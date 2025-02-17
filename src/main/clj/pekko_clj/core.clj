@@ -8,7 +8,7 @@
   (.tell (.getSender src) msg (.getSelf src)))
 
 (defn spawn
-  ([src func] (spawn src func (func)))
+  ([src props] (.actorOf src (CljActor/create props)))
   ([src func initial]
    (.actorOf src (CljActor/create initial func))))
 
@@ -33,7 +33,6 @@
            (reply this "hello there")
            @this)))
 
-
 (def actor (spawn system fa 0))
 
 (.tell actor 5 nil)
@@ -43,3 +42,4 @@
 
 (.value v)
 
+(m/match :pata :pata 1 :peta 2)
