@@ -10,6 +10,9 @@
   :main ^:skip-aot pekko-clj.core
   :java-source-paths ["src/main/java"]
   :source-paths ["src/main/clj"]
+
+  :plugins [[lein-cljfmt "0.9.2"]]
+  
   :target-path "target/%s"
   :profiles {:uberjar {:aot :all
                        :jvm-opts ["-Dclojure.compiler.direct-linking=true"]}})

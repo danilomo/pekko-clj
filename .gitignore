@@ -1,0 +1,7 @@
+.clj-kondo/
+.idea/
+.lein-repl-history
+.lsp/
+pekko-clj.iml
+target/
+.nrepl-port

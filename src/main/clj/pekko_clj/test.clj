@@ -1,22 +1,31 @@
 (ns pekko-clj.test
-  (:require [pekko-clj.core :refer [spawn system]]))
+  (:import  [org.apache.pekko.pattern Patterns]
+            [pekko_clj.actor FnWrapper])
+  (:require [pekko-clj.core :refer [new-actor reply system spawn]]))
 
 (declare manager)
 
-(def guardian-props {:function (fn [this msg]
-                                 (let [manager (:manager @this)
-                                       sender (.getSender this)]
-                                   (.tell manager msg sender)
-                                   @this))
+(defn seconds [val]
+  (java.time.Duration/ofSeconds val))
 
-                     :pre-start (fn [this]
-                                  (let [manager (spawn (.getContext this) manager :ok)]
-                                    {:manager manager}))})
+(def guardian-props
+  {:pre-start
+   (fn [this]
+     (.scheduleOnce this (seconds 1) #(println "scheduled message!"))
+     {:manager (spawn manager :none)})
 
+   :function
+   (fn [this msg]
+     (.forward this (:manager @this) msg))})
 
-(defn manager [_ msg]
-  (println (str "Tengo fueme: " msg))
+(defn manager [this msg]
+  (reply (.toUpperCase msg))
   :ok)
 
-(def a (spawn system guardian-props))
-(.tell a "aaaaa" nil)
+(def a (new-actor system guardian-props))
+
+(.onComplete
+ (Patterns/ask a "aaaaa" 1000)
+ (FnWrapper/create #(println %))
+ (.getDispatcher system))
+

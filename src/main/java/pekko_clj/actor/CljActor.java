@@ -97,4 +97,30 @@ public class CljActor extends UntypedAbstractActor implements IDeref {
     Object initial = preStart.invoke(this);
     handleState(initial);
   }
+
+  public ActorRef spawn(IFn func, Object state) {
+    return getContext()
+      .actorOf(create(state, func));
+  }
+
+  public void tell(ActorRef ref, Object msg) {
+    ref.tell(msg, getSelf());
+  }
+
+  public void forward(ActorRef ref, Object msg) {
+    ref.tell(msg, getSender());	
+  }
+
+  public void reply(Object msg) {
+    getSender().tell(msg, getSelf());
+  }
+
+  public Scheduler scheduler() {
+    return getContext().getSystem().scheduler();
+  }
+
+  public Cancellable scheduleOnce(java.time.Duration duration, Runnable runnable) {
+    return scheduler().scheduleOnce(duration, runnable, getContext().getSystem().getDispatcher());
+  }
+    
 }

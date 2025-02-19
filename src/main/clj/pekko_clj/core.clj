@@ -4,13 +4,20 @@
            [org.apache.pekko.pattern Patterns]
            [pekko_clj.actor CljActor]))
 
-(defn reply [src msg]
-  (.tell (.getSender src) msg (.getSelf src)))
 
-(defn spawn
+(defn new-actor
   ([src props] (.actorOf src (CljActor/create props)))
   ([src func initial]
    (.actorOf src (CljActor/create initial func))))
+
+(defmacro spawn [& args]
+  `(.spawn ~'this ~@args))
+
+(defmacro ! [& args]
+  `(.tell ~'this ~@args))
+
+(defmacro reply [& args]
+  `(.reply ~'this ~@args))
 
 (defn actor-system []
   (ActorSystem/create "mysystem"))
@@ -22,7 +29,7 @@
 (defn fa [this msg]
   (m/match msg
     :ask (do
-           (reply this @this)
+           (reply @this)
            @this)
     :change [fb :none]
     (n :guard number?) (+ @this n)))
@@ -30,10 +37,10 @@
 (defn fb [this msg]
   (m/match msg
     :ask (do
-           (reply this "hello there")
+           (reply "hello there")
            @this)))
 
-(def actor (spawn system fa 0))
+(def actor (new-actor system fa 0))
 
 (.tell actor 5 nil)
 (.tell actor :change nil)
