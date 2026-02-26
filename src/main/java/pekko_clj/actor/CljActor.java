@@ -68,7 +68,14 @@ public class CljActor extends UntypedAbstractActor implements IDeref {
     if (result == null) {
       return;
     }
-    
+
+    if (result instanceof BecomeResult) {
+      BecomeResult b = (BecomeResult) result;
+      this.function = b.function;
+      this.state = b.state;
+      return;
+    }
+
     if (PersistentVector.class.isAssignableFrom(result.getClass())) {
       var seq = ((Seqable) result).seq();
       handleSeq(seq);
@@ -98,9 +105,25 @@ public class CljActor extends UntypedAbstractActor implements IDeref {
     handleState(initial);
   }
 
+  public ActorRef parentRef() {
+    return getContext().getParent();
+  }
+
+  public ActorRef senderRef() {
+    return getSender();
+  }
+
+  public ActorRef selfRef() {
+    return getSelf();
+  }
+
   public ActorRef spawn(IFn func, Object state) {
     return getContext()
       .actorOf(create(state, func));
+  }
+
+  public ActorRef spawn(ILookup props) {
+    return getContext().actorOf(create(props));
   }
 
   public void tell(ActorRef ref, Object msg) {
