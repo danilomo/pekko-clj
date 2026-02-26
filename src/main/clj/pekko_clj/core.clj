@@ -1,52 +1,106 @@
 (ns pekko-clj.core
   (:require [clojure.core.match :as m])
-  (:import [org.apache.pekko.actor ActorSystem]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.pattern Patterns]
-           [pekko_clj.actor CljActor]))
+           [pekko_clj.actor CljActor BecomeResult FnWrapper]))
 
+(def ^:dynamic *current-actor*
+  "Bound to the current CljActor instance during message handling.
+   Used by !, reply, sender, self, parent, spawn."
+  nil)
+
+(defn self
+  "Returns the ActorRef of the current actor."
+  []
+  (.selfRef *current-actor*))
+
+(defn sender
+  "Returns the ActorRef of the message sender."
+  []
+  (.senderRef *current-actor*))
+
+(defn parent
+  "Returns the ActorRef of the current actor's parent."
+  []
+  (.parentRef *current-actor*))
+
+(defn !
+  "Send a message to an actor. Inside an actor context, sender is self.
+   Outside, sender is noSender."
+  [target msg]
+  (if *current-actor*
+    (.tell *current-actor* target msg)
+    (.tell target msg (ActorRef/noSender))))
+
+(defn reply
+  "Reply to the sender of the current message. Returns nil (so it doesn't
+   affect handler return value / state)."
+  [msg]
+  (.reply *current-actor* msg)
+  nil)
+
+(defn actor-system
+  "Create a new ActorSystem."
+  ([] (ActorSystem/create))
+  ([name] (ActorSystem/create name)))
+
+(defn- make-props
+  "Given an actor-def map and args, produce a CljActor Props."
+  [actor-def args]
+  (CljActor/create ((:make-props actor-def) args)))
+
+(defn spawn
+  "Spawn a new actor.
+
+   Inside actor context:
+     (spawn actor-def)
+     (spawn actor-def args)
+
+   Top-level:
+     (spawn system actor-def)
+     (spawn system actor-def args)"
+  ([actor-def]
+   (spawn actor-def nil))
+  ([first-arg second-arg]
+   (if (instance? ActorSystem first-arg)
+     ;; (spawn system actor-def) — top-level, no args
+     (spawn first-arg second-arg nil)
+     ;; (spawn actor-def args) — inside actor context
+     (let [props (make-props first-arg second-arg)]
+       (.actorOf (.getContext *current-actor*) props))))
+  ([system actor-def args]
+   (.actorOf system (make-props actor-def args))))
+
+(def ^:dynamic *timeout* 30000)
+
+(defn <?>
+  "Send a message and expect a reply. Returns a Scala Future.
+   Use @(<?> actor msg) with a FnWrapper callback, or see <! for blocking."
+  ([target msg]
+   (<?> target msg *timeout*))
+  ([target msg timeout]
+   (Patterns/ask target msg (long timeout))))
+
+(defn <!
+  "Blocking ask. Requires an actor-system for the execution context."
+  ([system target msg]
+   (<! system target msg *timeout*))
+  ([system target msg timeout]
+   (let [result (promise)
+         future (<?> target msg timeout)]
+     (.onComplete
+      future
+      (FnWrapper/create #(deliver result (.get %)))
+      (.dispatcher system))
+     (deref result timeout nil))))
+
+(defn become
+  "Switch the current actor's behavior to another defactor's handler.
+   Returns a BecomeResult that the runtime interprets."
+  [actor-def new-state]
+  (BecomeResult/of (:receive actor-def) new-state))
 
 (defn new-actor
+  "Create an actor from a raw function and initial state (low-level API)."
   ([src props] (.actorOf src (CljActor/create props)))
-  ([src func initial]
-   (.actorOf src (CljActor/create initial func))))
-
-(defmacro spawn [& args]
-  `(.spawn ~'this ~@args))
-
-(defmacro ! [& args]
-  `(.tell ~'this ~@args))
-
-(defmacro reply [& args]
-  `(.reply ~'this ~@args))
-
-(defn actor-system []
-  (ActorSystem/create "mysystem"))
-
-(def system (actor-system))
-
-(declare fb)
-
-(defn fa [this msg]
-  (m/match msg
-    :ask (do
-           (reply @this)
-           @this)
-    :change [fb :none]
-    (n :guard number?) (+ @this n)))
-
-(defn fb [this msg]
-  (m/match msg
-    :ask (do
-           (reply "hello there")
-           @this)))
-
-(def actor (new-actor system fa 0))
-
-(.tell actor 5 nil)
-(.tell actor :change nil)
-
-(def v (Patterns/ask actor :ask 1000))
-
-(.value v)
-
-(m/match :pata :pata 1 :peta 2)
+  ([src func initial] (.actorOf src (CljActor/create initial func))))
