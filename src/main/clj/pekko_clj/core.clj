@@ -169,3 +169,8 @@
   "Schedule a function to run once after a duration (java.time.Duration)."
   [duration f]
   (.scheduleOnce *current-actor* duration f))
+
+(defn forward
+  "Forward the current message to another actor, preserving original sender."
+  [target msg]
+  (.forward *current-actor* target msg))

@@ -1,31 +1,24 @@
 (ns pekko-clj.test
-  (:import  [org.apache.pekko.pattern Patterns]
-            [pekko_clj.actor FnWrapper])
-  (:require [pekko-clj.core :refer [new-actor reply system spawn]]))
-
-(declare manager)
+  (:require [pekko-clj.core :refer :all]))
 
 (defn seconds [val]
   (java.time.Duration/ofSeconds val))
 
-(def guardian-props
-  {:pre-start
-   (fn [this]
-     (.scheduleOnce this (seconds 1) #(println "scheduled message!"))
-     {:manager (spawn manager :none)})
+(defactor manager
+  (handle msg
+    (reply (.toUpperCase msg))))
 
-   :function
-   (fn [this msg]
-     (.forward this (:manager @this) msg))})
+(defactor guardian
+  (init [_]
+    (schedule-once (seconds 1) #(println "scheduled message!"))
+    {:manager (spawn manager)})
 
-(defn manager [this msg]
-  (reply (.toUpperCase msg))
-  :ok)
+  (handle msg
+    (forward (:manager state) msg)
+    state))
 
-(def a (new-actor system guardian-props))
-
-(.onComplete
- (Patterns/ask a "aaaaa" 1000)
- (FnWrapper/create #(println %))
- (.getDispatcher system))
-
+;; Usage:
+;; (def sys (actor-system "test"))
+;; (def a (spawn sys guardian))
+;; (<! sys a "hello")  ;; => "HELLO"
+;; (.terminate sys)
