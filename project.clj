@@ -12,7 +12,8 @@
   :source-paths ["src/main/clj"]
 
   :plugins [[lein-cljfmt "0.9.2"]]
-  
+
+  :test-paths ["test/clj"]
   :target-path "target/%s"
   :profiles {:uberjar {:aot :all
                        :jvm-opts ["-Dclojure.compiler.direct-linking=true"]}})
