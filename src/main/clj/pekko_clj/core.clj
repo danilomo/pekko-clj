@@ -104,3 +104,68 @@
   "Create an actor from a raw function and initial state (low-level API)."
   ([src props] (.actorOf src (CljActor/create props)))
   ([src func initial] (.actorOf src (CljActor/create initial func))))
+
+(defn- parse-actor-clauses [body]
+  (let [clauses (group-by first body)]
+    {:init       (first (get clauses 'init))
+     :handlers   (get clauses 'handle)
+     :on-stop    (first (get clauses 'on-stop))
+     :on-restart (first (get clauses 'on-restart))}))
+
+(defmacro defactor [name & body]
+  (let [;; optional docstring
+        docstring (when (string? (first body)) (first body))
+        clauses   (if docstring (rest body) body)
+        parsed    (parse-actor-clauses clauses)
+
+        ;; destructure init clause: (init [args] body...)
+        init-clause  (:init parsed)
+        init-params  (when init-clause (second init-clause))   ;; [args]
+        init-body    (when init-clause (drop 2 init-clause))   ;; body...
+
+        ;; destructure handle clauses: (handle pattern body...)
+        handlers (:handlers parsed)
+        ;; Build match pairs: pattern1 (do body1) pattern2 (do body2) ...
+        match-pairs (mapcat (fn [h]
+                              (let [pattern (second h)
+                                    hbody   (drop 2 h)]
+                                [pattern `(do ~@hbody)]))
+                            handlers)
+
+        ;; lifecycle
+        on-stop    (:on-stop parsed)
+        on-restart (:on-restart parsed)
+
+        ;; gensyms
+        this-sym (gensym "this")
+        msg-sym  (gensym "msg")
+        args-sym (gensym "args")]
+
+    `(def ~(vary-meta name assoc :doc (or docstring ""))
+       (let [receive-fn#
+             (fn [~this-sym ~msg-sym]
+               (binding [*current-actor* ~this-sym]
+                 (let [~'state (deref ~this-sym)]
+                   (m/match ~msg-sym
+                     ~@match-pairs))))]
+         {:receive    receive-fn#
+          :make-props (fn [~args-sym]
+                        (merge
+                         {:function receive-fn#}
+                         ~(if init-clause
+                            `{:pre-start
+                              (fn [~this-sym]
+                                (binding [*current-actor* ~this-sym]
+                                  (let [~(first init-params) ~args-sym]
+                                    ~@init-body)))}
+                            `{:state ~args-sym})
+                         ~(when on-stop
+                            `{:post-stop
+                              (fn [~this-sym]
+                                (binding [*current-actor* ~this-sym]
+                                  ~@(rest on-stop)))})))}))))
+
+(defn schedule-once
+  "Schedule a function to run once after a duration (java.time.Duration)."
+  [duration f]
+  (.scheduleOnce *current-actor* duration f))
