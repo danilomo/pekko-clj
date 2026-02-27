@@ -94,6 +94,11 @@
       (.dispatcher system))
      (deref result timeout nil))))
 
+(defn forward
+  "Forward the current message to another actor, preserving original sender."
+  [target msg]
+  (.forward *current-actor* target msg))
+
 (defn become
   "Switch the current actor's behavior to another defactor's handler.
    Returns a BecomeResult that the runtime interprets."
