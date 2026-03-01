@@ -112,10 +112,12 @@
 
 (defn- parse-actor-clauses [body]
   (let [clauses (group-by first body)]
-    {:init       (first (get clauses 'init))
-     :handlers   (get clauses 'handle)
-     :on-stop    (first (get clauses 'on-stop))
-     :on-restart (first (get clauses 'on-restart))}))
+    {:init        (first (get clauses 'init))
+     :handlers    (get clauses 'handle)
+     :on-stop     (first (get clauses 'on-stop))
+     :on-restart  (first (get clauses 'on-restart))
+     :supervision (first (get clauses 'supervision))
+     :on-error    (first (get clauses 'on-error))}))
 
 (defmacro defactor [name & body]
   (let [;; optional docstring
@@ -141,10 +143,20 @@
         on-stop    (:on-stop parsed)
         on-restart (:on-restart parsed)
 
+        ;; supervision: (supervision strategy-expr)
+        supervision-clause (:supervision parsed)
+        supervision-expr   (when supervision-clause (second supervision-clause))
+
+        ;; on-error: (on-error [ex msg] body...) - error handler
+        on-error-clause (:on-error parsed)
+        on-error-params (when on-error-clause (second on-error-clause))  ;; [ex msg]
+        on-error-body   (when on-error-clause (drop 2 on-error-clause))  ;; body...
+
         ;; gensyms
         this-sym (gensym "this")
         msg-sym  (gensym "msg")
-        args-sym (gensym "args")]
+        args-sym (gensym "args")
+        ex-sym   (gensym "ex")]
 
     `(def ~(vary-meta name assoc :doc (or docstring ""))
        (let [receive-fn#
@@ -168,9 +180,102 @@
                             `{:post-stop
                               (fn [~this-sym]
                                 (binding [*current-actor* ~this-sym]
-                                  ~@(rest on-stop)))})))}))))
+                                  ~@(rest on-stop)))})
+                         ~(when supervision-expr
+                            `{:supervisor-strategy ~supervision-expr})
+                         ~(when on-error-clause
+                            `{:error-handler
+                              (fn [~this-sym ~ex-sym ~msg-sym]
+                                (binding [*current-actor* ~this-sym]
+                                  (let [~'state (deref ~this-sym)
+                                        ~(first on-error-params) ~ex-sym
+                                        ~(second on-error-params) ~msg-sym]
+                                    ~@on-error-body)))})))}))))
 
 (defn schedule-once
   "Schedule a function to run once after a duration (java.time.Duration)."
   [duration f]
   (.scheduleOnce *current-actor* duration f))
+
+;; Timer functions
+(defn start-timer
+  "Start a periodic timer that sends a message to self at fixed intervals.
+   key: timer key for cancellation/checking
+   interval: java.time.Duration between messages
+   message: message to send to self
+   Optional initial-delay: java.time.Duration before first message"
+  ([key interval message]
+   (.startTimer *current-actor* key interval message))
+  ([key initial-delay interval message]
+   (.startTimerWithInitialDelay *current-actor* key initial-delay interval message)))
+
+(defn start-single-timer
+  "Start a single-shot timer that sends a message to self after a delay.
+   key: timer key for cancellation/checking
+   delay: java.time.Duration before message is sent
+   message: message to send to self"
+  [key delay message]
+  (.startSingleTimer *current-actor* key delay message))
+
+(defn cancel-timer
+  "Cancel a timer by key."
+  [key]
+  (.cancelTimer *current-actor* key))
+
+(defn timer-active?
+  "Check if a timer is active."
+  [key]
+  (.isTimerActive *current-actor* key))
+
+(defn cancel-all-timers
+  "Cancel all timers for this actor."
+  []
+  (.cancelAllTimers *current-actor*))
+
+;; DeathWatch functions
+(defn watch
+  "Watch an actor for termination. When the watched actor stops,
+   this actor will receive [:terminated actor-ref]."
+  [actor-ref]
+  (.watch *current-actor* actor-ref))
+
+(defn unwatch
+  "Stop watching an actor for termination."
+  [actor-ref]
+  (.unwatch *current-actor* actor-ref))
+
+;; Stash functions
+(defn stash
+  "Stash the current message for later processing.
+   Use this to defer handling of messages until the actor is ready.
+   Returns nil (doesn't affect state)."
+  []
+  (.stash *current-actor*)
+  nil)
+
+(defn unstash-all
+  "Unstash all messages, prepending them to the mailbox.
+   Messages will be processed in the order they were stashed.
+   Returns nil (doesn't affect state)."
+  []
+  (.unstashAll *current-actor*)
+  nil)
+
+(defn unstash
+  "Unstash the first stashed message only.
+   Returns nil (doesn't affect state)."
+  []
+  (.unstash *current-actor*)
+  nil)
+
+(defn stash-size
+  "Returns the number of stashed messages."
+  []
+  (.stashSize *current-actor*))
+
+(defn clear-stash
+  "Clear all stashed messages without processing them.
+   Returns nil (doesn't affect state)."
+  []
+  (.clearStash *current-actor*)
+  nil)
