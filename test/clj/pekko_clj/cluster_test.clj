@@ -259,3 +259,101 @@
       (is (not (cluster/has-role? sys "frontend")))
       (finally
         (terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: New Cluster Parity Features
+;; ---------------------------------------------------------------------------
+
+(deftest join-seed-nodes-test
+  (testing "Join cluster with seed nodes"
+    (let [sys (cluster/create-system "seed-test"
+                {:hostname "127.0.0.1"
+                 :port 0})]
+      (try
+        ;; Test that join-seed-nodes can be called with a list of addresses
+        ;; In a single-node test, we use our own address
+        (let [self-addr (str (.selfAddress (cluster/cluster sys)))]
+          (cluster/join-seed-nodes sys [self-addr])
+          (Thread/sleep 1000)
+          ;; After joining, we should have at least one member
+          (is (<= 1 (count (cluster/members sys)))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest is-terminated-test
+  (testing "Check cluster termination status"
+    (let [sys (cluster/create-system "term-test"
+                {:hostname "127.0.0.1"
+                 :port 0})]
+      (try
+        (is (wait-for-member-up sys))
+        ;; Cluster should not be terminated while running
+        (is (not (cluster/is-terminated? sys)))
+        (finally
+          (terminate-system sys))))))
+
+(deftest members-by-age-test
+  (testing "Members sorted by age"
+    (let [sys (cluster/create-system "age-test"
+                {:hostname "127.0.0.1"
+                 :port 0})]
+      (try
+        (is (wait-for-member-up sys))
+        (let [members (cluster/members-by-age sys)]
+          ;; Should have one member in single-node cluster
+          (is (= 1 (count members)))
+          ;; Each member should have expected keys
+          (let [member (first members)]
+            (is (contains? member :address))
+            (is (contains? member :status))
+            (is (contains? member :upNumber))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest state-snapshot-test
+  (testing "Get cluster state snapshot"
+    (let [sys (cluster/create-system "snapshot-test"
+                {:hostname "127.0.0.1"
+                 :port 0})]
+      (try
+        (is (wait-for-member-up sys))
+        (Thread/sleep 500) ; Allow state to stabilize
+        (let [snapshot (cluster/state-snapshot sys)]
+          ;; Should have required keys
+          (is (contains? snapshot :members))
+          (is (contains? snapshot :unreachable))
+          (is (contains? snapshot :leader))
+          (is (contains? snapshot :seen-by))
+          ;; Should have one member
+          (is (= 1 (count (:members snapshot))))
+          ;; No unreachable members in healthy single-node cluster
+          (is (empty? (:unreachable snapshot)))
+          ;; Should have a leader (self in single-node)
+          (is (some? (:leader snapshot)))
+          ;; Seen-by should contain self
+          (is (seq (:seen-by snapshot))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest prepare-for-shutdown-test
+  (testing "Coordinated cluster shutdown preparation"
+    (let [sys (cluster/create-system "shutdown-test"
+                {:hostname "127.0.0.1"
+                 :port 0})
+          shutdown-event (promise)]
+      (try
+        (is (wait-for-member-up sys))
+        ;; Subscribe to cluster events to observe shutdown event
+        (cluster/subscribe sys
+          (fn [event]
+            (when (= :member-preparing-for-shutdown (:type event))
+              (deliver shutdown-event event))))
+        ;; Call prepare-for-shutdown
+        (cluster/prepare-for-shutdown sys)
+        ;; Should receive shutdown event within timeout
+        (let [event (deref shutdown-event 5000 nil)]
+          (is (some? event) "Should receive member-preparing-for-shutdown event")
+          (when event
+            (is (= :member-preparing-for-shutdown (:type event)))))
+        (finally
+          (terminate-system sys))))))

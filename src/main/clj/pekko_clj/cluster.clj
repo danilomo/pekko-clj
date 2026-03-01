@@ -13,12 +13,17 @@
      ;; Join a cluster
      (cluster/join sys \"pekko://my-app@127.0.0.1:7355\")
 
+     ;; Join using seed nodes for dynamic discovery
+     (cluster/join-seed-nodes sys [\"pekko://my-app@host1:7355\"
+                                   \"pekko://my-app@host2:7355\"])
+
      ;; Get cluster state
      (cluster/members sys)
      (cluster/leader sys)
-     (cluster/self-member sys)"
+     (cluster/self-member sys)
+     (cluster/state-snapshot sys)"
   (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef Address AddressFromURIString]
            [org.apache.pekko.cluster Cluster Member MemberStatus ClusterEvent$ClusterDomainEvent
                                      ClusterEvent$MemberUp ClusterEvent$MemberRemoved
                                      ClusterEvent$MemberExited ClusterEvent$MemberDowned
@@ -27,7 +32,7 @@
                                      ClusterEvent$UnreachableMember ClusterEvent$ReachableMember
                                      ClusterEvent$LeaderChanged ClusterEvent$RoleLeaderChanged]
            [com.typesafe.config Config ConfigFactory]
-           [java.util Set]))
+           [java.util Set List]))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster Access
@@ -110,7 +115,25 @@
   ([system]
    (.join (cluster system)))
   ([system address]
-   (.join (cluster system) (org.apache.pekko.actor.AddressFromURIString/parse address))))
+   (.join (cluster system) (AddressFromURIString/parse address))))
+
+(defn join-seed-nodes
+  "Join the cluster using a list of seed node addresses.
+
+   This is useful for dynamic cluster discovery where seed nodes
+   are determined at runtime (e.g., from a service registry).
+
+   Arguments:
+   - system: ActorSystem
+   - seed-nodes: Collection of address strings
+
+   Example:
+     (join-seed-nodes sys [\"pekko://my-app@host1:7355\"
+                           \"pekko://my-app@host2:7355\"])"
+  [system seed-nodes]
+  (let [addresses (java.util.ArrayList.
+                    (map #(AddressFromURIString/parse %) seed-nodes))]
+    (.joinSeedNodes (cluster system) addresses)))
 
 (defn leave
   "Leave the cluster gracefully.
@@ -159,10 +182,7 @@
 (defn leader
   "Get the current cluster leader's address, or nil if none."
   [system]
-  (let [state (.state (cluster system))
-        leader-opt (.getLeader state)]
-    (when (.isPresent leader-opt)
-      (.get leader-opt))))
+  (.getLeader (.state (cluster system))))
 
 (defn is-leader?
   "Check if this node is the cluster leader."
@@ -181,15 +201,47 @@
 (defn role-leader
   "Get the leader for a specific role."
   [system role]
-  (let [state (.state (cluster system))
-        leader-opt (.roleLeader state role)]
-    (when (.isPresent leader-opt)
-      (.get leader-opt))))
+  (.roleLeader (.state (cluster system)) role))
 
 (defn has-role?
   "Check if this node has a specific role."
   [system role]
   (.hasRole (.selfMember (cluster system)) role))
+
+(defn is-terminated?
+  "Check if the cluster extension has been terminated."
+  [system]
+  (.isTerminated (cluster system)))
+
+(defn members-by-age
+  "Get cluster members sorted by age (oldest first).
+
+   This is useful for singleton-like patterns where the oldest
+   node should take responsibility. Members are sorted by their
+   upNumber (join order), with the oldest member having the lowest number.
+
+   Returns a sequence of member maps."
+  [system]
+  (let [state (.state (cluster system))
+        members (seq (.getMembers state))]
+    (->> members
+         (sort-by #(.upNumber ^Member %))
+         (map member->map))))
+
+(defn state-snapshot
+  "Get the current cluster state as a map.
+
+   Returns a map with:
+   - :members - All cluster members as a sequence of member maps
+   - :unreachable - Unreachable members as a sequence of member maps
+   - :leader - Current leader address (or nil)
+   - :seen-by - Set of addresses that have seen this state"
+  [system]
+  (let [state (.state (cluster system))]
+    {:members (map member->map (seq (.getMembers state)))
+     :unreachable (map member->map (seq (.getUnreachable state)))
+     :leader (.getLeader state)
+     :seen-by (set (seq (.getSeenBy state)))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster Event Subscription
@@ -222,6 +274,9 @@
     (instance? ClusterEvent$MemberWeaklyUp event)
     {:type :member-weakly-up :member (member->map (.member ^ClusterEvent$MemberWeaklyUp event))}
 
+    (instance? ClusterEvent$MemberPreparingForShutdown event)
+    {:type :member-preparing-for-shutdown :member (member->map (.member ^ClusterEvent$MemberPreparingForShutdown event))}
+
     (instance? ClusterEvent$UnreachableMember event)
     {:type :unreachable :member (member->map (.member ^ClusterEvent$UnreachableMember event))}
 
@@ -230,14 +285,12 @@
 
     (instance? ClusterEvent$LeaderChanged event)
     {:type :leader-changed
-     :leader (let [opt (.getLeader ^ClusterEvent$LeaderChanged event)]
-               (when (.isPresent opt) (.get opt)))}
+     :leader (.getLeader ^ClusterEvent$LeaderChanged event)}
 
     (instance? ClusterEvent$RoleLeaderChanged event)
     {:type :role-leader-changed
      :role (.role ^ClusterEvent$RoleLeaderChanged event)
-     :leader (let [opt (.getLeader ^ClusterEvent$RoleLeaderChanged event)]
-               (when (.isPresent opt) (.get opt)))}
+     :leader (.getLeader ^ClusterEvent$RoleLeaderChanged event)}
 
     ;; ClusterShuttingDown is a Scala object, check by class name
     (= "ClusterShuttingDown" (.getSimpleName (class event)))
@@ -295,3 +348,11 @@
   "Register a callback to run when this node is removed from the cluster."
   [system callback]
   (.registerOnMemberRemoved (cluster system) callback))
+
+(defn prepare-for-shutdown
+  "Prepare the cluster for a full coordinated shutdown.
+
+   All nodes in the cluster will be marked as PreparingForShutdown.
+   This enables graceful shutdown where all nodes coordinate their exit."
+  [system]
+  (.prepareForFullClusterShutdown (cluster system)))

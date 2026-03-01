@@ -175,3 +175,133 @@
     (is (instance? Routees routees))
     ;; Should have 3 routees
     (is (= 3 (.size (.getRoutees routees))))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Balancing Pool
+;; ---------------------------------------------------------------------------
+
+(deftest balancing-pool-processes-messages
+  (reset! process-log [])
+  (let [pool (routing/spawn-pool *system* logging-worker 3 {:strategy :balancing})]
+    ;; Send several messages
+    (dotimes [i 6]
+      (core/! pool [:process i]))
+    (Thread/sleep 500)
+    ;; All messages processed
+    (is (= 6 (count @process-log)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Consistent Hashing
+;; ---------------------------------------------------------------------------
+
+(def hash-log (atom {}))
+
+(core/defactor hash-tracking-worker
+  "Worker that tracks which messages it received"
+  (init [args]
+    {:id (or (:id args) (rand-int 100000))})
+  (handle [:hash-msg key data]
+    (swap! hash-log update key (fnil conj []) {:id (:id state) :data data})
+    state)
+  (handle :get-id
+    (core/reply (:id state))))
+
+(deftest consistent-hashing-pool-routes-same-key-to-same-routee
+  (reset! hash-log {})
+  (let [pool (routing/spawn-consistent-hash-pool *system* hash-tracking-worker 5
+               {:hash-fn (fn [[_ key _]] (str key))})]  ; Convert to string for serialization
+    ;; Send messages with same key - should go to same routee
+    (dotimes [i 5]
+      (core/! pool [:hash-msg "user-123" i]))
+    ;; Send messages with different key - may go to different routee
+    (dotimes [i 5]
+      (core/! pool [:hash-msg "user-456" i]))
+    (Thread/sleep 500)
+    ;; All messages for same key went to same worker
+    (let [user123-workers (set (map :id (get @hash-log "user-123")))
+          user456-workers (set (map :id (get @hash-log "user-456")))]
+      (is (= 1 (count user123-workers)) "Same key should route to same worker")
+      (is (= 1 (count user456-workers)) "Same key should route to same worker"))))
+
+(deftest consistent-hashing-group-routes-same-key-to-same-routee
+  (reset! hash-log {})
+  ;; Create individual workers
+  (let [w1 (core/spawn *system* hash-tracking-worker {:id 1})
+        w2 (core/spawn *system* hash-tracking-worker {:id 2})
+        w3 (core/spawn *system* hash-tracking-worker {:id 3})
+        paths [(str (.path w1)) (str (.path w2)) (str (.path w3))]
+        group (routing/spawn-consistent-hash-group *system* paths
+                {:hash-fn (fn [[_ key _]] (str key))})]  ; Convert to string for serialization
+    ;; Send messages with same key
+    (dotimes [i 5]
+      (core/! group [:hash-msg "session-abc" i]))
+    (Thread/sleep 500)
+    ;; All messages went to same worker
+    (let [workers (set (map :id (get @hash-log "session-abc")))]
+      (is (= 1 (count workers)) "Same key should route to same worker"))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Scatter-Gather Pool
+;; ---------------------------------------------------------------------------
+
+(core/defactor delayed-echo-worker
+  "Worker that echoes with a delay"
+  (init [args]
+    {:delay-ms (or (:delay-ms args) 0)})
+  (handle [:delayed-echo msg]
+    (Thread/sleep (:delay-ms state))
+    (core/reply msg)))
+
+(deftest scatter-gather-pool-returns-first-response
+  (let [pool (routing/spawn-scatter-gather-pool *system* delayed-echo-worker 3
+               {:timeout-ms 5000
+                :args {:delay-ms 0}})]
+    ;; Should get response from first responder
+    (let [result (await-ask pool [:delayed-echo :test-msg])]
+      (is (= :test-msg result)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Tail-Chopping Pool
+;; ---------------------------------------------------------------------------
+
+(deftest tail-chopping-pool-returns-response
+  (let [pool (routing/spawn-tail-chopping-pool *system* echo-worker 3
+               {:timeout-ms 5000
+                :interval-ms 100})]
+    ;; Should get response
+    (is (= :pong (await-ask pool :ping)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Pool with Resizer
+;; ---------------------------------------------------------------------------
+
+(deftest pool-with-resizer-starts
+  (let [pool (routing/spawn-pool-with-resizer *system* echo-worker
+               {:min-size 2
+                :max-size 5
+                :strategy :round-robin})]
+    ;; Pool should respond
+    (is (= :pong (await-ask pool :ping)))
+    ;; Should have at least min-size routees
+    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
+      (is (>= (.size (.getRoutees routees)) 2)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Dynamic Routee Management
+;; ---------------------------------------------------------------------------
+
+(deftest adjust-pool-size-changes-routees
+  (let [pool (routing/spawn-pool *system* echo-worker 3)]
+    ;; Initial check
+    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
+      (is (= 3 (.size (.getRoutees routees)))))
+    ;; Add 2 routees
+    (routing/adjust-pool-size pool 2)
+    (Thread/sleep 500)
+    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
+      (is (= 5 (.size (.getRoutees routees)))))
+    ;; Remove 1 routee
+    (routing/adjust-pool-size pool -1)
+    (Thread/sleep 500)
+    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
+      (is (= 4 (.size (.getRoutees routees)))))))
