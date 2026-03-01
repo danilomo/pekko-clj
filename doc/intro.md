@@ -172,3 +172,14 @@ pekko-clj has three layers:
 3. **`defactor` macro** — Compiles declarative actor definitions into the core function calls and `core.match` dispatch.
 
 The dynamic var `*current-actor*` is bound during message handling, enabling context-aware functions like `self`, `sender`, and `reply` to work without explicit actor references.
+
+## 📚 Step-by-Step Tutorial
+
+Ready to dive deeper? Check out our detailed tutorials documenting every major module within `pekko-clj`:
+
+1.  **[Actors Basics](01-actors.md)** – Detailed exploration of core actors, message passing, and state transitions.
+2.  **[Supervision & Error Handling](02-error-handling.md)** – How to supervise children and handle runtime exceptions robustly.
+3.  **[Routing](03-routing.md)** – Grouping and pooling multiple actors seamlessly to distribute computational workloads.
+4.  **[Clustering, Singletons & Sharding](04-cluster.md)** – Distributed clustered operations spanning multiple nodes efficiently.
+5.  **[Reactive Streams](05-streams.md)** – Fluent manipulation and pipelining of continuous data streams utilizing backpressure.
+6.  **[HTTP Setup and Routing](06-http.md)** – Setting up responsive HTTP endpoint bindings with succinct routing macros.
