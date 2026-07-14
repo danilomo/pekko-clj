@@ -1,6 +1,7 @@
 (ns pekko-clj.deathwatch-test
   (:require [clojure.test :refer :all]
-            [pekko-clj.core :as core])
+            [pekko-clj.core :as core]
+            [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -26,7 +27,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: DeathWatch
@@ -168,10 +169,8 @@
     (.tell target1 poison-pill no-sender)
     (.tell target2 poison-pill no-sender)
     (.tell target3 poison-pill no-sender)
-    ;; Wait for termination messages
-    (Thread/sleep 500)
-    ;; Should have received all three
-    (is (= 3 (count @terminated-actors)))
+    ;; Should receive all three termination messages.
+    (is (eventually (= 3 (count @terminated-actors))))
     (is (contains? @terminated-actors target1))
     (is (contains? @terminated-actors target2))
     (is (contains? @terminated-actors target3))))

@@ -1,7 +1,8 @@
 (ns pekko-clj.routing-test
   (:require [clojure.test :refer :all]
             [pekko-clj.core :as core]
-            [pekko-clj.routing :as routing])
+            [pekko-clj.routing :as routing]
+            [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.routing Routees]
            [scala.concurrent Await]
@@ -25,7 +26,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Test actor definitions
@@ -76,9 +77,8 @@
     ;; Send 6 messages - should hit each of 3 workers twice
     (dotimes [i 6]
       (core/! pool [:process i]))
-    (Thread/sleep 300)
     ;; All messages processed
-    (is (= 6 (count @process-log)))
+    (is (eventually (= 6 (count @process-log))))
     ;; Messages distributed to multiple workers
     (let [worker-ids (set (map :id @process-log))]
       (is (= 3 (count worker-ids))))))
@@ -89,18 +89,16 @@
     ;; Send several messages
     (dotimes [i 10]
       (core/! pool [:process i]))
-    (Thread/sleep 300)
     ;; All messages processed
-    (is (= 10 (count @process-log)))))
+    (is (eventually (= 10 (count @process-log))))))
 
 (deftest pool-broadcast-sends-to-all
   (reset! process-log [])
   (let [pool (routing/spawn-pool *system* logging-worker 3 {:strategy :broadcast})]
     ;; Send one message - should go to all 3 workers
     (core/! pool [:process :hello])
-    (Thread/sleep 200)
     ;; Message received by all workers
-    (is (= 3 (count @process-log)))
+    (is (eventually (= 3 (count @process-log))))
     (is (every? #(= :hello (:data %)) @process-log))))
 
 (deftest pool-smallest-mailbox-strategy
@@ -115,7 +113,7 @@
     ;; All workers should have the same ID from args
     (core/! pool [:process :test])
     (core/! pool [:process :test])
-    (Thread/sleep 200)
+    (is (eventually (= 2 (count @process-log))))
     ;; Both workers have ID 999
     (is (every? #(= 999 (:id %)) @process-log))))
 
@@ -146,9 +144,8 @@
         group (routing/spawn-group *system* paths {:strategy :broadcast})]
     ;; Send one message
     (core/! group [:process :broadcast-test])
-    (Thread/sleep 200)
     ;; All three workers received it
-    (is (= 3 (count @process-log)))
+    (is (eventually (= 3 (count @process-log))))
     (is (= #{1 2 3} (set (map :id @process-log))))))
 
 ;; ---------------------------------------------------------------------------
@@ -160,9 +157,8 @@
   (let [pool (routing/spawn-pool *system* logging-worker 3 {:strategy :round-robin})]
     ;; Use broadcast helper to send to all, even though pool is round-robin
     (routing/broadcast pool [:process :to-all])
-    (Thread/sleep 200)
     ;; All 3 workers received it
-    (is (= 3 (count @process-log)))))
+    (is (eventually (= 3 (count @process-log))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Get Routees
@@ -171,7 +167,7 @@
 (deftest get-routees-returns-routee-info
   (let [pool (routing/spawn-pool *system* echo-worker 3)
         future (routing/get-routees pool)
-        routees (Await/result future timeout-duration)]
+        routees (deref future 10000 nil)]
     (is (instance? Routees routees))
     ;; Should have 3 routees
     (is (= 3 (.size (.getRoutees routees))))))
@@ -186,9 +182,8 @@
     ;; Send several messages
     (dotimes [i 6]
       (core/! pool [:process i]))
-    (Thread/sleep 500)
     ;; All messages processed
-    (is (= 6 (count @process-log)))))
+    (is (eventually (= 6 (count @process-log))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Consistent Hashing
@@ -216,7 +211,8 @@
     ;; Send messages with different key - may go to different routee
     (dotimes [i 5]
       (core/! pool [:hash-msg "user-456" i]))
-    (Thread/sleep 500)
+    (is (eventually (and (= 5 (count (get @hash-log "user-123")))
+                         (= 5 (count (get @hash-log "user-456"))))))
     ;; All messages for same key went to same worker
     (let [user123-workers (set (map :id (get @hash-log "user-123")))
           user456-workers (set (map :id (get @hash-log "user-456")))]
@@ -235,7 +231,7 @@
     ;; Send messages with same key
     (dotimes [i 5]
       (core/! group [:hash-msg "session-abc" i]))
-    (Thread/sleep 500)
+    (is (eventually (= 5 (count (get @hash-log "session-abc")))))
     ;; All messages went to same worker
     (let [workers (set (map :id (get @hash-log "session-abc")))]
       (is (= 1 (count workers)) "Same key should route to same worker"))))
@@ -283,7 +279,7 @@
     ;; Pool should respond
     (is (= :pong (await-ask pool :ping)))
     ;; Should have at least min-size routees
-    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
+    (let [routees (deref (routing/get-routees pool) 10000 nil)]
       (is (>= (.size (.getRoutees routees)) 2)))))
 
 ;; ---------------------------------------------------------------------------
@@ -293,15 +289,11 @@
 (deftest adjust-pool-size-changes-routees
   (let [pool (routing/spawn-pool *system* echo-worker 3)]
     ;; Initial check
-    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
+    (let [routees (deref (routing/get-routees pool) 10000 nil)]
       (is (= 3 (.size (.getRoutees routees)))))
     ;; Add 2 routees
     (routing/adjust-pool-size pool 2)
-    (Thread/sleep 500)
-    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
-      (is (= 5 (.size (.getRoutees routees)))))
+    (is (eventually (= 5 (.size (.getRoutees (deref (routing/get-routees pool) 5000 nil))))))
     ;; Remove 1 routee
     (routing/adjust-pool-size pool -1)
-    (Thread/sleep 500)
-    (let [routees (Await/result (routing/get-routees pool) timeout-duration)]
-      (is (= 4 (.size (.getRoutees routees)))))))
+    (is (eventually (= 4 (.size (.getRoutees (deref (routing/get-routees pool) 5000 nil))))))))

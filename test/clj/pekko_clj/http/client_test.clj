@@ -86,10 +86,9 @@
       (is (= "test-value" result)))))
 
 (deftest await-response-timeout-test
-  (testing "await-response timeout"
+  (testing "await-response returns nil on the block timeout (matches core/<!)"
     (let [stage (java.util.concurrent.CompletableFuture.)]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"timed out"
-            (client/await-response stage 100))))))
+      (is (nil? (client/await-response stage 100))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Note: Full client tests with actual HTTP requests require a running server

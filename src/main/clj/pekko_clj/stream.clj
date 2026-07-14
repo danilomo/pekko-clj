@@ -9,27 +9,30 @@
    - Flow: transforms elements (map, filter, etc.)
    - Sink: consumes elements (foreach, fold, to actors, etc.)
 
+   Naming convention: `map` and `filter` clash with clojure.core and are used so
+   pervasively that they are renamed here with an `s` prefix — `smap`/`sfilter` —
+   rather than shadowed. Less commonly-confused ops (`concat`, `drop`, `take`,
+   `merge`, `mapcat`, `distinct`, `partition`, `group-by`, `take-while`,
+   `drop-while`) DO shadow clojure.core (see the ns :refer-clojure :exclude), so
+   qualify them (`stream/take`) or use the aliased require in call sites.
+
    Example:
      (-> (source (range 100))
          (smap inc)
          (sfilter even?)
          (run-foreach println sys))"
   (:refer-clojure :exclude [concat drop drop-while map filter mapcat take take-while merge distinct partition group-by])
-  (:import [org.apache.pekko.stream Materializer OverflowStrategy ClosedShape ClosedShape$
-                                    FlowShape Graph SourceShape SinkShape]
+  (:import [org.apache.pekko.stream Materializer OverflowStrategy Graph SourceShape SinkShape]
            [org.apache.pekko.stream.javadsl Source Flow Sink Keep RunnableGraph
                                             AsPublisher SinkQueueWithCancel
-                                            SourceQueueWithComplete GraphDSL GraphDSL$Builder
+                                            SourceQueueWithComplete
                                             Broadcast Balance Merge Partition SubSource]
            [org.apache.pekko.actor ActorSystem ActorRef]
-           [org.apache.pekko NotUsed Done]
-           [org.apache.pekko.japi Pair]
            [org.apache.pekko.japi.pf PFBuilder FI$Apply]
            [java.util.concurrent CompletionStage CompletableFuture]
            [java.util Optional]
            [java.time Duration]
-           [org.reactivestreams Publisher]
-           [org.apache.pekko.event Logging LoggingAdapter]))
+           [org.reactivestreams Publisher]))
 
 ;; ---------------------------------------------------------------------------
 ;; Materializer
@@ -184,9 +187,9 @@
   (.throttle src (int elements) per))
 
 (defn delay-each
-  "Delay each element by the given duration."
+  "Delay each element by the given duration (backpressuring upstream while waiting)."
   [src ^Duration duration]
-  (.delay src duration))
+  (.delay src duration (org.apache.pekko.stream.DelayOverflowStrategy/backpressure)))
 
 (defn buffer
   "Buffer elements when downstream is slower.
@@ -340,10 +343,11 @@
                    :fail        (OverflowStrategy/fail)
                    (OverflowStrategy/fail))
         source (Source/actorRef (int buffer-size) overflow)
-        ;; Materialize to get the ActorRef
-        [src actor-ref] (let [pair (.preMaterialize source materializer)]
-                          [(.first pair) (.second pair)])]
-    [src actor-ref]))
+        ;; preMaterialize returns a Pair (materialized-value, source): .first is
+        ;; the ActorRef, .second is the reusable Source (same convention as
+        ;; source-queue). Return [source actor-ref] per the docstring.
+        pair (.preMaterialize source materializer)]
+    [(.second pair) (.first pair)]))
 
 (defn to-actor
   "Connect a Source to an actor, sending each element as a message.
@@ -357,13 +361,16 @@
 ;; ---------------------------------------------------------------------------
 
 (defn await-completion
-  "Block until a CompletionStage completes, returning its value.
-   timeout-ms: maximum time to wait in milliseconds"
-  [^CompletionStage stage timeout-ms]
-  (try
-    (.get (.toCompletableFuture stage) timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
-    (catch java.util.concurrent.TimeoutException _
-      (throw (ex-info "Stream completion timed out" {:timeout-ms timeout-ms})))))
+  "Block for a CompletionStage's value (up to timeout-ms, default 30000). Rethrows
+   the unwrapped failure if the stage completed exceptionally; returns nil on the
+   block timeout — the same nil-vs-throw convention as pekko-clj.core/<!."
+  ([stage] (await-completion stage 30000))
+  ([^CompletionStage stage timeout-ms]
+   (try
+     (.get (.toCompletableFuture stage) (long timeout-ms) java.util.concurrent.TimeUnit/MILLISECONDS)
+     (catch java.util.concurrent.ExecutionException e
+       (throw (or (.getCause e) e)))
+     (catch java.util.concurrent.TimeoutException _ nil))))
 
 (defn completion->promise
   "Convert a CompletionStage to a Clojure promise."
@@ -798,3 +805,4 @@
   (-> src
       (flat-map-merge n worker-fn)
       (run-to-seq materializer)))
+

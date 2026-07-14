@@ -1,6 +1,7 @@
 (ns pekko-clj.error-handling-test
   (:require [clojure.test :refer :all]
-            [pekko-clj.core :as core])
+            [pekko-clj.core :as core]
+            [pekko-clj.supervision :as sup])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -23,7 +24,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Error Handling
@@ -208,3 +209,69 @@
       (is (= actor @self-ref))
       ;; Sender was the ask temporary actor (not noSender)
       (is (some? @sender-ref)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: on-error vs supervision contract (B10)
+;; ---------------------------------------------------------------------------
+
+(deftest on-error-does-not-swallow-errors
+  ;; An Error must bypass on-error and reach the parent's supervision decider,
+  ;; not be swallowed by the on-error handler.
+  (let [on-error-calls (atom [])
+        decider-received (promise)]
+    (core/defactor b10-error-child
+      (init [_] nil)
+      (on-error [ex msg]
+        (swap! on-error-calls conj (class ex))
+        state)
+      (handle :throw-error
+        (throw (AssertionError. "fatal-ish")))
+      (handle :ping
+        (core/reply :pong)))
+
+    (core/defactor b10-error-parent
+      (supervision (sup/one-for-one (fn [ex]
+                                      (deliver decider-received (class ex))
+                                      :stop)))
+      (init [_] nil)
+      (handle :spawn
+        (core/reply (core/spawn b10-error-child nil))))
+
+    (let [parent (core/spawn *system* b10-error-parent nil)
+          child (await-ask parent :spawn)]
+      (core/! child :throw-error)
+      (is (= AssertionError (deref decider-received 3000 :timeout))
+          "the Error reached the parent's supervision decider")
+      (is (empty? @on-error-calls)
+          "on-error was NOT called for the Error"))))
+
+(deftest on-error-intercepts-exceptions-before-supervision
+  ;; A recoverable Exception is handled by on-error in place; the parent's
+  ;; supervision decider is not invoked and the child keeps running.
+  (let [on-error-calls (atom [])
+        decider-received (atom nil)]
+    (core/defactor b10-recoverable-child
+      (init [_] nil)
+      (on-error [ex msg]
+        (swap! on-error-calls conj (class ex))
+        state)
+      (handle :boom
+        (throw (RuntimeException. "recoverable")))
+      (handle :ping
+        (core/reply :pong)))
+
+    (core/defactor b10-watching-parent
+      (supervision (sup/one-for-one (fn [ex]
+                                      (reset! decider-received (class ex))
+                                      :restart)))
+      (init [_] nil)
+      (handle :spawn
+        (core/reply (core/spawn b10-recoverable-child nil))))
+
+    (let [parent (core/spawn *system* b10-watching-parent nil)
+          child (await-ask parent :spawn)]
+      (core/! child :boom)
+      (Thread/sleep 200)
+      (is (= [RuntimeException] @on-error-calls) "on-error handled the Exception")
+      (is (nil? @decider-received) "supervision decider was NOT invoked")
+      (is (= :pong (await-ask child :ping)) "child is still alive"))))

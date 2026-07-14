@@ -6,6 +6,7 @@
   (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes StatusCode
                                                   ContentTypes ContentType HttpEntities
                                                   ResponseEntity]
+           [org.apache.pekko.http.javadsl.model.headers RawHeader Location]
            [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
            [org.apache.pekko.util ByteString]
            [org.apache.pekko.stream.javadsl Source]))
@@ -127,6 +128,12 @@
 ;; Response Builders
 ;; ---------------------------------------------------------------------------
 
+(defn- ->headers
+  "Build a sequence of HttpHeader (RawHeader) from a map of name -> value.
+   Names may be keywords or strings; values are coerced with str."
+  [headers]
+  (map (fn [[k v]] (RawHeader/create (name k) (str v))) headers))
+
 (defn response
   "Create an HTTP response.
 
@@ -135,7 +142,7 @@
    (response status headers body) - response with status, headers map, and body
 
    status: keyword (:ok, :not-found, etc.) or integer
-   headers: map of header names to values (not yet implemented, reserved)
+   headers: map of header names (keyword or string) to values, added as raw headers
    body: HttpEntity, string, or nil"
   ([status body]
    (let [sc (->status-code status)
@@ -149,8 +156,10 @@
          (.withStatus sc)
          (.withEntity ^String ent))))
   ([status headers body]
-   ;; For now, ignore headers (would require building HttpHeader list)
-   (response status body)))
+   (let [resp (response status body)]
+     (if (seq headers)
+       (.addHeaders resp (java.util.ArrayList. (->headers headers)))
+       resp))))
 
 (defn ok
   "Create an OK (200) response with the given body."
@@ -204,6 +213,5 @@
   ([url]
    (redirect url :found))
   ([url status]
-   ;; Redirect responses typically include a Location header
-   ;; For now, return basic redirect response
-   (response status (text (str "Redirecting to " url)))))
+   (-> (response status (text (str "Redirecting to " url)))
+       (.addHeader (Location/create ^String url)))))

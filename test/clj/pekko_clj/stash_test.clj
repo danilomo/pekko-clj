@@ -1,6 +1,7 @@
 (ns pekko-clj.stash-test
   (:require [clojure.test :refer :all]
-            [pekko-clj.core :as core])
+            [pekko-clj.core :as core]
+            [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -23,7 +24,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Stashing
@@ -62,14 +63,12 @@
     (core/! actor :msg1)
     (core/! actor :msg2)
     (core/! actor :msg3)
-    (Thread/sleep 100)
-    ;; Nothing processed yet
+    ;; All three are stashed (FIFO before this ask), so nothing is processed yet.
     (is (= [] (await-ask actor :get-processed)))
     ;; Become ready - unstashes all
     (core/! actor :ready)
-    (Thread/sleep 100)
-    ;; All messages should be processed in order
-    (is (= [:msg1 :msg2 :msg3] (await-ask actor :get-processed)))))
+    ;; All messages should be processed in order.
+    (is (eventually (= [:msg1 :msg2 :msg3] (await-ask actor :get-processed))))))
 
 (deftest stash-preserves-sender
   (let [received-senders (atom [])
@@ -111,14 +110,11 @@
                        :state nil})]
     ;; Sender sends to stashing actor
     (is (= :sent (await-ask sender-actor :send-to-stashing)))
-    (Thread/sleep 100)
-    ;; Make stashing actor ready
+    ;; Make stashing actor ready (unstashes the payload).
     (core/! stashing-actor :ready)
-    (Thread/sleep 200)
-    ;; Check that sender was preserved
-    (let [senders (await-ask stashing-actor :get-senders)]
-      (is (= 1 (count senders)))
-      (is (= sender-actor (first senders))))))
+    ;; Check that the original sender was preserved on the unstashed message.
+    (is (eventually (= 1 (count (await-ask stashing-actor :get-senders)))))
+    (is (= sender-actor (first (await-ask stashing-actor :get-senders))))))
 
 (deftest stash-size-tracking
   (let [actor (core/new-actor
@@ -146,23 +142,17 @@
                                   ;; Don't stash when not in stashing mode
                                   :else state))))
                 :state {:stashing false}})]
-    ;; Initially empty
+    ;; All sends and asks share one mailbox (FIFO), so the asks observe the
+    ;; expected state without any sleeps.
     (is (= 0 (await-ask actor :get-size)))
-    ;; Enable stashing
     (core/! actor :start-stashing)
-    (Thread/sleep 50)
-    ;; Stash some messages
     (core/! actor :stash-me)
     (core/! actor :stash-me)
     (core/! actor :stash-me)
-    (Thread/sleep 100)
     (is (= 3 (await-ask actor :get-size)))
-    ;; Disable stashing before unstashing
+    ;; Disable stashing, then unstash all (messages won't be re-stashed).
     (core/! actor :stop-stashing)
-    (Thread/sleep 50)
-    ;; Unstash all - messages won't be re-stashed
     (core/! actor :unstash-all)
-    (Thread/sleep 100)
     (is (= 0 (await-ask actor :get-size)))))
 
 (deftest unstash-single-message
@@ -194,16 +184,12 @@
                                     {:ready true})))))
                 :state {:ready false}})]
     ;; First message gets stashed and actor becomes ready
-    (core/! actor :first)
-    (Thread/sleep 50)
-    ;; Second message processed directly
-    (core/! actor :second)
-    (Thread/sleep 50)
+    (core/! actor :first)  ; stashed; actor becomes ready
+    (core/! actor :second) ; processed directly
     (is (= [:second] (await-ask actor :get-processed)))
     ;; Unstash one - should process :first
     (core/! actor :unstash-one)
-    (Thread/sleep 50)
-    (is (= [:second :first] (await-ask actor :get-processed)))))
+    (is (eventually (= [:second :first] (await-ask actor :get-processed))))))
 
 (deftest clear-stash-discards-messages
   (let [processed (atom [])
@@ -241,14 +227,10 @@
     ;; Stash some messages
     (core/! actor :msg1)
     (core/! actor :msg2)
-    (Thread/sleep 50)
-    ;; Clear the stash
+    ;; Clear the stash, then become ready and unstash (nothing left).
     (core/! actor :clear)
-    (Thread/sleep 50)
-    ;; Become ready and unstash
     (core/! actor :ready)
-    (Thread/sleep 50)
-    ;; Nothing should be processed - stash was cleared
+    ;; Nothing should be processed - stash was cleared (all FIFO, no wait needed).
     (is (= [] (await-ask actor :get-processed)))))
 
 (deftest stash-with-defactor
@@ -274,9 +256,7 @@
       (core/! actor :a)
       (core/! actor :b)
       (core/! actor :c)
-      (Thread/sleep 100)
       (is (= [] (await-ask actor :get-processed)))
       ;; Ready - unstash
       (core/! actor :ready)
-      (Thread/sleep 100)
-      (is (= [:a :b :c] (await-ask actor :get-processed))))))
+      (is (eventually (= [:a :b :c] (await-ask actor :get-processed)))))))

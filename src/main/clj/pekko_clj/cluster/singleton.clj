@@ -28,7 +28,7 @@
                       :max-backoff-ms 30000}})"
   (:refer-clojure :exclude [proxy])
   (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef ExtendedActorSystem]
            [org.apache.pekko.cluster.singleton ClusterSingletonManager ClusterSingletonManagerSettings
                                                ClusterSingletonProxy ClusterSingletonProxySettings]
            [org.apache.pekko.pattern BackoffSupervisor BackoffOpts]
@@ -149,15 +149,17 @@
   [^ActorSystem system opts]
   (let [{:keys [singleton-manager-path role buffer-size identification-interval-ms]
          :or {buffer-size 1000}} opts
-        ;; Singleton actor name is always "singleton" within the manager
-        singleton-path (str singleton-manager-path "/singleton")
         settings (cond-> (ClusterSingletonProxySettings/create system)
                    role (.withRole role)
                    buffer-size (.withBufferSize (int buffer-size))
                    identification-interval-ms
                    (.withSingletonIdentificationInterval
                      (FiniteDuration/apply identification-interval-ms TimeUnit/MILLISECONDS)))
-        proxy-props (ClusterSingletonProxy/props singleton-path settings)]
+        ;; ClusterSingletonProxy wants the MANAGER path; it locates the singleton
+        ;; child itself via settings.singletonName (default "singleton"). Do NOT
+        ;; append "/singleton" here, or the proxy looks under the wrong path and
+        ;; never routes messages.
+        proxy-props (ClusterSingletonProxy/props singleton-manager-path settings)]
     (.actorOf system proxy-props)))
 
 ;; ---------------------------------------------------------------------------
@@ -209,13 +211,14 @@
           selection (.actorSelection system singleton-path)
           ;; Use a short timeout to check if actor exists locally
           future (.resolveOne selection (Duration/ofMillis 100))]
-      ;; If we can resolve it quickly, check if it's a local actor
+      ;; If we can resolve it quickly, check if it's a local actor. resolveOne
+      ;; on a LOCAL path only resolves actors on this node, so a resolved ref's
+      ;; path address is host-less (an empty host Option).
       (try
         (let [ref @future
-              local-addr (.address (.provider (.dispatcher system)))
-              actor-addr (.address (.path ref))]
-          ;; Compare addresses - local actors have the same address
-          (or (nil? (.host actor-addr))
+              local-addr (.getDefaultAddress (.provider ^ExtendedActorSystem system))
+              actor-addr (.address (.path ^ActorRef ref))]
+          (or (.isEmpty (.host actor-addr))
               (= local-addr actor-addr)))
         (catch Exception _
           false)))

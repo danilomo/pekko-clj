@@ -22,7 +22,8 @@
      (cluster/leader sys)
      (cluster/self-member sys)
      (cluster/state-snapshot sys)"
-  (:require [pekko-clj.core :as core])
+  (:require [pekko-clj.core :as core]
+            [clojure.string :as str])
   (:import [org.apache.pekko.actor ActorSystem ActorRef Address AddressFromURIString]
            [org.apache.pekko.cluster Cluster Member MemberStatus ClusterEvent$ClusterDomainEvent
                                      ClusterEvent$MemberUp ClusterEvent$MemberRemoved
@@ -59,27 +60,33 @@
    - :port - This node's port (default: 7355)
    - :seed-nodes - Vector of seed node addresses
    - :roles - Vector of roles for this node
+   - :extra-config - A HOCON string or a com.typesafe.config.Config whose settings
+                     are merged with higher precedence over the generated defaults
+                     (e.g. to override the default SplitBrainResolver or
+                     allow-java-serialization). Takes precedence over everything the
+                     map generates, but still falls back to reference.conf.
 
    Example:
      (create-system \"my-app\" {:hostname \"192.168.1.10\"
                                 :port 7355
                                 :seed-nodes [\"pekko://my-app@192.168.1.10:7355\"
                                              \"pekko://my-app@192.168.1.11:7355\"]
-                                :roles [\"backend\"]})"
+                                :roles [\"backend\"]
+                                :extra-config \"pekko.cluster.min-nr-of-members = 2\"})"
   [name config]
   (let [cfg (if (instance? Config config)
               config
-              (let [{:keys [hostname port seed-nodes roles]
+              (let [{:keys [hostname port seed-nodes roles extra-config]
                      :or {hostname "127.0.0.1" port 7355}} config
                     seed-nodes-str (if seed-nodes
                                      (str "["
-                                          (clojure.string/join ", "
+                                          (str/join ", "
                                             (map #(str "\"" % "\"") seed-nodes))
                                           "]")
                                      "[]")
                     roles-str (if roles
                                 (str "["
-                                     (clojure.string/join ", "
+                                     (str/join ", "
                                        (map #(str "\"" % "\"") roles))
                                      "]")
                                 "[]")
@@ -99,21 +106,41 @@
                           roles = " roles-str "
                           downing-provider-class = \"org.apache.pekko.cluster.sbr.SplitBrainResolverProvider\"
                         }
-                      }")]
-                (ConfigFactory/parseString config-str)))]
+                      }")
+                    base-cfg (ConfigFactory/parseString config-str)
+                    extra-cfg (cond
+                                (nil? extra-config) nil
+                                (instance? Config extra-config) extra-config
+                                (string? extra-config) (ConfigFactory/parseString extra-config)
+                                :else (throw (IllegalArgumentException.
+                                              (str ":extra-config must be a HOCON string or a "
+                                                   "com.typesafe.config.Config, got "
+                                                   (class extra-config)))))]
+                ;; extra-config overrides the generated defaults, which in turn
+                ;; override reference.conf (applied below).
+                (if extra-cfg
+                  (.withFallback extra-cfg base-cfg)
+                  base-cfg)))]
     (ActorSystem/create name (.withFallback cfg (ConfigFactory/load)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster Membership
 ;; ---------------------------------------------------------------------------
 
+(declare join-seed-nodes)
+
 (defn join
   "Join the cluster by contacting seed nodes or a specific address.
 
    If address is provided, joins that specific node.
-   If no address is provided, joins using configured seed nodes."
+   If no address is provided, joins using the seed nodes configured under
+   `pekko.cluster.seed-nodes` (a no-op if none are configured)."
   ([system]
-   (.join (cluster system)))
+   (let [cfg (.config (.settings ^ActorSystem system))
+         seeds (when (.hasPath cfg "pekko.cluster.seed-nodes")
+                 (seq (.getStringList cfg "pekko.cluster.seed-nodes")))]
+     (when (seq seeds)
+       (join-seed-nodes system seeds))))
   ([system address]
    (.join (cluster system) (AddressFromURIString/parse address))))
 
@@ -167,7 +194,7 @@
   "Convert a Member to a Clojure map."
   [^Member m]
   {:address (.address m)
-   :status (keyword (clojure.string/lower-case (str (.status m))))
+   :status (keyword (str/lower-case (str (.status m))))
    :roles (set (seq (.getRoles m)))
    :unique-address (.uniqueAddress m)
    :upNumber (.upNumber m)})

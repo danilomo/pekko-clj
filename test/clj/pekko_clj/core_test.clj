@@ -28,7 +28,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: dynamic vars
@@ -99,20 +99,30 @@
 ;; Tests: <?> (ask)
 ;; ---------------------------------------------------------------------------
 
-(deftest ask-returns-scala-future
+(deftest ask-returns-completion-stage
   (let [actor  (core/new-actor *system*
                                (fn [this msg] (.reply this :pong) nil)
                                nil)
         future (core/<?> actor :ping 3000)]
-    (is (instance? scala.concurrent.Future future))))
+    (is (instance? java.util.concurrent.CompletionStage future))
+    ;; A CompletableFuture, so it is also derefable and composable.
+    (is (instance? java.util.concurrent.CompletableFuture future))))
 
-(deftest ask-future-resolves-to-reply
+(deftest ask-future-derefs-to-reply
+  (let [actor  (core/new-actor *system*
+                               (fn [this msg] (.reply this :pong) nil)
+                               nil)]
+    ;; @ works because <?> returns a CompletableFuture.
+    (is (= :pong @(core/<?> actor :ping 3000)))))
+
+(deftest ask-future-composes-with-then-apply
   (let [actor  (core/new-actor *system*
                                (fn [this msg] (.reply this :pong) nil)
                                nil)
-        future (core/<?> actor :ping 3000)
-        result (Await/result future timeout-duration)]
-    (is (= :pong result))))
+        stage  (.thenApply (core/<?> actor :ping 3000)
+                           (reify java.util.function.Function
+                             (apply [_ v] (name v))))]
+    (is (= "pong" @stage))))
 
 (deftest ask-uses-dynamic-timeout
   (binding [core/*timeout* 5000]
@@ -138,6 +148,34 @@
                               (fn [this msg] (.reply this :done) nil)
                               nil)]
     (is (= :done (core/<! *system* actor :go 5000)))))
+
+(deftest blocking-ask-two-arg-form
+  ;; B2: new ergonomic form without a leading ActorSystem.
+  (let [actor (core/new-actor *system*
+                              (fn [this msg] (.reply this (str "hi:" msg)) nil)
+                              nil)]
+    (is (= "hi:x" (core/<! actor "x")))
+    (is (= "hi:y" (core/<! actor "y" 3000)))))
+
+(deftest blocking-ask-surfaces-failure-reply
+  ;; B2: a genuine failure (here a Status/Failure reply) must be rethrown, not
+  ;; silently turned into nil (which was indistinguishable from a timeout).
+  (let [actor (core/new-actor *system*
+                              (fn [this _]
+                                (.reply this (org.apache.pekko.actor.Status$Failure.
+                                              (ex-info "boom" {:k 1})))
+                                nil)
+                              nil)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
+          (core/<! actor :go 3000)))))
+
+(deftest blocking-ask-timeout-returns-nil
+  ;; An actor that never replies: the ask times out (AskTimeoutException) and <!
+  ;; returns nil — distinct from a surfaced failure.
+  (let [actor (core/new-actor *system*
+                              (fn [_ _] nil) ; never replies
+                              nil)]
+    (is (nil? (core/<! actor :go 300)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: become
@@ -272,3 +310,61 @@
         child        (await-ask parent-actor :spawn-child)]
     (is (instance? ActorRef child))
     (is (= :echo (await-ask child :echo)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: DX polish (H5) — context, stop, poison-pill, graceful-stop,
+;;        actor-selection/identify, actor-system Config arity, shutdown-system
+;; ---------------------------------------------------------------------------
+
+(core/defactor h5-context-reporter
+  (handle :ctx? (core/reply (instance? org.apache.pekko.actor.ActorContext (core/context)))))
+
+(core/defactor h5-echo
+  (handle msg (core/reply msg)))
+
+(deftest context-returns-actor-context
+  (let [a (core/spawn *system* h5-context-reporter nil)]
+    (is (true? (core/<! a :ctx? 3000)))))
+
+(deftest poison-pill-stops-actor
+  (let [stopped (promise)
+        a (core/new-actor *system* {:function  (fn [_ _] nil)
+                                    :post-stop (fn [_] (deliver stopped true))
+                                    :state     nil})]
+    (core/poison-pill a)
+    (is (true? (deref stopped 3000 false)))))
+
+(deftest graceful-stop-completes
+  (let [a (core/new-actor *system* {:function (fn [_ _] nil) :state nil})]
+    (is (true? @(core/graceful-stop a 3000)))))
+
+(deftest stop-stops-a-child
+  (let [child-stopped (promise)]
+    (core/defactor h5-stop-child
+      (init [_] nil)
+      (on-stop (deliver child-stopped true))
+      (handle :ping (core/reply :pong)))
+    (core/defactor h5-stop-parent
+      (init [_] {})
+      (handle :make (core/reply (core/spawn h5-stop-child nil)))
+      (handle [:kill c]
+        (core/stop c)
+        (core/reply :killed)))
+    (let [p (core/spawn *system* h5-stop-parent nil)
+          c (core/<! p :make 3000)]
+      (is (= :pong (core/<! c :ping 3000)))
+      (is (= :killed (core/<! p [:kill c] 3000)))
+      (is (true? (deref child-stopped 3000 false))))))
+
+(deftest actor-selection-resolves-actor
+  (let [a   (core/spawn *system* h5-echo nil)
+        sel (core/actor-selection *system* (str (.path a)))]
+    (is (= a @(core/identify sel 3000)))))
+
+(deftest actor-system-with-config-and-shutdown
+  (let [cfg (.withFallback (com.typesafe.config.ConfigFactory/parseString "my.key = 7")
+                           (com.typesafe.config.ConfigFactory/load))
+        sys (core/actor-system "cfg-sys" cfg)]
+    (is (= 7 (.getInt (.config (.settings sys)) "my.key")))
+    ;; shutdown-system returns the Terminated event
+    (is (some? (core/shutdown-system sys 10000)))))

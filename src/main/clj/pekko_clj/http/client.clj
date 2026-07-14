@@ -2,13 +2,13 @@
   "HTTP client for Pekko HTTP.
 
    Provides simple HTTP request functions with async response handling."
-  (:require [pekko-clj.http.response :as resp])
+  (:require [pekko-clj.http.response :as resp]
+            [pekko-clj.http.core :as http])
   (:import [org.apache.pekko.http.javadsl Http]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse HttpMethods
                                                   ContentTypes]
            [org.apache.pekko.http.javadsl.model.headers RawHeader]
            [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.stream Materializer]
            [java.util.concurrent CompletionStage CompletableFuture TimeUnit]
            [java.util.function Function BiConsumer]
            [scala.concurrent.duration Duration]
@@ -202,9 +202,7 @@
 
    materializer-or-system: Materializer or ActorSystem"
   [^HttpResponse response materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
+  (let [mat (http/->materializer materializer-or-system)]
     (-> (.entity response)
         (.toStrict (Duration/create 30 TimeUnit/SECONDS) mat)
         (FutureConverters/asJava)
@@ -218,9 +216,7 @@
 
    materializer-or-system: Materializer or ActorSystem"
   [^HttpResponse response materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
+  (let [mat (http/->materializer materializer-or-system)]
     (-> (.entity response)
         (.toStrict (Duration/create 30 TimeUnit/SECONDS) mat)
         (FutureConverters/asJava)
@@ -233,9 +229,7 @@
    Important for connection reuse - always call this if you don't need the body.
    Returns a CompletionStage<Done>."
   [^HttpResponse response materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
+  (let [mat (http/->materializer materializer-or-system)]
     (.discardBytes (.entity response) mat)))
 
 ;; ---------------------------------------------------------------------------
@@ -270,13 +264,16 @@
                      (f result ex)))))
 
 (defn await-response
-  "Block until a CompletionStage completes, returning its value.
-   timeout-ms: maximum time to wait in milliseconds"
-  [^CompletionStage stage timeout-ms]
-  (try
-    (.get (.toCompletableFuture stage) timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)
-    (catch java.util.concurrent.TimeoutException _
-      (throw (ex-info "Request timed out" {:timeout-ms timeout-ms})))))
+  "Block for a CompletionStage's value (up to timeout-ms, default 30000). Rethrows
+   the unwrapped failure if the request completed exceptionally; returns nil on the
+   block timeout — the same nil-vs-throw convention as pekko-clj.core/<!."
+  ([stage] (await-response stage 30000))
+  ([^CompletionStage stage timeout-ms]
+   (try
+     (.get (.toCompletableFuture stage) (long timeout-ms) java.util.concurrent.TimeUnit/MILLISECONDS)
+     (catch java.util.concurrent.ExecutionException e
+       (throw (or (.getCause e) e)))
+     (catch java.util.concurrent.TimeoutException _ nil))))
 
 ;; ---------------------------------------------------------------------------
 ;; Convenience Functions

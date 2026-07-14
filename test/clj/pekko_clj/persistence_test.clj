@@ -1,7 +1,8 @@
 (ns pekko-clj.persistence-test
   (:require [clojure.test :refer :all]
             [pekko-clj.persistence :as p]
-            [pekko-clj.core :as core])
+            [pekko-clj.core :as core]
+            [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem]
            [com.typesafe.config ConfigFactory]
            [scala.concurrent Await]
@@ -111,6 +112,29 @@
   (on-recovery-complete [this]
     (reset! recovery-completed true)))
 
+(p/defactor-persistent reply-helper-actor
+  "Exercises p/reply, p/recovering?, and p/trigger-snapshot!."
+  :persistence-id (fn [args] (str "reply-helper-" (:id args)))
+
+  (init [_] {:count 0})
+
+  (command :increment
+    (p/persist [:incremented]))
+
+  ;; p/reply returns nil, so no trailing nil is needed to skip persistence.
+  (command :get
+    (p/reply (:count state)))
+
+  (command :recovering?
+    (p/reply (p/recovering? this)))
+
+  (command :snapshot!
+    (p/trigger-snapshot! this)
+    (p/reply :ok))
+
+  (event [:incremented]
+    (update state :count inc)))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests
 ;; ---------------------------------------------------------------------------
@@ -121,17 +145,15 @@
         actor (p/spawn sys counter-actor {:id id})]
     (try
       ;; Initial state
-      (is (= 0 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (= 0 (core/<! actor :get 3000)))
 
       ;; Increment
       (core/! actor :increment)
-      (Thread/sleep 100)
-      (is (= 1 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (eventually (= 1 (core/<! actor :get 3000))))
 
       ;; Add
       (core/! actor [:add 5])
-      (Thread/sleep 100)
-      (is (= 6 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (eventually (= 6 (core/<! actor :get 3000))))
       (finally
         (terminate-system sys)))))
 
@@ -144,8 +166,7 @@
           (core/! actor :increment)
           (core/! actor :increment)
           (core/! actor [:add 10])
-          (Thread/sleep 200)
-          (is (= 12 (Await/result (core/<?> actor :get 3000) timeout-duration))))
+          (is (eventually (= 12 (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))
 
@@ -153,9 +174,7 @@
     (let [sys (create-test-system "persistence-test")]
       (try
         (let [actor (p/spawn sys counter-actor {:id id})]
-          ;; Give time for recovery
-          (Thread/sleep 300)
-          (is (= 12 (Await/result (core/<?> actor :get 3000) timeout-duration))))
+          (is (eventually (= 12 (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))))
 
@@ -164,11 +183,10 @@
         id (unique-id)
         actor (p/spawn sys counter-actor {:id id :initial 100})]
     (try
-      (is (= 100 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (= 100 (core/<! actor :get 3000)))
 
       (core/! actor :increment)
-      (Thread/sleep 100)
-      (is (= 101 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (eventually (= 101 (core/<! actor :get 3000))))
       (finally
         (terminate-system sys)))))
 
@@ -181,8 +199,7 @@
           ;; Send 7 increments (snapshot at 5)
           (dotimes [_ 7]
             (core/! actor :increment))
-          (Thread/sleep 300)
-          (is (= 7 (Await/result (core/<?> actor :get 3000) timeout-duration))))
+          (is (eventually (= 7 (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))
 
@@ -190,8 +207,7 @@
     (let [sys (create-test-system "persistence-test")]
       (try
         (let [actor (p/spawn sys counter-with-snapshot {:id id})]
-          (Thread/sleep 300)
-          (is (= 7 (Await/result (core/<?> actor :get 3000) timeout-duration))))
+          (is (eventually (= 7 (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))))
 
@@ -202,13 +218,11 @@
     (try
       ;; Add two items at once
       (core/! actor [:add-two :a :b])
-      (Thread/sleep 100)
-      (is (= [:a :b] (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (eventually (= [:a :b] (core/<! actor :get 3000))))
 
       ;; Add two more
       (core/! actor [:add-two :c :d])
-      (Thread/sleep 100)
-      (is (= [:a :b :c :d] (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (eventually (= [:a :b :c :d] (core/<! actor :get 3000))))
       (finally
         (terminate-system sys)))))
 
@@ -219,8 +233,8 @@
       (try
         (let [actor (p/spawn sys multi-event-actor {:id id})]
           (core/! actor [:add-two :x :y])
-          ;; Wait for both events to be persisted
-          (Thread/sleep 500))
+          ;; Confirm both events applied (hence persisted) before terminating.
+          (is (eventually (= [:x :y] (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))
 
@@ -228,9 +242,7 @@
     (let [sys (create-test-system "persistence-test")]
       (try
         (let [actor (p/spawn sys multi-event-actor {:id id})]
-          ;; Wait for recovery
-          (Thread/sleep 500)
-          (is (= [:x :y] (Await/result (core/<?> actor :get 3000) timeout-duration))))
+          (is (eventually (= [:x :y] (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))))
 
@@ -240,8 +252,7 @@
         id (unique-id)
         actor (p/spawn sys recovery-callback-actor {:id id})]
     (try
-      (Thread/sleep 200)
-      (is @recovery-completed "Recovery callback should have been called")
+      (is (eventually @recovery-completed) "Recovery callback should have been called")
       (finally
         (terminate-system sys)))))
 
@@ -251,12 +262,12 @@
         actor (p/spawn sys counter-actor {:id id})]
     (try
       ;; Query commands return nil (no event to persist)
-      (is (= 0 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (= 0 (core/<! actor :get 3000)))
 
       ;; Still at 0 after multiple queries
-      (Await/result (core/<?> actor :get 3000) timeout-duration)
-      (Await/result (core/<?> actor :get 3000) timeout-duration)
-      (is (= 0 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (core/<! actor :get 3000)
+      (core/<! actor :get 3000)
+      (is (= 0 (core/<! actor :get 3000)))
       (finally
         (terminate-system sys)))))
 
@@ -266,6 +277,70 @@
         actor (p/spawn-named sys counter-actor {:id id} "my-counter")]
     (try
       (is (= "my-counter" (.name (.path actor))))
-      (is (= 0 (Await/result (core/<?> actor :get 3000) timeout-duration)))
+      (is (= 0 (core/<! actor :get 3000)))
       (finally
         (terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: p/reply helper, recovering?, trigger-snapshot! (B4)
+;; ---------------------------------------------------------------------------
+
+(deftest persistent-reply-helper-works
+  ;; Regression: p/reply previously did (resolve 'this) -> nil -> NPE. It must
+  ;; now reply via the dynamically-bound current persistent actor.
+  (let [sys (create-test-system "persistence-test")
+        id (unique-id)
+        actor (p/spawn sys reply-helper-actor {:id id})]
+    (try
+      (is (= 0 (core/<! actor :get 3000)))
+      (core/! actor :increment)
+      (is (eventually (= 1 (core/<! actor :get 3000))))
+      (finally
+        (terminate-system sys)))))
+
+(deftest persistent-recovering?-false-after-recovery
+  (let [sys (create-test-system "persistence-test")
+        id (unique-id)
+        actor (p/spawn sys reply-helper-actor {:id id})]
+    (try
+      ;; :recovering? is only handled after recovery, so it is already false.
+      (is (false? (core/<! actor :recovering? 3000)))
+      (finally
+        (terminate-system sys)))))
+
+(deftest persistent-trigger-snapshot!-and-recover
+  (let [id (unique-id)]
+    ;; First run: persist events, then manually snapshot.
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys reply-helper-actor {:id id})]
+          (core/! actor :increment)
+          (core/! actor :increment)
+          ;; snapshot!/get are handled FIFO after both increments.
+          (is (= :ok (core/<! actor :snapshot! 3000)))
+          (is (= 2 (core/<! actor :get 3000))))
+        (finally
+          (terminate-system sys))))
+    ;; Second run: state recovers (from snapshot + events).
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys reply-helper-actor {:id id})]
+          (is (eventually (= 2 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest defactor-persistent-docstring-preserved
+  (is (= "Exercises p/reply, p/recovering?, and p/trigger-snapshot!."
+         (:doc (meta #'reply-helper-actor)))))
+
+(deftest defactor-persistent-rejects-state-shadow-in-command
+  ;; H6: `this`/`state` are reserved anaphors in command bodies (macroexpand-1
+  ;; wraps the guard's ExceptionInfo in a CompilerException).
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent bad-persistent
+                            :persistence-id (fn [_] "x")
+                            (init [_] {})
+                            (command [:set state] (p/persist [state]))))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))

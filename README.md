@@ -72,13 +72,15 @@ pekko-clj includes these Apache Pekko modules:
 
 | Module | Version | Purpose |
 |--------|---------|---------|
-| `pekko-actor_3` | 1.1.3 | Core actor system |
-| `pekko-stream_3` | 1.1.3 | Reactive streams |
-| `pekko-persistence_3` | 1.1.3 | Event sourcing |
-| `pekko-cluster_3` | 1.1.3 | Clustering |
-| `pekko-cluster-sharding_3` | 1.1.3 | Cluster sharding |
-| `pekko-cluster-tools_3` | 1.1.3 | Singletons, pub-sub |
-| `pekko-http_3` | 1.1.0 | HTTP server/client |
+| `pekko-actor_3` | 1.6.0 | Core actor system |
+| `pekko-stream_3` | 1.6.0 | Reactive streams |
+| `pekko-persistence_3` | 1.6.0 | Event sourcing |
+| `pekko-cluster_3` | 1.6.0 | Clustering |
+| `pekko-cluster-sharding_3` | 1.6.0 | Cluster sharding |
+| `pekko-cluster-tools_3` | 1.6.0 | Singletons, pub-sub |
+| `pekko-http_3` | 1.3.0 | HTTP server/client |
+| `pekko-testkit_3` | 1.6.0 | `pekko-clj.test` companion |
+| `pekko-stream-testkit_3` | 1.6.0 | Stream test probes |
 
 ## The `defactor` Macro
 

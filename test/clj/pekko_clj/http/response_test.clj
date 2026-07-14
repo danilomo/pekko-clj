@@ -105,3 +105,33 @@
   (testing "Internal server error response helper"
     (let [r (resp/internal-server-error "Server error")]
       (is (= StatusCodes/INTERNAL_SERVER_ERROR (.status r))))))
+
+;; ---------------------------------------------------------------------------
+;; Headers + redirect (B9)
+;; ---------------------------------------------------------------------------
+
+(deftest response-with-headers-test
+  (testing "Headers map (keyword or string names) is applied as raw headers"
+    (let [r (resp/response :ok {"X-Custom" "abc" :x-other 42} "body")]
+      (is (= StatusCodes/OK (.status r)))
+      (is (.isPresent (.getHeader r "X-Custom")))
+      (is (= "abc" (.value (.get (.getHeader r "X-Custom")))))
+      (is (= "42" (.value (.get (.getHeader r "x-other"))))))))
+
+(deftest response-empty-headers-test
+  (testing "Empty/nil headers produce a response with no extra headers"
+    (let [r (resp/response :ok {} "body")]
+      (is (= StatusCodes/OK (.status r)))
+      (is (not (.isPresent (.getHeader r "X-Custom")))))))
+
+(deftest redirect-sets-location-header-test
+  (testing "redirect defaults to 302 Found with a Location header"
+    (let [r (resp/redirect "/new-path")]
+      (is (= StatusCodes/FOUND (.status r)))
+      (is (.isPresent (.getHeader r "Location")))
+      (is (= "/new-path" (.value (.get (.getHeader r "Location")))))))
+  (testing "redirect with an explicit status"
+    (let [r (resp/redirect "https://example.com/page" :moved-permanently)]
+      (is (= StatusCodes/MOVED_PERMANENTLY (.status r)))
+      (is (= "https://example.com/page"
+             (.value (.get (.getHeader r "Location"))))))))

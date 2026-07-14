@@ -1,6 +1,7 @@
 (ns pekko-clj.timer-test
   (:require [clojure.test :refer :all]
-            [pekko-clj.core :as core])
+            [pekko-clj.core :as core]
+            [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -23,7 +24,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Timers
@@ -70,9 +71,8 @@
                                 nil)))
                 :state nil})]
     (core/! actor :setup)
-    (Thread/sleep 200)
-    (core/! actor :stop)
-    (is (>= @counter 3))))
+    (is (eventually (>= @counter 3)))
+    (core/! actor :stop)))
 
 (deftest cancel-timer-stops-messages
   (let [counter (atom 0)
@@ -95,10 +95,10 @@
                                 nil)))
                 :state nil})]
     (core/! actor :setup)
-    (Thread/sleep 100)
+    (is (eventually (>= @counter 1))) ; let at least one tick fire
     (core/! actor :cancel)
     (let [count-at-cancel @counter]
-      (Thread/sleep 100)
+      (Thread/sleep 100) ; stability window: confirm no further ticks
       ;; After cancelling, count should not have increased much (maybe 1 more due to timing)
       (is (<= @counter (+ count-at-cancel 1))))))
 
@@ -124,7 +124,7 @@
                                 nil)))
                 :state nil})]
     (core/! actor :setup)
-    (Thread/sleep 50)
+    ;; :check-active is handled FIFO after :setup, so the timer is already active.
     (is (true? (await-ask actor :check-active)))
     (is (false? (await-ask actor :check-inactive)))))
 
@@ -152,11 +152,11 @@
                                 nil)))
                 :state nil})]
     (core/! actor :setup)
-    (Thread/sleep 100)
+    (is (eventually (and (>= @counter1 1) (>= @counter2 1)))) ; let both fire
     (core/! actor :cancel-all)
     (let [c1 @counter1
           c2 @counter2]
-      (Thread/sleep 100)
+      (Thread/sleep 100) ; stability window: confirm no further ticks
       ;; After cancelling all, counts should not increase
       (is (<= @counter1 (+ c1 1)))
       (is (<= @counter2 (+ c2 1))))))

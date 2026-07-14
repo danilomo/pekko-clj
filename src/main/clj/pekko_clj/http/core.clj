@@ -2,13 +2,14 @@
   "Core HTTP server functionality for Pekko HTTP.
 
    Provides server binding, request accessors, and entity handling."
-  (:require [pekko-clj.stream :as stream])
+  (:require [pekko-clj.stream :as stream]
+            [clojure.string :as str])
   (:import [org.apache.pekko.http.javadsl Http ServerBinding]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse
                                                   HttpMethod HttpMethods Uri Query]
            [org.apache.pekko.http.javadsl.server Route]
            [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.stream Materializer]
+           [org.apache.pekko.stream Materializer SystemMaterializer]
            [org.apache.pekko.util ByteString]
            [java.util.concurrent CompletionStage CompletableFuture TimeUnit]
            [java.util.function Function]
@@ -147,15 +148,24 @@
 ;; Entity Handling
 ;; ---------------------------------------------------------------------------
 
+(defn ->materializer
+  "Resolve a Materializer from a Materializer or an ActorSystem.
+
+   When given a system, returns the shared per-system materializer via
+   SystemMaterializer instead of creating a fresh one each call — the latter
+   leaks an unclosed materializer (and its actor) on every invocation."
+  [materializer-or-system]
+  (if (instance? Materializer materializer-or-system)
+    materializer-or-system
+    (.materializer (SystemMaterializer/get ^ActorSystem materializer-or-system))))
+
 (defn entity->string
   "Convert a request entity to a string.
    Returns a CompletionStage<String>.
 
    materializer-or-system: Materializer or ActorSystem"
   [^HttpRequest request materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
+  (let [mat (->materializer materializer-or-system)]
     (-> (.entity request)
         (.toStrict (Duration/create 10 TimeUnit/SECONDS) mat)
         (FutureConverters/asJava)
@@ -169,9 +179,7 @@
 
    materializer-or-system: Materializer or ActorSystem"
   [^HttpRequest request materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
+  (let [mat (->materializer materializer-or-system)]
     (-> (.entity request)
         (.toStrict (Duration/create 10 TimeUnit/SECONDS) mat)
         (FutureConverters/asJava)
@@ -194,7 +202,7 @@
    \"/api/v1/users/123\" -> [\"api\" \"v1\" \"users\" \"123\"]"
   [^HttpRequest request]
   (let [path (request-path request)]
-    (vec (remove empty? (clojure.string/split path #"/")))))
+    (vec (remove empty? (str/split path #"/")))))
 
 (defn match-path-pattern
   "Match a path against a pattern with :param placeholders.
@@ -204,8 +212,8 @@
    (match-path-pattern \"/users/123\" \"/users/:id\")
    => {:id \"123\"}"
   [path pattern]
-  (let [path-parts (remove empty? (clojure.string/split path #"/"))
-        pattern-parts (remove empty? (clojure.string/split pattern #"/"))]
+  (let [path-parts (remove empty? (str/split path #"/"))
+        pattern-parts (remove empty? (str/split pattern #"/"))]
     (when (= (count path-parts) (count pattern-parts))
       (loop [remaining-path path-parts
              remaining-pattern pattern-parts

@@ -11,13 +11,14 @@
    - EntityRef: A reference to a specific entity for direct messaging
 
    Example:
-     ;; Define a sharded entity actor
+     ;; Define a sharded entity actor. It matches the raw message it is sent and
+     ;; reads its own id with (sharding/entity-id).
      (core/defactor order-actor
-       (init [args] {:order-id (:entity-id args) :items []})
+       (init [_] {:items []})
        (handle [:add-item item]
          (update state :items conj item))
        (handle :get-items
-         (core/reply (:items state))))
+         (core/reply {:order-id (sharding/entity-id) :items (:items state)})))
 
      ;; Start sharding
      (def orders (sharding/start sys order-actor
@@ -68,20 +69,23 @@
    - shard-id: Which shard the entity belongs to"
   [num-shards]
   (proxy [ShardRegion$HashCodeMessageExtractor] [(int num-shards)]
+    ;; Only EntityMessage envelopes (produced by tell/ask/entity-ref) carry an
+    ;; entity id and are routed; anything else has no id and is dropped by Pekko.
     (entityId [message]
-      (cond
-        (instance? EntityMessage message) (:entity-id message)
-        (and (vector? message) (>= (count message) 2))
-        (str (first message))  ; First element as entity ID
-        :else nil))
+      (when (instance? EntityMessage message)
+        (:entity-id message)))
+    ;; Deliver the *unwrapped* payload so the entity actor matches the raw
+    ;; message pattern it was written for; it reads its own id via (entity-id).
     (entityMessage [message]
-      (cond
-        (instance? EntityMessage message)
-        ;; Wrap with entity-id so entity knows its ID
-        [:entity-message (:entity-id message) (:message message)]
-        (and (vector? message) (>= (count message) 2))
-        (subvec message 1)  ; Rest as the actual message
-        :else message))))
+      (if (instance? EntityMessage message)
+        (:message message)
+        message))))
+
+(defn entity-id
+  "Return the current sharded entity's id — its actor-path name, which Pekko sets
+   to the entity id. Call inside an entity actor's handler or init body."
+  []
+  (.name (.path ^ActorRef (core/self))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sharding Setup
@@ -106,7 +110,8 @@
 
    Returns the ShardRegion ActorRef.
 
-   The entity actor's init function receives {:entity-id <id>} as args.
+   Entity actors are all created from the same Props (their init receives nil
+   args); an entity reads its own id at runtime with (entity-id).
 
    Example:
      (sharding/start sys order-actor
@@ -171,15 +176,16 @@
 (defn ask
   "Send a message to a sharded entity and wait for a reply.
 
-   Returns a Scala Future of the response.
+   Returns a java.util.concurrent.CompletableFuture of the response (deref with @,
+   compose with .thenApply, or block with pekko-clj.core/<!).
 
    Arguments:
    - shard-region: The ShardRegion ActorRef
    - entity-id: The entity's unique identifier
    - message: The message to send
-   - timeout-ms: Timeout in milliseconds (default: 5000)"
+   - timeout-ms: Timeout in milliseconds (default: pekko-clj.core/*timeout*)"
   ([shard-region entity-id message]
-   (ask shard-region entity-id message 5000))
+   (ask shard-region entity-id message core/*timeout*))
   ([shard-region entity-id message timeout-ms]
    (core/<?> shard-region (entity-message entity-id message) timeout-ms)))
 
@@ -247,13 +253,14 @@
 (defn ask-entity
   "Send a message to an entity via its EntityRef and wait for a reply.
 
-   Returns a Scala Future of the response.
+   Returns a java.util.concurrent.CompletableFuture of the response (deref with @,
+   compose with .thenApply, or block with pekko-clj.core/<!).
 
    Example:
      (ask-entity order-ref :get-items)
      (ask-entity order-ref :get-items 10000)"
   ([^EntityRef ref message]
-   (ask-entity ref message 5000))
+   (ask-entity ref message core/*timeout*))
   ([^EntityRef ref message timeout-ms]
    (ask (.shard-region ref) (.entity-id ref) message timeout-ms)))
 
@@ -267,12 +274,12 @@
    Arguments:
    - system: ActorSystem
    - type-name: The entity type name
-   - timeout-ms: Timeout for gathering stats (default: 5000)
+   - timeout-ms: Timeout for gathering stats (default: pekko-clj.core/*timeout*)
 
    Returns a future of the ClusterShardingStats object containing:
    - regions: Map of region addresses to their shard stats"
   ([system type-name]
-   (cluster-sharding-stats system type-name 5000))
+   (cluster-sharding-stats system type-name core/*timeout*))
   ([system type-name timeout-ms]
    (let [shard-region (get-shard-region system type-name)
          timeout (FiniteDuration/create timeout-ms TimeUnit/MILLISECONDS)

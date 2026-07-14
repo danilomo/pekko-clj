@@ -6,7 +6,16 @@
    - :resume   - Resume the actor, keeping its accumulated state
    - :restart  - Restart the actor, clearing its state
    - :stop     - Stop the actor permanently
-   - :escalate - Escalate the failure to the parent's supervisor"
+   - :escalate - Escalate the failure to the parent's supervisor
+
+   on-error vs supervision:
+   A `defactor` may define an `on-error` clause (see pekko-clj.core/defactor).
+   When set, it intercepts recoverable Exceptions thrown while handling a message
+   and lets the actor recover in place (compute a new state, reply, ...), so the
+   parent's supervisor strategy does NOT see those failures. Without an on-error
+   clause, exceptions propagate to the parent's supervisor strategy. Errors (e.g.
+   OutOfMemoryError, AssertionError) and InterruptedException always bypass
+   on-error and propagate — supervision (or the JVM) handles them."
   (:import [pekko_clj.actor CljSupervisorStrategy]))
 
 (defn one-for-one

@@ -3,7 +3,8 @@
 
    Provides a Compojure-style routing API with Pekko HTTP backend."
   (:require [pekko-clj.http.core :as http]
-            [pekko-clj.http.response :as resp])
+            [pekko-clj.http.response :as resp]
+            [clojure.string :as str])
   (:import [org.apache.pekko.http.javadsl.server Route AllDirectives Directives]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse
                                                   HttpMethods StatusCodes]
@@ -320,7 +321,7 @@
    (GET \"/users/:id\" [id]
      (complete :ok (json (get-user id))))"
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (clojure.string/split path-pattern #"/"))
+  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     ;; Path with parameters - use extract-request
     `(method-get
       (extract-request
@@ -343,7 +344,7 @@
    (POST \"/users\" []
      (complete :created (json new-user)))"
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (clojure.string/split path-pattern #"/"))
+  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-post
       (extract-request
        (fn [req#]
@@ -361,7 +362,7 @@
 (defmacro PUT
   "Define a PUT route with path matching."
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (clojure.string/split path-pattern #"/"))
+  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-put
       (extract-request
        (fn [req#]
@@ -379,7 +380,7 @@
 (defmacro DELETE
   "Define a DELETE route with path matching."
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (clojure.string/split path-pattern #"/"))
+  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-delete
       (extract-request
        (fn [req#]
@@ -397,7 +398,7 @@
 (defmacro PATCH
   "Define a PATCH route with path matching."
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (clojure.string/split path-pattern #"/"))
+  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-patch
       (extract-request
        (fn [req#]

@@ -1,106 +1,63 @@
 (ns pekko-clj.cluster.sharding-test
   (:require [clojure.test :refer :all]
             [pekko-clj.core :as core]
-            [pekko-clj.cluster :as cluster]
-            [pekko-clj.cluster.sharding :as sharding])
-  (:import [org.apache.pekko.actor ActorSystem]
-           [scala.concurrent Await]
-           [scala.concurrent.duration Duration]))
+            [pekko-clj.cluster.sharding :as sharding]
+            [pekko-clj.test-support :as ts :refer [eventually]]))
 
-(def timeout-duration (Duration/create 10 "seconds"))
-
+;; core/<?> now returns a CompletableFuture; block on it (deref returns nil on
+;; timeout, rethrows the actor's failure otherwise).
 (defn await-result [future]
-  (Await/result future timeout-duration))
-
-;; ---------------------------------------------------------------------------
-;; Helper: Create cluster-enabled system for sharding tests
-;; ---------------------------------------------------------------------------
-
-(defn create-sharding-system [name]
-  (cluster/create-system name
-    {:hostname "127.0.0.1"
-     :port 0}))
-
-(defn wait-for-cluster-up [sys]
-  (let [c (cluster/cluster sys)]
-    (.join c (.selfAddress c))
-    (loop [attempts 50]
-      (if (zero? attempts)
-        false
-        (let [member (cluster/self-member sys)
-              status (str (.status member))]
-          (if (= "Up" status)
-            true
-            (do
-              (Thread/sleep 100)
-              (recur (dec attempts)))))))))
-
-(defn terminate-system [sys]
-  (.terminate sys)
-  (Await/result (.whenTerminated sys) (Duration/create 10 "seconds")))
+  (deref future 10000 nil))
 
 ;; ---------------------------------------------------------------------------
 ;; Test Actor Definitions
 ;; ---------------------------------------------------------------------------
 
+;; Entities match the raw (unwrapped) payload they are sent and read their own id
+;; via (sharding/entity-id).
 (core/defactor counter-entity
   "Simple counter entity for testing"
-  (init [args]
-    {:entity-id (:entity-id args)
-     :count 0})
-  (handle [:entity-message id msg]
-    ;; Unwrap entity message and update entity-id if needed
-    (let [new-state (if (nil? (:entity-id state))
-                      (assoc state :entity-id id)
-                      state)]
-      (case (first msg)
-        :inc (update new-state :count inc)
-        :get (do (core/reply (:count new-state)) new-state)
-        :get-id (do (core/reply (:entity-id new-state)) new-state)
-        new-state)))
-  (handle :inc
+  (init [_] {:count 0})
+  (handle [:inc]
     (update state :count inc))
-  (handle :get
+  (handle [:get]
     (core/reply (:count state)))
-  (handle :get-id
-    (core/reply (:entity-id state))))
+  (handle [:get-id]
+    (core/reply (sharding/entity-id))))
 
 (def entity-log (atom []))
 
 (core/defactor logging-entity
   "Entity that logs operations for testing"
-  (init [args]
-    {:entity-id (:entity-id args)})
-  (handle [:entity-message id msg]
-    (swap! entity-log conj {:id id :msg msg})
-    (let [new-state (if (nil? (:entity-id state))
-                      (assoc state :entity-id id)
-                      state)]
-      (case (first msg)
-        :ping (do (core/reply :pong) new-state)
-        :get-id (do (core/reply id) new-state)
-        new-state))))
+  (init [_] {})
+  (handle [:ping]
+    (swap! entity-log conj {:id (sharding/entity-id) :msg :ping})
+    (core/reply :pong)
+    state)
+  (handle [:get-id]
+    (core/reply (sharding/entity-id))
+    state))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Basic Sharding
 ;; ---------------------------------------------------------------------------
 
 (deftest sharding-start-test
-  (let [sys (create-sharding-system "sharding-start-test")]
+  (let [sys (ts/create-cluster-system "sharding-start-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys counter-entity
                      {:type-name "Counter"
                       :num-shards 10})]
         (is (some? region))
         (is (instance? org.apache.pekko.actor.ActorRef region)))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 (deftest sharding-tell-ask-test
-  (let [sys (create-sharding-system "sharding-tell-ask-test")]
+  (let [sys (ts/create-cluster-system "sharding-tell-ask-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys counter-entity
                      {:type-name "Counter"
                       :num-shards 10})]
@@ -108,21 +65,19 @@
         (sharding/tell region "counter-1" [:inc])
         (sharding/tell region "counter-1" [:inc])
         (sharding/tell region "counter-1" [:inc])
-        (Thread/sleep 500)
-        ;; Ask for the count
-        (let [count (await-result (sharding/ask region "counter-1" [:get]))]
-          (is (= 3 count))))
+        ;; Poll until the three increments have been applied.
+        (is (eventually (= 3 (await-result (sharding/ask region "counter-1" [:get]))))))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: EntityRef
 ;; ---------------------------------------------------------------------------
 
 (deftest entity-ref-creation-test
-  (let [sys (create-sharding-system "entity-ref-creation-test")]
+  (let [sys (ts/create-cluster-system "entity-ref-creation-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [_ (sharding/start sys counter-entity
                 {:type-name "Counter"
                  :num-shards 10})
@@ -132,12 +87,12 @@
         (is (= "Counter" (:type-name ref)))
         (is (some? (:shard-region ref))))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 (deftest entity-ref-tell-ask-test
-  (let [sys (create-sharding-system "entity-ref-tell-ask-test")]
+  (let [sys (ts/create-cluster-system "entity-ref-tell-ask-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [_ (sharding/start sys counter-entity
                 {:type-name "Counter"
                  :num-shards 10})
@@ -145,17 +100,15 @@
         ;; Use tell-entity
         (sharding/tell-entity ref [:inc])
         (sharding/tell-entity ref [:inc])
-        (Thread/sleep 500)
-        ;; Use ask-entity
-        (let [count (await-result (sharding/ask-entity ref [:get]))]
-          (is (= 2 count))))
+        ;; Use ask-entity (poll until both increments applied)
+        (is (eventually (= 2 (await-result (sharding/ask-entity ref [:get]))))))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 (deftest entity-ref-multiple-entities-test
-  (let [sys (create-sharding-system "entity-ref-multi-test")]
+  (let [sys (ts/create-cluster-system "entity-ref-multi-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [_ (sharding/start sys counter-entity
                 {:type-name "Counter"
                  :num-shards 10})
@@ -165,23 +118,20 @@
         (sharding/tell-entity ref-a [:inc])
         (sharding/tell-entity ref-a [:inc])
         (sharding/tell-entity ref-b [:inc])
-        (Thread/sleep 500)
         ;; Verify they have independent state
-        (let [count-a (await-result (sharding/ask-entity ref-a [:get]))
-              count-b (await-result (sharding/ask-entity ref-b [:get]))]
-          (is (= 2 count-a))
-          (is (= 1 count-b))))
+        (is (eventually (= 2 (await-result (sharding/ask-entity ref-a [:get])))))
+        (is (eventually (= 1 (await-result (sharding/ask-entity ref-b [:get]))))))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Shard Region Info
 ;; ---------------------------------------------------------------------------
 
 (deftest get-shard-region-test
-  (let [sys (create-sharding-system "get-region-test")]
+  (let [sys (ts/create-cluster-system "get-region-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [original (sharding/start sys counter-entity
                        {:type-name "TestEntity"
                         :num-shards 10})
@@ -189,12 +139,12 @@
         (is (some? retrieved))
         (is (= original retrieved)))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 (deftest shard-region-registered-test
-  (let [sys (create-sharding-system "registered-test")]
+  (let [sys (ts/create-cluster-system "registered-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       ;; Before starting, region should not be registered
       (is (not (sharding/shard-region-registered? sys "NotStarted")))
       ;; Start a region
@@ -204,16 +154,16 @@
       ;; Now it should be registered
       (is (sharding/shard-region-registered? sys "Started"))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Cluster Sharding Stats
 ;; ---------------------------------------------------------------------------
 
 (deftest cluster-sharding-stats-test
-  (let [sys (create-sharding-system "stats-test")]
+  (let [sys (ts/create-cluster-system "stats-test")]
     (try
-      (is (wait-for-cluster-up sys))
+      (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys counter-entity
                      {:type-name "StatsEntity"
                       :num-shards 10})]
@@ -221,12 +171,10 @@
         (sharding/tell region "entity-1" [:inc])
         (sharding/tell region "entity-2" [:inc])
         (sharding/tell region "entity-3" [:inc])
-        (Thread/sleep 1000)
-        ;; Get stats
-        (let [stats (await-result (sharding/cluster-sharding-stats sys "StatsEntity" 5000))]
+        ;; Get stats once the region responds
+        (let [stats (ts/poll-until
+                     #(await-result (sharding/cluster-sharding-stats sys "StatsEntity" 5000)))]
           (is (some? stats))
-          ;; Convert to map
-          (let [stats-map (sharding/stats->map stats)]
-            (is (contains? stats-map :regions)))))
+          (is (contains? (sharding/stats->map stats) :regions))))
       (finally
-        (terminate-system sys)))))
+        (ts/terminate-system sys)))))

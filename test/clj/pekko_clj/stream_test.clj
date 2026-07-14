@@ -1,7 +1,8 @@
 (ns pekko-clj.stream-test
   (:require [clojure.test :refer :all]
             [pekko-clj.core :as core]
-            [pekko-clj.stream :as s])
+            [pekko-clj.stream :as s]
+            [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.stream Materializer]
            [org.apache.pekko Done]
@@ -155,6 +156,15 @@
                    (s/await-completion 3000))]
     (is (= [:a :sep :b :sep :c] (vec result)))))
 
+(deftest delay-each-preserves-elements
+  ;; Regression (H3): delay-each called Source.delay with no strategy, which has
+  ;; no matching method — it would have thrown at runtime.
+  (let [result (-> (s/source [1 2 3])
+                   (s/delay-each (java.time.Duration/ofMillis 10))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 5000))]
+    (is (= [1 2 3] (vec result)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: Combining sources
 ;; ---------------------------------------------------------------------------
@@ -239,11 +249,21 @@
                 :state nil})]
     ;; to-actor returns NotUsed, not CompletionStage - just run it
     (s/to-actor (s/source [1 2 3]) actor :done *mat*)
-    (Thread/sleep 200)
-    (is (= [1 2 3] @received))))
+    (is (eventually (= [1 2 3] @received)))))
 
-;; Note: source-actor-ref requires more complex setup with preMaterialize
-;; which has different behavior. Skipping this test for now.
+(deftest source-actor-ref-emits-and-completes
+  ;; B7: source-actor-ref returns [source actor-ref] (previously swapped, so the
+  ;; ActorRef and Source came back in the wrong slots).
+  (let [[src actor-ref] (s/source-actor-ref 16 :fail *mat*)]
+    (is (instance? org.apache.pekko.actor.ActorRef actor-ref)
+        "second element must be the ActorRef")
+    (let [result (s/run-to-seq src *mat*)]
+      (core/! actor-ref 1)
+      (core/! actor-ref 2)
+      (core/! actor-ref 3)
+      ;; Status.Success completes the actor-ref-backed source.
+      (core/! actor-ref (org.apache.pekko.actor.Status$Success. "done"))
+      (is (= [1 2 3] (vec (s/await-completion result 5000)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Utility functions
@@ -261,10 +281,10 @@
                                         (java.time.Duration/ofSeconds 10)
                                         :tick)
                         (s/take 1))]
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"timed out"
-          (-> slow-stream
-              (s/run-to-seq *mat*)
-              (s/await-completion 100))))))
+    ;; H5: await-completion returns nil on the block timeout (matches core/<!).
+    (is (nil? (-> slow-stream
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 100))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Phase 1 - Async Operators
@@ -481,9 +501,8 @@
                      [(s/sink-foreach #(swap! results conj [:sink1 %]))
                       (s/sink-foreach #(swap! results conj [:sink2 %]))]
                      *mat*)]
-    (Thread/sleep 200)
     ;; Both sinks received all elements
-    (is (= 6 (count @results)))
+    (is (eventually (= 6 (count @results))))
     (is (= 3 (count (clojure.core/filter #(= :sink1 (first %)) @results))))
     (is (= 3 (count (clojure.core/filter #(= :sink2 (first %)) @results))))))
 
@@ -546,8 +565,7 @@
                   *mat*)
                  (s/await-completion 3000))]
     (is (instance? Done done))
-    (Thread/sleep 100)
-    (is (= #{1 2 3} (set @results)))))
+    (is (eventually (= #{1 2 3} (set @results))))))
 
 (deftest sink-queue-allows-pulling
   (let [queue (-> (s/source [1 2 3])
@@ -602,8 +620,7 @@
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= [2 3 4] (vec result)))
-    (Thread/sleep 100)
-    (is (= [1 2 3] @tapped))))
+    (is (eventually (= [1 2 3] @tapped)))))
 
 (deftest also-to-sends-to-sink
   (let [secondary (atom [])
@@ -612,8 +629,7 @@
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= [1 2 3] (vec result)))
-    (Thread/sleep 100)
-    (is (= [1 2 3] @secondary))))
+    (is (eventually (= [1 2 3] @secondary)))))
 
 (deftest watch-termination-callback
   (let [completed (promise)

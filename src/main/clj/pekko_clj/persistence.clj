@@ -30,6 +30,11 @@
            [org.apache.pekko.persistence SnapshotSelectionCriteria]
            [pekko_clj.actor CljPersistentActor]))
 
+(def ^:dynamic *current-persistent-actor*
+  "Bound to the current CljPersistentActor during command handling.
+   Used by (reply ...). Mirrors pekko-clj.core/*current-actor*."
+  nil)
+
 ;; ---------------------------------------------------------------------------
 ;; Persistent Actor Definition
 ;; ---------------------------------------------------------------------------
@@ -73,11 +78,12 @@
                                 [pattern `(do ~@body)])
                               commands)]
     `(fn [~this-sym ~command-sym]
-       (let [~'this ~this-sym
-             ~'state @~this-sym]
-         (match ~command-sym
-           ~@match-clauses
-           :else nil)))))
+       (binding [*current-persistent-actor* ~this-sym]
+         (let [~'this ~this-sym
+               ~'state @~this-sym]
+           (match ~command-sym
+             ~@match-clauses
+             :else nil))))))
 
 (defn- build-event-handler [events]
   (let [state-sym (gensym "state")
@@ -102,10 +108,13 @@
    - (snapshot-every n)       - Take snapshot every n events
    - (on-recovery-complete [this] ...) - Called when recovery finishes
 
-   The `this` binding is available in command handlers for:
-   - @this          - Current state
-   - (reply msg)    - Reply to sender
+   In command bodies, `this` (the actor) and `state` (its current value) are
+   reserved anaphors:
+   - @this / state   - Current state
+   - (reply msg)     - Reply to sender
    - (persist event) - Return event(s) to persist
+   Do not shadow `this`/`state` in a command pattern — that throws at
+   macro-expansion.
 
    Example:
      (defactor-persistent counter
@@ -131,7 +140,9 @@
 
        (snapshot-every 50))"
   [name & clauses]
-  (let [persistence-id-fn (parse-persistence-id clauses)
+  (let [docstring (when (string? (first clauses)) (first clauses))
+        clauses   (if docstring (rest clauses) clauses)
+        persistence-id-fn (parse-persistence-id clauses)
         init-fn (parse-init clauses)
         commands (parse-commands clauses)
         events (parse-events clauses)
@@ -139,24 +150,38 @@
         on-recovery-complete (parse-on-recovery-complete clauses)
         command-handler (build-command-handler commands)
         event-handler (build-event-handler events)]
-    `(def ~name
-       {:type :persistent-actor
-        :persistence-id-fn ~persistence-id-fn
-        :init-fn ~init-fn
-        :command-handler ~command-handler
-        :event-handler ~event-handler
-        :snapshot-every ~snapshot-every
-        :on-recovery-complete ~on-recovery-complete
-        :make-props (fn [args#]
-                      (let [init-fn# ~init-fn
-                            initial-state# (when init-fn# (init-fn# args#))
-                            persistence-id# (~persistence-id-fn args#)]
-                        {:state initial-state#
-                         :persistence-id persistence-id#
-                         :command-handler ~command-handler
-                         :event-handler ~event-handler
-                         :snapshot-every ~snapshot-every
-                         :on-recovery-complete ~on-recovery-complete}))})))
+    ;; Reserved-anaphor guard: `this`/`state` are auto-bound in command bodies.
+    (doseq [cmd commands]
+      (let [pattern (second cmd)]
+        (when (some #{'this 'state} (tree-seq coll? seq pattern))
+          (throw (ex-info (str "defactor-persistent " name ": `this`/`state` are reserved "
+                               "bindings in command bodies — rename them in the command pattern")
+                          {:pattern pattern})))))
+    ;; Bind each generated form to a local exactly once (no double splice), then
+    ;; reference the locals from both the actor-def map and its :make-props.
+    `(def ~(if docstring (vary-meta name assoc :doc docstring) name)
+       (let [command-handler#      ~command-handler
+             event-handler#        ~event-handler
+             init-fn#              ~init-fn
+             persistence-id-fn#    ~persistence-id-fn
+             snapshot-every#       ~snapshot-every
+             on-recovery-complete# ~on-recovery-complete]
+         {:type :persistent-actor
+          :persistence-id-fn persistence-id-fn#
+          :init-fn init-fn#
+          :command-handler command-handler#
+          :event-handler event-handler#
+          :snapshot-every snapshot-every#
+          :on-recovery-complete on-recovery-complete#
+          :make-props (fn [args#]
+                        (let [initial-state# (when init-fn# (init-fn# args#))
+                              persistence-id# (persistence-id-fn# args#)]
+                          {:state initial-state#
+                           :persistence-id persistence-id#
+                           :command-handler command-handler#
+                           :event-handler event-handler#
+                           :snapshot-every snapshot-every#
+                           :on-recovery-complete on-recovery-complete#}))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Spawning Persistent Actors
@@ -206,10 +231,12 @@
   event-or-events)
 
 (defn reply
-  "Reply to the sender of the current command.
-   Use this in command handlers."
+  "Reply to the sender of the current command. Call inside a command handler,
+   where defactor-persistent binds the current persistent actor. Returns nil, so
+   a command whose last form is (reply ...) persists no event."
   [msg]
-  (.reply ^CljPersistentActor (resolve 'this) msg))
+  (.reply ^CljPersistentActor *current-persistent-actor* msg)
+  nil)
 
 ;; ---------------------------------------------------------------------------
 ;; Actor State Access

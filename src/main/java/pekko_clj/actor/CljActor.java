@@ -4,8 +4,6 @@ import org.apache.pekko.actor.*;
 import clojure.lang.RT;
 import clojure.lang.IDeref;
 import clojure.lang.IFn;
-import clojure.lang.ISeq;
-import clojure.lang.Seqable;
 import clojure.lang.Keyword;
 import clojure.lang.PersistentVector;
 import clojure.lang.ILookup;
@@ -95,12 +93,22 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       Object result = function.invoke(this, translatedMessage);
       handleState(result);
     } catch (Throwable t) {
+      // on-error vs supervision contract:
+      //  - Error and InterruptedException always propagate: they are never
+      //    routed to on-error. Swallowing them would hide fatal failures
+      //    (OutOfMemoryError, StackOverflowError) and break thread interruption.
+      //  - Any other Throwable (i.e. a recoverable Exception): if an on-error
+      //    handler is set it recovers the actor IN PLACE, so the parent's
+      //    supervisor strategy never sees the failure; otherwise it is rethrown
+      //    so supervision can decide (restart/resume/stop/escalate).
+      if (t instanceof Error || t instanceof InterruptedException) {
+        throw t;
+      }
       if (errorHandler != null) {
-        // Call error handler: (fn [this exception message] ...) -> new-state
+        // on-error handler: (fn [this exception message] ...) -> new-state
         Object result = errorHandler.invoke(this, t, translatedMessage);
         handleState(result);
       } else {
-        // No error handler - rethrow to trigger supervision
         throw t;
       }
     } finally {
@@ -114,6 +122,9 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       return;
     }
 
+    // Behavior switching goes through BecomeResult only (see core/become). Any
+    // other return value — including a PersistentVector — is the new state, so a
+    // handler whose state legitimately is a vector is handled correctly.
     if (result instanceof BecomeResult) {
       BecomeResult b = (BecomeResult) result;
       this.function = b.function;
@@ -121,18 +132,7 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       return;
     }
 
-    if (PersistentVector.class.isAssignableFrom(result.getClass())) {
-      var seq = ((Seqable) result).seq();
-      handleSeq(seq);
-      return;
-    }
-
     state = result;
-  }
-
-  private void handleSeq(ISeq seq) {
-    function = (IFn) seq.first();
-    state = seq.more().first();
   }
 
   @Override
@@ -148,6 +148,15 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
 
     Object initial = preStart.invoke(this);
     handleState(initial);
+  }
+
+  @Override
+  public void postStop() {
+    // Runs on stop, and (via the default preRestart) on restart. Powers the
+    // defactor `on-stop` clause and the :post-stop prop.
+    if (postStop != null) {
+      postStop.invoke(this);
+    }
   }
 
   @Override
@@ -189,6 +198,18 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
 
   public void reply(Object msg) {
     getSender().tell(msg, getSelf());
+  }
+
+  /**
+   * Mark a message as unhandled. Delegates to Pekko's default handling, which
+   * publishes an {@link org.apache.pekko.actor.UnhandledMessage} to the actor
+   * system's event stream (and throws {@code DeathPactException} for an
+   * unwatched {@code Terminated}). Used by the {@code defactor} catch-all so an
+   * unmatched message does not crash the actor with a {@code MatchError}.
+   */
+  @Override
+  public void unhandled(Object message) {
+    super.unhandled(message);
   }
 
   public Scheduler scheduler() {
