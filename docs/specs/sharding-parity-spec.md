@@ -23,8 +23,12 @@
 | `:type-name` | Type name | ✅ |
 | `:role` | `withRole` | ✅ |
 | `:num-shards` | Extractor param | ✅ |
-| `:passivate-after` | `withPassivateIdleEntityAfter` | ✅ |
+| `:passivate-after` | `withPassivationStrategy` (idle) | ✅ |
+| `:passivation` | `withPassivationStrategy` (idle / LRU / SLRU / MRU / LFU) | ✅ |
 | `:remember-entities` | `withRememberEntities` | ✅ |
+| `:remember-entities-store` | `remember-entities-store` config | ✅ |
+| `:journal-plugin-id` / `:snapshot-plugin-id` | `withJournalPluginId` / `withSnapshotPluginId` | ✅ |
+| `:stop-message` | `start(…, allocationStrategy, handOffStopMessage)` | ✅ |
 
 ---
 
@@ -75,7 +79,7 @@
 
 ---
 
-### 2. Advanced Passivation Strategies (Medium Priority)
+### 2. Advanced Passivation Strategies ✅ Implemented
 
 **Pekko API:** `passivation.strategy` configuration
 
@@ -98,19 +102,25 @@
   ...)
 ```
 
-**Implementation Notes:**
-- Requires configuration-based setup, not programmatic
-- Generate HOCON config string for passivation settings:
-  ```hocon
-  pekko.cluster.sharding.passivation {
-    strategy = "default-strategy"
-    default-strategy {
-      active-entity-limit = 100000
-      replacement.policy = "least-recently-used"
-    }
-  }
-  ```
-- Pass config to `ClusterShardingSettings.create(system, config)`
+**Implemented as (N5):** `sharding/passivation-settings` builds a
+`ClusterShardingSettings.PassivationStrategySettings` programmatically — no HOCON generation
+needed, Pekko 1.6 exposes a builder (`withIdleEntityPassivation`, `withActiveEntityLimit`,
+`withLeastRecentlyUsedReplacement` / `withMostRecentlyUsedReplacement` /
+`withLeastFrequentlyUsedReplacement`, segmented LRU via `LeastRecentlyUsedSettings`).
+`start` accepts it as `:passivation` (a map or a settings object):
+
+```clojure
+(sharding/start sys order-entity
+  {:type-name "Order"
+   :passivation {:strategy :least-recently-used   ;; or :idle / :most-recently-used
+                 :active-entity-limit 10000       ;;    / :least-frequently-used / :none
+                 :segmented [0.2 0.8]             ;; optional SLRU levels
+                 :idle-timeout 300000}})          ;; may be combined with a limit
+```
+
+Note: Pekko disables automatic passivation entirely when `:remember-entities` is on.
+`:passivate-after` remains as the idle shorthand — it previously called
+`withPassivateIdleEntityAfter`, which does not exist in Pekko 1.6 (it threw at runtime).
 
 ---
 
@@ -281,22 +291,41 @@
 
 ---
 
-### 8. Remember Entities Store Mode (Low Priority)
+### 8. Remember Entities Store Mode ✅ Implemented
 
 **Pekko API:** `remember-entities-store`
 
 **Purpose:** Configure how remembered entity IDs are stored (ddata vs eventsourced).
 
-**Signature:**
-```clojure
-;; Add to start opts
-:remember-entities-store - Storage mode (:ddata or :eventsourced)
-```
+**Implemented as (N5):** `start`'s `:remember-entities-store` (`:ddata` / `:eventsourced`),
+plus `:journal-plugin-id` / `:snapshot-plugin-id` for the eventsourced store. There is no
+`with…` setter for the store mode, so `sharding/sharding-settings` builds the settings from
+the system's own `pekko.cluster.sharding` config section with the key overridden.
 
-**Implementation Notes:**
-- Configuration-based: `pekko.cluster.sharding.remember-entities-store`
-- `:ddata` - Use Distributed Data (default)
-- `:eventsourced` - Use Event Sourcing with persistence
+Note: with the ddata store, remembered entities are written through the *durable* (LMDB)
+replicator by default, which needs `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED` — or
+`pekko.cluster.sharding.distributed-data.durable.keys = []` to keep them in memory (what
+`test/resources/cluster-test.conf` does).
+
+---
+
+### 9. Sharded Daemon Process ✅ Implemented
+
+**Pekko API:** `ShardedDaemonProcess.init` (typed only)
+
+**Purpose:** Keep exactly `n` always-on workers running across the cluster — queue
+consumers, projections, periodic jobs — rebalanced automatically, not addressed by id.
+
+**Implemented as (N5):** `pekko-clj.cluster.daemon/start`. `ShardedDaemonProcess` has no
+classic API, so each worker runs inside a narrow typed wrapper
+(`pekko_clj.actor.CljDaemonProcess`) that spawns the classic `defactor` actor as its child,
+forwards messages to it, and stops when it stops. Adds the `pekko-cluster-sharding-typed_3`
+dependency; nothing user-facing becomes typed.
+
+```clojure
+(daemon/start sys "partition-workers" 4 partition-worker
+  {:keep-alive-interval 5000 :role "workers" :stop-message :stop})
+```
 
 ---
 
@@ -306,9 +335,12 @@
 |---------|--------|-------|
 | entity-ref | ✅ Implemented | `entity-ref`, `tell-entity`, `ask-entity` |
 | cluster-sharding-stats | ✅ Implemented | `cluster-sharding-stats`, `stats->map` |
-| passivate-entity | ✅ Implemented | `passivate` function |
+| passivate-entity | ✅ Implemented | `passivate` (0- or 1-arg context) |
 | Health checks | ✅ Implemented | `shard-region-registered?` |
-| Advanced passivation | ❌ Not implemented | Configuration-based |
+| Advanced passivation | ✅ Implemented | `passivation-settings`, `start` `:passivation` |
+| Remember-entities store | ✅ Implemented | `:remember-entities-store`, `sharding-settings` |
+| Hand-off stop message | ✅ Implemented | `start` `:stop-message` |
+| Sharded daemon process | ✅ Implemented | `pekko-clj.cluster.daemon/start` (typed shim) |
 | External allocation | ❌ Not implemented | Kafka co-location use case |
 | Custom allocation | ❌ Not implemented | Advanced use case |
 
@@ -323,9 +355,9 @@ User Code                    Shard Region              Entity Actor
     |   (EntityMessage envelope)  |                         |
     |                             |-- route to shard -----> |
     |                             |                         |
-    |                             |<-- [:entity-message     |
-    |                             |     id, msg] ---------->|
-    |                             |                         |
+    |                             |-- msg (unwrapped) ----->|
+    |                             |   entity reads its own  |
+    |                             |   id via (entity-id)    |
 ```
 
 ## Proposed EntityRef Flow
@@ -353,6 +385,18 @@ Tests in `test/clj/pekko_clj/cluster/sharding_test.clj`:
 - `get-shard-region-test` - Get existing shard region
 - `shard-region-registered-test` - Health check for region registration
 - `cluster-sharding-stats-test` - Cluster-wide statistics
+- `passivation-settings-*-test` - Idle / LRU / SLRU / MRU / LFU / disabled strategy settings
+- `sharding-settings-from-opts-test` - Settings built from `start` opts (passivation,
+  role, remember-entities + store mode, persistence plugins)
+- `idle-passivation-stops-entity-test` - An idle entity is passivated and recreated
+- `manual-passivate-recreates-entity-test` - `passivate` + stop-message round trip
+- `start-with-stop-message-and-remember-entities-test` - Hand-off stop message overload
+
+Daemon process tests in `test/clj/pekko_clj/cluster/daemon_test.clj`:
+
+- `daemon-settings-test` - Keep-alive interval and role settings
+- `daemon-process-starts-all-instances-test` - All `n` workers start with their index
+- `daemon-process-with-stop-message-test` - Stop message passes through the typed wrapper
 
 ---
 

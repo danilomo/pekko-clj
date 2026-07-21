@@ -25,6 +25,10 @@
 | `unsubscribe` | `cluster.unsubscribe` | ✅ Complete |
 | `register-on-member-up` | `registerOnMemberUp` | ✅ Complete |
 | `register-on-member-removed` | `registerOnMemberRemoved` | ✅ Complete |
+| `prepare-for-shutdown` | `prepareForFullClusterShutdown` | ✅ Complete |
+| `split-brain-resolver-config` | SBR HOCON + `SplitBrainResolverProvider` | ✅ Complete (N6) |
+| `create-system` `:split-brain-resolver` | SBR wired into system config | ✅ Complete (N6) |
+| `coordinated-shutdown` / `add-shutdown-task` / `add-cancellable-shutdown-task` / `add-jvm-shutdown-hook` / `run-coordinated-shutdown` | `CoordinatedShutdown` | ✅ Complete (N6) |
 
 ---
 
@@ -126,7 +130,59 @@
 
 ---
 
-### 6. Multi-DC Support (Future)
+### 6. Split Brain Resolver config helper ✅ Implemented (N6)
+
+**Pekko API:** `pekko.cluster.split-brain-resolver.*` + `SplitBrainResolverProvider`.
+
+**Purpose:** Configure the recommended downing provider (SBR) without hand-writing HOCON.
+
+**Functions:**
+```clojure
+;; Standalone: build a Config for the SBR (pass as :extra-config, or use the
+;; :split-brain-resolver key on create-system).
+(split-brain-resolver-config
+  {:active-strategy :static-quorum   ; :keep-majority (default) | :static-quorum
+                                     ; | :keep-oldest | :down-all | :lease-majority
+   :quorum-size 3
+   :role "backend"
+   :stable-after 15000               ; ms number or HOCON duration string
+   :down-all-when-unstable true})    ; true→on | false→off | duration
+
+;; Wired into create-system:
+(create-system "app" {:port 7355
+                      :split-brain-resolver {:active-strategy :keep-majority
+                                             :stable-after 20000}})
+```
+Precedence in `create-system`: `:extra-config` > `:split-brain-resolver` > generated
+defaults > reference.conf.
+
+---
+
+### 7. Coordinated Shutdown wrapper ✅ Implemented (N6)
+
+**Pekko API:** `CoordinatedShutdown` (`addTask`, `addCancellableTask`, `run`,
+`addJvmShutdownHook`), phase/reason constants.
+
+**Purpose:** Register cleanup tasks that run phase-by-phase on ActorSystem shutdown, and
+trigger shutdown programmatically. Complements `prepare-for-shutdown`.
+
+**Functions:**
+```clojure
+(coordinated-shutdown system)                 ; the extension (any ActorSystem)
+shutdown-phases                                ; keyword → phase-name map (ordered)
+shutdown-reasons                               ; keyword → CoordinatedShutdown.Reason map
+(add-shutdown-task system :before-actor-system-terminate "flush" (fn [] ...))
+(add-cancellable-shutdown-task system phase name f)  ; → Cancellable
+(add-jvm-shutdown-hook system (fn [] ...))
+(run-coordinated-shutdown system)             ; → CompletableFuture<Done>
+(run-coordinated-shutdown system :jvm-exit)   ; reason keyword / Reason / nil
+```
+A task fn returning a `CompletionStage` is awaited before its phase completes; any other
+return completes the task immediately (`Done`).
+
+---
+
+### 8. Multi-DC Support (Future)
 
 **Pekko API:** `selfMember.dataCenter`, `state.allDataCenters`
 
@@ -174,6 +230,13 @@ All new features have been tested in `test/clj/pekko_clj/cluster_test.clj`:
 - `members-by-age-test` - Tests members sorted by age (upNumber)
 - `state-snapshot-test` - Tests cluster state snapshot
 - `is-terminated-test` - Tests cluster termination status check
+
+N6 (SBR + CoordinatedShutdown) is covered in `test/clj/pekko_clj/coordination_test.clj`:
+
+- SBR config rendering per strategy, duration/on-off/role/quorum handling, unknown-strategy throw
+- `create-system` merges `:split-brain-resolver` into the live config; `:extra-config` wins over it
+- CoordinatedShutdown: task runs on shutdown, `CompletionStage` task awaited, cancelled task skipped,
+  phase/reason maps, bad phase/reason throw
 
 ---
 

@@ -1,14 +1,38 @@
 (ns pekko-clj.http.routing
   "Routing DSL for Pekko HTTP.
 
-   Provides a Compojure-style routing API with Pekko HTTP backend."
+   Provides a Compojure-style routing API with Pekko HTTP backend.
+
+   Beyond paths and methods it covers:
+   - extraction: `param`/`param-opt`/`params`, `form-field`/`form-fields`,
+     `header-value`/`header-value-opt`, `with-request-body`
+   - marshalling: `with-json-body`/`with-edn-body`/`with-body` in,
+     `complete-json`/`complete-edn` out (see `pekko-clj.http.marshalling`)
+   - failure handling: `handle-rejections`/`handle-exceptions` with the
+     `rejection-handler`/`exception-handler` builders
+   - websockets: `websocket` over a stream Flow of Messages (`text-flow`)
+
+   Example:
+     (routes
+       (path \"users\"
+         (routes
+           (method-get (path-end (complete-json (list-users))))
+           (method-post (path-end (with-json-body #(complete-json :created (create! %)))))))
+       (path \"echo\" (websocket (text-flow str/upper-case))))"
   (:require [pekko-clj.http.core :as http]
             [pekko-clj.http.response :as resp]
+            [pekko-clj.http.marshalling :as marshal]
+            [pekko-clj.stream :as stream]
             [clojure.string :as str])
-  (:import [org.apache.pekko.http.javadsl.server Route AllDirectives Directives]
-           [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse
+  (:import [org.apache.pekko.http.javadsl.server Route AllDirectives Directives
+                                                 ExceptionHandler RejectionHandler
+                                                 Rejection]
+           [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse HttpEntity$Strict
                                                   HttpMethods StatusCodes]
            [org.apache.pekko.http.javadsl.model.headers Location]
+           [org.apache.pekko.http.javadsl.model.ws Message TextMessage BinaryMessage]
+           [org.apache.pekko.japi.pf FI$Apply]
+           [java.time Duration]
            [java.util.function Supplier Function]
            [java.util.concurrent CompletionStage CompletableFuture]
            [scala.jdk.javaapi FutureConverters]))
@@ -220,6 +244,52 @@
                                         default-value)]
                             (inner-fn value))))))
 
+(defn params
+  "Extract all query parameters as a Clojure map of keyword -> string.
+   Multi-valued parameters keep their last value (Pekko's parameterMap).
+
+   (params (fn [{:keys [page size]}] (complete (str page \"/\" size))))"
+  [inner-fn]
+  (.parameterMap directives
+                 (reify Function
+                   (apply [_ m]
+                     (inner-fn (into {} (map (fn [e] [(keyword (key e)) (val e)])) m))))))
+
+;; ---------------------------------------------------------------------------
+;; Form Field Directives
+;; ---------------------------------------------------------------------------
+
+(defn form-field
+  "Extract a required form field (application/x-www-form-urlencoded body).
+
+   (form-field \"username\" (fn [name] (complete name)))"
+  [field-name inner-fn]
+  (.formField directives
+              field-name
+              (reify Function
+                (apply [_ value] (inner-fn value)))))
+
+(defn form-field-opt
+  "Extract an optional form field, using default-value when absent."
+  [field-name default-value inner-fn]
+  (.formFieldOptional directives
+                      field-name
+                      (reify Function
+                        (apply [_ opt-value]
+                          (inner-fn (if (.isPresent opt-value)
+                                      (.get opt-value)
+                                      default-value))))))
+
+(defn form-fields
+  "Extract all form fields as a Clojure map of keyword -> string.
+
+   (form-fields (fn [{:keys [username password]}] ...))"
+  [inner-fn]
+  (.formFieldMap directives
+                 (reify Function
+                   (apply [_ m]
+                     (inner-fn (into {} (map (fn [e] [(keyword (key e)) (val e)])) m))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Header Directives
 ;; ---------------------------------------------------------------------------
@@ -418,25 +488,188 @@
 ;; ---------------------------------------------------------------------------
 
 (defn with-request-body
-  "Extract and process the request body as a string.
+  "Extract the request body as a string and pass it to handler-fn, which returns a
+   Route. The body is buffered (made strict) first, so handler-fn is called with a
+   plain string — no futures to thread through.
 
    (with-request-body
-     (fn [body] (complete :ok body)))"
-  [handler-fn]
-  (extract-request
-   (fn [req]
-     (extract-materializer
-      (fn [mat]
-        (complete-future
-         (-> (http/entity->string req mat)
-             (.thenApply
-              (reify Function
-                (apply [_ body-str]
-                  (let [route (handler-fn body-str)]
-                    ;; Route needs to be converted to response
-                    ;; For simplicity, return the route directly
-                    ;; The caller should ensure handler-fn returns a response
-                    route)))))))))))
+     (fn [body] (complete :ok body)))
+   (with-request-body 10000 (fn [body] ...))   ;; custom buffering timeout (ms)"
+  ([handler-fn] (with-request-body 5000 handler-fn))
+  ([timeout-ms handler-fn]
+   (.extractStrictEntity directives
+                         (Duration/ofMillis (long timeout-ms))
+                         (reify Function
+                           (apply [_ strict]
+                             (handler-fn (.utf8String (.getData ^HttpEntity$Strict strict))))))))
+
+(defn- with-parsed-body
+  "Shared body parsing: buffer the body, parse it with parse-fn, and hand the data
+   to handler-fn. A parse failure completes 400 instead of throwing."
+  [timeout-ms parse-fn label handler-fn]
+  (with-request-body
+    timeout-ms
+    (fn [body]
+      (let [parsed (try
+                     {:ok (parse-fn body)}
+                     (catch Exception e
+                       {:error (.getMessage e)}))]
+        (if (contains? parsed :ok)
+          (handler-fn (:ok parsed))
+          (complete :bad-request (str "Malformed " label " body: " (:error parsed))))))))
+
+(defn with-json-body
+  "Parse the request body as JSON (keys keywordized) and pass the data to
+   handler-fn, which returns a Route. A malformed body completes 400.
+
+   (with-json-body (fn [{:keys [name]}] (complete-json :created {:name name})))"
+  ([handler-fn] (with-json-body 5000 handler-fn))
+  ([timeout-ms handler-fn]
+   (with-parsed-body timeout-ms marshal/json-> "JSON" handler-fn)))
+
+(defn with-edn-body
+  "Parse the request body as EDN (via clojure.edn — no code evaluation) and pass
+   the data to handler-fn, which returns a Route. A malformed body completes 400."
+  ([handler-fn] (with-edn-body 5000 handler-fn))
+  ([timeout-ms handler-fn]
+   (with-parsed-body timeout-ms marshal/edn-> "EDN" handler-fn)))
+
+(defn with-body
+  "Parse the request body according to its Content-Type — JSON and EDN become
+   Clojure data, anything else stays a string — and pass it to handler-fn."
+  ([handler-fn] (with-body 5000 handler-fn))
+  ([timeout-ms handler-fn]
+   (extract-request
+    (fn [req]
+      (with-parsed-body timeout-ms
+        (fn [body] (marshal/unmarshal (http/request-content-type req) body))
+        "request"
+        handler-fn)))))
+
+;; ---------------------------------------------------------------------------
+;; Marshalled Completion
+;; ---------------------------------------------------------------------------
+
+(defn complete-json
+  "Complete with Clojure data encoded as JSON (application/json).
+
+   (complete-json {:id 1})
+   (complete-json :created {:id 1})"
+  ([data] (complete-json :ok data))
+  ([status data] (complete status (resp/json data))))
+
+(defn complete-edn
+  "Complete with Clojure data encoded as EDN (application/edn)."
+  ([data] (complete-edn :ok data))
+  ([status data] (complete status (resp/edn data))))
+
+;; ---------------------------------------------------------------------------
+;; Rejection & Exception Handling
+;; ---------------------------------------------------------------------------
+
+(defn rejection-handler
+  "Build a Pekko RejectionHandler.
+
+   Options map:
+   - :not-found - Route used when no route matched (Pekko's 'handleNotFound')
+   - :all       - (fn [rejections] route) handling every remaining rejection; the
+                  argument is a Clojure seq of Rejection objects
+   - :handle    - map of Rejection class -> (fn [rejection] route)
+
+   Returns: RejectionHandler — pass it to `handle-rejections`.
+
+   Example:
+     (rejection-handler
+       {:not-found (complete :not-found \"nothing here\")
+        :handle {MethodRejection (fn [_] (complete :method-not-allowed \"nope\"))}})"
+  ^RejectionHandler [{:keys [not-found all handle]}]
+  (let [builder (RejectionHandler/newBuilder)
+        builder (reduce (fn [b [klass f]]
+                          (.handle b klass (reify Function
+                                             (apply [_ rejection] (f rejection)))))
+                        builder
+                        handle)
+        builder (if all
+                  (.handleAll builder Rejection
+                              (reify Function
+                                (apply [_ rejections] (all (seq rejections)))))
+                  builder)
+        builder (if not-found (.handleNotFound builder not-found) builder)]
+    (.build builder)))
+
+(defn handle-rejections
+  "Run `route` with a RejectionHandler (from `rejection-handler`, or a raw
+   RejectionHandler) in scope.
+
+   (handle-rejections (rejection-handler {:not-found (complete :not-found \"…\")})
+     my-routes)"
+  [^RejectionHandler handler route]
+  (.handleRejections directives handler (reify Supplier (get [_] route))))
+
+(defn exception-handler
+  "Build a Pekko ExceptionHandler from a map of Throwable class -> (fn [ex] route),
+   or from a single (fn [ex] route) applied to any Throwable.
+
+   Example:
+     (exception-handler
+       {IllegalArgumentException (fn [e] (complete :bad-request (.getMessage e)))
+        Throwable                (fn [_] (complete :internal-server-error \"boom\"))})"
+  ^ExceptionHandler [handlers]
+  (let [builder (ExceptionHandler/newBuilder)]
+    (if (map? handlers)
+      (do (doseq [[klass f] handlers]
+            (.match builder klass (reify FI$Apply (apply [_ ex] (f ex)))))
+          (.build builder))
+      (-> builder
+          (.matchAny (reify FI$Apply (apply [_ ex] (handlers ex))))
+          (.build)))))
+
+(defn handle-exceptions
+  "Run `route` with an ExceptionHandler (from `exception-handler`, or a raw
+   ExceptionHandler) in scope, turning thrown exceptions into responses.
+
+   (handle-exceptions (exception-handler {Throwable (fn [e] (complete :internal-server-error …))})
+     my-routes)"
+  [^ExceptionHandler handler route]
+  (.handleExceptions directives handler (reify Supplier (get [_] route))))
+
+;; ---------------------------------------------------------------------------
+;; WebSockets
+;; ---------------------------------------------------------------------------
+
+(defn text-message
+  "Create a strict WebSocket text Message."
+  ^TextMessage [^String s]
+  (TextMessage/create s))
+
+(defn message->text
+  "The text of a strict WebSocket text message, or nil for binary or streamed
+   messages (stream those yourself with `.getStreamedText`)."
+  [^Message msg]
+  (when (and (.isText msg) (.isStrict msg))
+    (.getStrictText (.asTextMessage msg))))
+
+(defn text-flow
+  "Build a Flow of WebSocket Messages that answers each incoming *text* message
+   with (f text). Returning nil from f drops the message; binary and streamed
+   messages are dropped too.
+
+   (websocket (text-flow str/upper-case))"
+  [f]
+  (-> (stream/flow-of Message)
+      (stream/smap (fn [msg] (some-> (message->text msg) f)))
+      (stream/sfilter some?)
+      (stream/smap (fn [text] (text-message (str text))))))
+
+(defn websocket
+  "Handle a WebSocket upgrade on this route with a Flow of Messages (see
+   `text-flow` for the common text case). Requests that are not upgrades are
+   rejected, so this composes with `routes`.
+
+   (path \"echo\" (websocket (text-flow identity)))
+   (path \"chat\" (websocket flow \"chat-v1\"))   ;; require a subprotocol"
+  ([flow] (.handleWebSocketMessages directives flow))
+  ([flow ^String protocol] (.handleWebSocketMessagesForProtocol directives flow protocol)))
 
 (defn handle-request
   "Create a route from a request handler function.

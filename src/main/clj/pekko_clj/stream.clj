@@ -9,6 +9,22 @@
    - Flow: transforms elements (map, filter, etc.)
    - Sink: consumes elements (foreach, fold, to actors, etc.)
 
+   Most operators take the stream as their first argument and are polymorphic over
+   a Source and a Flow, so they thread with `->`. The `run-*` family takes a
+   Materializer (see `materializer`) as its LAST argument and returns a
+   CompletionStage; `await-completion` blocks for its value.
+
+   Beyond the basics:
+   - Materialized values: `to-mat`/`via-mat`/`run-mat` with `keep-mat`
+     (:left/:right/:both/:none), plus `run-source-queue` / `run-sink-queue`.
+   - Lifecycle: `run-with-kill-switch` and `shared-kill-switch` to stop streams
+     from outside; `shutdown` / `abort`.
+   - Failure handling: `with-supervision` (:stop/:resume/:restart) for
+     per-element failures, `recover*` for fallbacks, and `restart-*` /
+     `retry-flow` for backoff.
+   - Actor interop: `ask` / `ask-with-status`, `source-actor-ref`, `to-actor`,
+     `sink-actor-ref-with-backpressure`.
+
    Naming convention: `map` and `filter` clash with clojure.core and are used so
    pervasively that they are renamed here with an `s` prefix — `smap`/`sfilter` —
    rather than shadowed. Less commonly-confused ops (`concat`, `drop`, `take`,
@@ -17,22 +33,53 @@
    qualify them (`stream/take`) or use the aliased require in call sites.
 
    Example:
-     (-> (source (range 100))
-         (smap inc)
-         (sfilter even?)
-         (run-foreach println sys))"
+     (let [mat (materializer sys)]
+       (-> (source (range 100))
+           (smap inc)
+           (sfilter even?)
+           (run-foreach println mat)))"
   (:refer-clojure :exclude [concat drop drop-while map filter mapcat take take-while merge distinct partition group-by])
-  (:import [org.apache.pekko.stream Materializer OverflowStrategy Graph SourceShape SinkShape]
+  (:import [org.apache.pekko.stream Materializer OverflowStrategy Graph SourceShape SinkShape
+                                    ActorAttributes Attributes CompletionStrategy KillSwitch
+                                    KillSwitches RestartSettings SharedKillSwitch Supervision]
            [org.apache.pekko.stream.javadsl Source Flow Sink Keep RunnableGraph
                                             AsPublisher SinkQueueWithCancel
                                             SourceQueueWithComplete
-                                            Broadcast Balance Merge Partition SubSource]
+                                            Broadcast Balance Merge Partition SubSource
+                                            RestartSource RestartFlow RestartSink RetryFlow]
            [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.japi.pf PFBuilder FI$Apply]
+           [org.apache.pekko.pattern StatusReply]
+           [org.apache.pekko.util Timeout]
            [java.util.concurrent CompletionStage CompletableFuture]
            [java.util Optional]
            [java.time Duration]
            [org.reactivestreams Publisher]))
+
+;; ---------------------------------------------------------------------------
+;; Coercion helpers
+;; ---------------------------------------------------------------------------
+
+(defn- ->duration
+  "Coerce a java.time.Duration or a number of milliseconds to a Duration."
+  ^Duration [d]
+  (if (instance? Duration d) d (Duration/ofMillis (long d))))
+
+(defn- ->overflow-strategy
+  "Coerce an overflow-strategy keyword to an OverflowStrategy, falling back to
+   `default` (itself a keyword) when the strategy is nil or unrecognized.
+
+   Note: not every operator accepts every strategy — `Source/actorRef` rejects
+   :backpressure, for instance. Pekko validates at materialization."
+  [strategy default]
+  (case strategy
+    :drop-head    (OverflowStrategy/dropHead)
+    :drop-tail    (OverflowStrategy/dropTail)
+    :drop-buffer  (OverflowStrategy/dropBuffer)
+    :drop-new     (OverflowStrategy/dropNew)
+    :fail         (OverflowStrategy/fail)
+    :backpressure (OverflowStrategy/backpressure)
+    (->overflow-strategy default nil)))
 
 ;; ---------------------------------------------------------------------------
 ;; Materializer
@@ -196,15 +243,7 @@
    size: buffer size
    strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail"
   [src size strategy]
-  (let [overflow-strategy
-        (case strategy
-          :drop-head   (OverflowStrategy/dropHead)
-          :drop-tail   (OverflowStrategy/dropTail)
-          :drop-buffer (OverflowStrategy/dropBuffer)
-          :drop-new    (OverflowStrategy/dropNew)
-          :fail        (OverflowStrategy/fail)
-          (OverflowStrategy/dropNew))]
-    (.buffer src (int size) overflow-strategy)))
+  (.buffer src (int size) (->overflow-strategy strategy :drop-new)))
 
 (defn async
   "Run the previous stages asynchronously."
@@ -277,9 +316,30 @@
 (defn sink-actor-ref
   "Create a Sink that sends elements to an actor.
    on-complete-msg: message to send when stream completes
-   Note: This sink materializes to NotUsed, not a CompletionStage."
+   Note: This sink materializes to NotUsed, not a CompletionStage.
+   This sink does not backpressure — a slow actor's mailbox will grow unbounded.
+   Use sink-actor-ref-with-backpressure when the actor must pace the stream."
   [^ActorRef actor-ref on-complete-msg]
   (Sink/actorRef actor-ref on-complete-msg))
+
+(defn sink-actor-ref-with-backpressure
+  "Create a Sink that sends elements to an actor, using an ack protocol so the
+   actor backpressures the stream.
+
+   The actor receives on-init-msg first and must reply with ack-msg; thereafter it
+   must reply with ack-msg for each element before the next is sent. on-complete-msg
+   is sent when the stream completes; on-failure-fn (a fn of Throwable -> message)
+   builds the message sent when it fails.
+
+   Materializes to NotUsed.
+
+   Example:
+     (sink-actor-ref-with-backpressure worker :init :ack :done
+                                       (fn [ex] [:failed (.getMessage ex)]))"
+  [^ActorRef actor-ref on-init-msg ack-msg on-complete-msg on-failure-fn]
+  (Sink/actorRefWithBackpressure actor-ref on-init-msg ack-msg on-complete-msg
+                                 (reify org.apache.pekko.japi.function.Function
+                                   (apply [_ ex] (on-failure-fn ex)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Running streams
@@ -325,29 +385,61 @@
 ;; Actor integration
 ;; ---------------------------------------------------------------------------
 
+(defn- ->completion-strategy
+  "Coerce :immediately / :draining (or a CompletionStrategy) to a CompletionStrategy."
+  [v]
+  (cond
+    (instance? CompletionStrategy v) v
+    (= :immediately v)               (CompletionStrategy/immediately)
+    :else                            (CompletionStrategy/draining)))
+
 (defn source-actor-ref
   "Create a Source backed by an actor that you can send messages to.
    Returns [source actor-ref].
 
    buffer-size: size of the buffer
    overflow-strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail
+     (:backpressure is NOT supported here — use source-queue instead)
 
-   Send messages to the actor-ref to emit them from the source.
-   Send org.apache.pekko.actor.Status$Success to complete the stream."
-  [buffer-size overflow-strategy materializer]
-  (let [overflow (case overflow-strategy
-                   :drop-head   (OverflowStrategy/dropHead)
-                   :drop-tail   (OverflowStrategy/dropTail)
-                   :drop-buffer (OverflowStrategy/dropBuffer)
-                   :drop-new    (OverflowStrategy/dropNew)
-                   :fail        (OverflowStrategy/fail)
-                   (OverflowStrategy/fail))
-        source (Source/actorRef (int buffer-size) overflow)
-        ;; preMaterialize returns a Pair (materialized-value, source): .first is
-        ;; the ActorRef, .second is the reusable Source (same convention as
-        ;; source-queue). Return [source actor-ref] per the docstring.
-        pair (.preMaterialize source materializer)]
-    [(.second pair) (.first pair)]))
+   Send messages to the actor-ref to emit them from the source. With the 3-arity,
+   completion/failure use Pekko's defaults: send org.apache.pekko.actor.Status$Success
+   to complete the stream and Status$Failure to fail it.
+
+   The 4-arity takes an opts map and uses the matcher-based Source/actorRef overload
+   for explicit control over which messages terminate the stream:
+   - :complete-with  fn of message -> :immediately, :draining, a CompletionStrategy,
+                     or nil to not complete
+   - :fail-with      fn of message -> a Throwable, or nil to not fail
+
+   Example:
+     (source-actor-ref 8 :fail {:complete-with #(when (= :done %) :immediately)
+                               :fail-with     #(when (= :boom %) (RuntimeException. \"boom\"))}
+                       mat)"
+  ([buffer-size overflow-strategy materializer]
+   (source-actor-ref buffer-size overflow-strategy nil materializer))
+  ([buffer-size overflow-strategy opts materializer]
+   (let [overflow (->overflow-strategy overflow-strategy :fail)
+         {:keys [complete-with fail-with]} opts
+         source (if opts
+                  (Source/actorRef
+                   (reify org.apache.pekko.japi.function.Function
+                     (apply [_ msg]
+                       (if-let [v (when complete-with (complete-with msg))]
+                         (Optional/of (->completion-strategy v))
+                         (Optional/empty))))
+                   (reify org.apache.pekko.japi.function.Function
+                     (apply [_ msg]
+                       (if-let [^Throwable ex (when fail-with (fail-with msg))]
+                         (Optional/of ex)
+                         (Optional/empty))))
+                   (int buffer-size)
+                   overflow)
+                  (Source/actorRef (int buffer-size) overflow))
+         ;; preMaterialize returns a Pair (materialized-value, source): .first is
+         ;; the ActorRef, .second is the reusable Source (same convention as
+         ;; source-queue). Return [source actor-ref] per the docstring.
+         pair (.preMaterialize source materializer)]
+     [(.second pair) (.first pair)])))
 
 (defn to-actor
   "Connect a Source to an actor, sending each element as a message.
@@ -616,15 +708,7 @@
    buffer-size: size of the buffer
    overflow-strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail, :backpressure"
   [buffer-size overflow-strategy materializer]
-  (let [overflow (case overflow-strategy
-                   :drop-head    (OverflowStrategy/dropHead)
-                   :drop-tail    (OverflowStrategy/dropTail)
-                   :drop-buffer  (OverflowStrategy/dropBuffer)
-                   :drop-new     (OverflowStrategy/dropNew)
-                   :fail         (OverflowStrategy/fail)
-                   :backpressure (OverflowStrategy/backpressure)
-                   (OverflowStrategy/backpressure))
-        source (Source/queue (int buffer-size) overflow)
+  (let [source (Source/queue (int buffer-size) (->overflow-strategy overflow-strategy :backpressure))
         pair (.preMaterialize source materializer)]
     [(.first pair) (.second pair)]))
 
@@ -806,3 +890,403 @@
       (flat-map-merge n worker-fn)
       (run-to-seq materializer)))
 
+
+;; ---------------------------------------------------------------------------
+;; N1: Materialized values (toMat / viaMat / Keep)
+;; ---------------------------------------------------------------------------
+
+(defn keep-mat
+  "Return the Keep combiner for a keyword: :left, :right, :both or :none.
+
+   Used by via-mat / to-mat / run-mat to choose which materialized value(s) to
+   retain. (Named keep-mat rather than `keep` to avoid shadowing clojure.core/keep.)"
+  [which]
+  (case which
+    :left  (Keep/left)
+    :right (Keep/right)
+    :both  (Keep/both)
+    :none  (Keep/none)
+    (throw (IllegalArgumentException.
+            (str "Unknown Keep combiner: " (pr-str which)
+                 " — expected :left, :right, :both or :none")))))
+
+(defn- mat-value
+  "Unwrap a materialized value: a japi.Pair (from Keep/both) becomes [left right],
+   anything else passes through."
+  [v]
+  (if (instance? org.apache.pekko.japi.Pair v)
+    [(.first ^org.apache.pekko.japi.Pair v) (.second ^org.apache.pekko.japi.Pair v)]
+    v))
+
+(defn via-mat
+  "Connect a Source to a Flow, combining their materialized values with `which`
+   (:left, :right, :both or :none — see keep-mat).
+
+   Unlike `via` (which always keeps the Source's value), this lets a Flow's
+   materialized value — a KillSwitch, say — survive downstream.
+
+   Example:
+     (-> (source (range 100)) (via-mat (kill-switch-single) :right))"
+  [src flow which]
+  (.viaMat src flow (keep-mat which)))
+
+(defn to-mat
+  "Connect a Source to a Sink, combining their materialized values with `which`
+   (:left, :right, :both or :none — see keep-mat). Returns a RunnableGraph;
+   run it with run-graph.
+
+   Example:
+     (-> (source [1 2 3])
+         (to-mat (sink-seq) :right)
+         (run-graph mat)
+         (await-completion))"
+  [src sink which]
+  (.toMat src sink (keep-mat which)))
+
+(defn run-graph
+  "Run a RunnableGraph (from to-mat), returning its materialized value.
+   A Keep/both pair is returned as a Clojure vector [left right]."
+  [^RunnableGraph graph materializer]
+  (mat-value (.run graph materializer)))
+
+(defn run-mat
+  "Run a Source into a Sink, keeping the materialized value(s) selected by `which`
+   (:left, :right, :both or :none — see keep-mat). With :both the result is a
+   Clojure vector [source-mat sink-mat] rather than a japi.Pair.
+
+   `run` is the same as (run-mat src sink :right materializer).
+
+   Example:
+     (let [[queue done] (run-mat queued-src (sink-seq) :both mat)] ...)"
+  [src sink which materializer]
+  (mat-value (.run (to-mat src sink which) materializer)))
+
+(defn run-source-queue
+  "Materialize a queue-backed Source into `sink` in one step.
+
+   Returns {:queue SourceQueueWithComplete, :done <sink's materialized value>} —
+   for the usual sinks :done is a CompletionStage. Offer elements with
+   (.offer queue x), finish with (.complete queue) or (.fail queue ex).
+
+   buffer-size: size of the buffer
+   overflow-strategy: :backpressure (default), :drop-head, :drop-tail,
+                      :drop-buffer, :drop-new, :fail
+
+   Example:
+     (let [{:keys [queue done]} (run-source-queue 8 :backpressure (sink-seq) mat)]
+       (.offer queue 1)
+       (.complete queue)
+       (await-completion done))"
+  [buffer-size overflow-strategy sink materializer]
+  (let [[queue done] (-> (Source/queue (int buffer-size)
+                                       (->overflow-strategy overflow-strategy :backpressure))
+                         (run-mat sink :both materializer))]
+    {:queue queue :done done}))
+
+(defn run-sink-queue
+  "Run a Source into a queue-backed Sink for pull-based consumption.
+
+   Returns {:queue SinkQueueWithCancel}. Pull elements with (.pull queue), which
+   yields a CompletionStage<Optional> — empty once the stream completes. Stop
+   early with (.cancel queue).
+
+   Example:
+     (let [{:keys [queue]} (run-sink-queue (source [1 2]) mat)]
+       (.get (await-completion (.pull queue))))"
+  [src materializer]
+  {:queue (run-with src (sink-queue) materializer)})
+
+;; ---------------------------------------------------------------------------
+;; N1: KillSwitches
+;; ---------------------------------------------------------------------------
+
+(defn kill-switch-single
+  "A Graph that materializes a UniqueKillSwitch controlling a single stream.
+   Insert it with via-mat (keeping :right or :both) — or use via-kill-switch."
+  []
+  (KillSwitches/single))
+
+(defn via-kill-switch
+  "Insert a UniqueKillSwitch into a Source, making the kill switch the Source's
+   materialized value (the upstream value is dropped).
+
+   Combine with to-mat/run-mat to also keep the sink's value:
+     (run-mat (via-kill-switch src) (sink-seq) :both mat)
+     ;; => [kill-switch done]
+   or use run-with-kill-switch, which does exactly that."
+  [src]
+  (via-mat src (kill-switch-single) :right))
+
+(defn run-with-kill-switch
+  "Run a Source into a Sink through a UniqueKillSwitch.
+
+   Returns {:kill-switch UniqueKillSwitch, :done <sink's materialized value>}.
+   Call (shutdown kill-switch) to complete the stream gracefully, or
+   (abort kill-switch ex) to fail it.
+
+   Example:
+     (let [{:keys [kill-switch done]} (run-with-kill-switch (source-repeat 1)
+                                                            (sink-ignore) mat)]
+       (shutdown kill-switch)
+       (await-completion done))"
+  [src sink materializer]
+  (let [[ks done] (run-mat (via-kill-switch src) sink :both materializer)]
+    {:kill-switch ks :done done}))
+
+(defn shared-kill-switch
+  "Create a SharedKillSwitch that can control many streams at once.
+   Insert it into each stream with shared-kill-switch-flow."
+  ^SharedKillSwitch [^String name]
+  (KillSwitches/shared name))
+
+(defn shared-kill-switch-flow
+  "The Flow to insert into a stream to place it under a SharedKillSwitch.
+   Use with plain `via` — the switch is shared, so there is no per-stream
+   materialized value worth keeping.
+
+   Example:
+     (let [ks (shared-kill-switch \"batch\")]
+       (run-with (via src (shared-kill-switch-flow ks)) (sink-ignore) mat)
+       (run-with (via src2 (shared-kill-switch-flow ks)) (sink-ignore) mat)
+       (shutdown ks)) ;; stops both"
+  [^SharedKillSwitch kill-switch]
+  (.flow kill-switch))
+
+(defn shutdown
+  "Complete the stream(s) controlled by a KillSwitch gracefully (downstream sees
+   normal completion). Works on both a UniqueKillSwitch and a SharedKillSwitch."
+  [^KillSwitch kill-switch]
+  (.shutdown kill-switch))
+
+(defn abort
+  "Fail the stream(s) controlled by a KillSwitch with the given exception.
+   Works on both a UniqueKillSwitch and a SharedKillSwitch."
+  [^KillSwitch kill-switch ^Throwable ex]
+  (.abort kill-switch ex))
+
+;; ---------------------------------------------------------------------------
+;; N1: Supervision
+;; ---------------------------------------------------------------------------
+
+(defn- ->directive
+  "Coerce :stop / :resume / :restart (or a Supervision.Directive) to a Directive."
+  [v]
+  (case v
+    :stop    (Supervision/stop)
+    :resume  (Supervision/resume)
+    :restart (Supervision/restart)
+    (if (instance? org.apache.pekko.stream.Supervision$Directive v)
+      v
+      (throw (IllegalArgumentException.
+              (str "Unknown supervision directive: " (pr-str v)
+                   " — expected :stop, :resume or :restart"))))))
+
+(defn supervision-strategy
+  "Build stream Attributes from a decider fn of Throwable -> :stop, :resume or
+   :restart (nil means :stop, matching Pekko's default).
+
+   :stop    fail the stream (the default)
+   :resume  drop the offending element and continue
+   :restart drop the element and reset the stage's state
+
+   Apply with with-attributes, or use with-supervision."
+  [decider-fn]
+  (ActorAttributes/withSupervisionStrategy
+   (reify org.apache.pekko.japi.function.Function
+     (apply [_ ex]
+       (->directive (or (decider-fn ex) :stop))))))
+
+(defn with-attributes
+  "Apply Attributes to a Source, Flow or Sink."
+  [src ^Attributes attributes]
+  (.withAttributes src attributes))
+
+(defn with-supervision
+  "Supervise a Source or Flow with a decider fn of Throwable -> :stop, :resume or
+   :restart (see supervision-strategy).
+
+   The decider applies to the stages it wraps, so place it after the operators it
+   should cover.
+
+   Example — skip elements that throw, instead of failing the stream:
+     (-> (source [1 0 2])
+         (smap #(/ 10 %))
+         (with-supervision (fn [ex] (when (instance? ArithmeticException ex) :resume)))
+         (run-to-seq mat))
+     ;; => [10 5]"
+  [src decider-fn]
+  (with-attributes src (supervision-strategy decider-fn)))
+
+(defn restart-settings
+  "Build RestartSettings for the restart-* wrappers.
+
+   Options (durations are java.time.Duration or milliseconds):
+   - :min-backoff         delay before the first restart (default 100ms)
+   - :max-backoff         cap on the exponential backoff (default 5000ms)
+   - :random-factor       jitter, 0.0-1.0 (default 0.2)
+   - :max-restarts        give up after this many restarts; requires
+                          :max-restarts-within
+   - :max-restarts-within window over which :max-restarts is counted
+   - :restart-on          fn of Throwable -> truthy to restart (default: all)"
+  ^RestartSettings [{:keys [min-backoff max-backoff random-factor
+                            max-restarts max-restarts-within restart-on]
+                     :or   {min-backoff 100 max-backoff 5000 random-factor 0.2}}]
+  (cond-> (RestartSettings/create (->duration min-backoff)
+                                  (->duration max-backoff)
+                                  (double random-factor))
+    max-restarts (.withMaxRestarts (int max-restarts)
+                                   (->duration (or max-restarts-within max-backoff)))
+    restart-on   (.withRestartOn (reify java.util.function.Predicate
+                                   (test [_ ex] (boolean (restart-on ex)))))))
+
+(defn restart-source
+  "A Source that restarts the wrapped Source with exponential backoff when it
+   completes OR fails. `f` is a no-arg fn returning a Source; it is called again
+   on each restart. Materializes to NotUsed.
+
+   opts: see restart-settings.
+
+   Example:
+     (restart-source {:min-backoff 100 :max-restarts 3 :max-restarts-within 5000}
+                     #(source (fetch-page!)))"
+  [opts f]
+  (RestartSource/withBackoff (restart-settings opts)
+                             (reify org.apache.pekko.japi.function.Creator
+                               (create [_] (f)))))
+
+(defn restart-source-on-failures
+  "Like restart-source, but only restarts on failure — normal completion of the
+   wrapped Source completes the stream."
+  [opts f]
+  (RestartSource/onFailuresWithBackoff (restart-settings opts)
+                                       (reify org.apache.pekko.japi.function.Creator
+                                         (create [_] (f)))))
+
+(defn restart-flow
+  "A Flow that restarts the wrapped Flow with exponential backoff when it
+   completes OR fails. `f` is a no-arg fn returning a Flow. Materializes to NotUsed.
+
+   opts: see restart-settings."
+  [opts f]
+  (RestartFlow/withBackoff (restart-settings opts)
+                           (reify org.apache.pekko.japi.function.Creator
+                             (create [_] (f)))))
+
+(defn restart-flow-on-failures
+  "Like restart-flow, but only restarts on failure."
+  [opts f]
+  (RestartFlow/onFailuresWithBackoff (restart-settings opts)
+                                     (reify org.apache.pekko.japi.function.Creator
+                                       (create [_] (f)))))
+
+(defn restart-sink
+  "A Sink that restarts the wrapped Sink with exponential backoff when it
+   completes or cancels. `f` is a no-arg fn returning a Sink. Materializes to NotUsed.
+
+   opts: see restart-settings."
+  [opts f]
+  (RestartSink/withBackoff (restart-settings opts)
+                           (reify org.apache.pekko.japi.function.Creator
+                             (create [_] (f)))))
+
+(defn retry-flow
+  "Wrap a Flow so failed results are retried with exponential backoff.
+
+   Unlike restart-flow (which restarts the whole stage on stream failure),
+   retry-flow retries individual elements based on their *result*: decide-fn is
+   called with [in out] and returns the next input to retry with, or nil to accept
+   `out` and move on.
+
+   opts (durations are java.time.Duration or milliseconds):
+   - :min-backoff   delay before the first retry (default 100ms)
+   - :max-backoff   cap on the exponential backoff (default 5000ms)
+   - :random-factor jitter, 0.0-1.0 (default 0.2)
+   - :max-retries   give up after this many retries (default 3)
+
+   The wrapped flow must emit exactly one output per input.
+
+   Example — retry until the call stops returning :error:
+     (retry-flow {:max-retries 3} call-flow
+                 (fn [in out] (when (= :error out) in)))"
+  [{:keys [min-backoff max-backoff random-factor max-retries]
+    :or   {min-backoff 100 max-backoff 5000 random-factor 0.2 max-retries 3}}
+   flow decide-fn]
+  (RetryFlow/withBackoff (->duration min-backoff)
+                         (->duration max-backoff)
+                         (double random-factor)
+                         (int max-retries)
+                         flow
+                         (reify org.apache.pekko.japi.function.Function2
+                           (apply [_ in out]
+                             (if-let [retry (decide-fn in out)]
+                               (Optional/of retry)
+                               (Optional/empty))))))
+
+;; ---------------------------------------------------------------------------
+;; N1: Flows and actor interop
+;; ---------------------------------------------------------------------------
+
+(defn flow
+  "An identity Flow — the starting point for building a standalone Flow to pass to
+   `via`, restart-flow or retry-flow.
+
+   Example:
+     (-> (flow) (smap inc) (sfilter even?))"
+  []
+  (Flow/create))
+
+(defn flow-of
+  "An identity Flow declared over a specific element Class.
+   Only needed where Pekko's Java DSL requires the element type."
+  [^Class klass]
+  (Flow/of klass))
+
+(defn flow-from-fn
+  "A single-operation Flow that applies f to each element."
+  [f]
+  (Flow/fromFunction (reify org.apache.pekko.japi.function.Function
+                       (apply [_ x] (f x)))))
+
+(defn ask
+  "Ask an actor per element, emitting its reply — the streaming equivalent of
+   pekko-clj.core/<?>, with backpressure.
+
+   Replies must be instances of reply-class or the stream fails. The actor must
+   reply via (core/reply ...) / sender; a timeout fails the stream.
+
+   parallelism: elements in flight at once (default 1). Order is always preserved.
+   timeout: java.time.Duration or milliseconds.
+
+   Works on a Source or a Flow.
+
+   Example:
+     (-> (source [1 2 3])
+         (ask worker Long 3000)
+         (run-to-seq mat))"
+  ([src actor-ref reply-class timeout]
+   (.ask src actor-ref reply-class (Timeout/create (->duration timeout))))
+  ([src parallelism actor-ref reply-class timeout]
+   (.ask src (int parallelism) actor-ref reply-class (Timeout/create (->duration timeout)))))
+
+(defn- unwrap-status-reply
+  [^StatusReply reply]
+  (if (.isError reply)
+    (throw (.getError reply))
+    (.getValue reply)))
+
+(defn ask-with-status
+  "Like `ask`, but the actor replies with an org.apache.pekko.pattern.StatusReply:
+   a success reply is unwrapped to its value, an error reply fails the stream.
+
+   Note: Pekko 1.6.0 has no Flow.askWithStatus (it is an Akka-only API), so this
+   asks for a StatusReply and unwraps it — same semantics, one extra stage.
+
+   Example — actor replies (core/reply (StatusReply/success 42))
+             or             (core/reply (StatusReply/error \"nope\")):
+     (-> (source [1]) (ask-with-status worker 3000) (run-to-seq mat))"
+  ([src actor-ref timeout]
+   (-> (ask src actor-ref StatusReply timeout)
+       (smap unwrap-status-reply)))
+  ([src parallelism actor-ref timeout]
+   (-> (ask src parallelism actor-ref StatusReply timeout)
+       (smap unwrap-status-reply))))

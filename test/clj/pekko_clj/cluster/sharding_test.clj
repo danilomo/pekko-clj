@@ -2,7 +2,9 @@
   (:require [clojure.test :refer :all]
             [pekko-clj.core :as core]
             [pekko-clj.cluster.sharding :as sharding]
-            [pekko-clj.test-support :as ts :refer [eventually]]))
+            [pekko-clj.test-support :as ts :refer [eventually]])
+  (:import [org.apache.pekko.cluster.sharding ClusterShardingSettings
+                                              ClusterShardingSettings$PassivationStrategySettings]))
 
 ;; core/<?> now returns a CompletableFuture; block on it (deref returns nil on
 ;; timeout, rethrows the actor's failure otherwise).
@@ -153,6 +155,187 @@
          :num-shards 10})
       ;; Now it should be registered
       (is (sharding/shard-region-registered? sys "Started"))
+      (finally
+        (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Passivation settings (N5)
+;; ---------------------------------------------------------------------------
+
+(defn- opt-get
+  "Value of a scala.Option, or nil when empty."
+  [^scala.Option o]
+  (when (.isDefined o) (.get o)))
+
+(deftest passivation-settings-idle-test
+  (let [ps (sharding/passivation-settings {:idle-timeout 60000})
+        idle (opt-get (.idleEntitySettings ps))]
+    (is (instance? ClusterShardingSettings$PassivationStrategySettings ps))
+    (is (some? idle) ":idle-timeout alone implies the idle strategy")
+    (is (= 60000 (.toMillis (.timeout idle))))
+    (is (nil? (opt-get (.interval idle))) "no interval unless asked for"))
+  ;; Explicit interval + a java.time.Duration timeout
+  (let [ps (sharding/passivation-settings {:strategy :idle
+                                           :idle-timeout (java.time.Duration/ofSeconds 30)
+                                           :idle-interval 5000})
+        idle (opt-get (.idleEntitySettings ps))]
+    (is (= 30000 (.toMillis (.timeout idle))))
+    (is (= 5000 (.toMillis ^scala.concurrent.duration.FiniteDuration (opt-get (.interval idle)))))))
+
+(deftest passivation-settings-replacement-policies-test
+  (let [lru (sharding/passivation-settings {:strategy :least-recently-used
+                                            :active-entity-limit 5000})
+        policy (opt-get (.replacementPolicySettings lru))]
+    (is (= 5000 (opt-get (.activeEntityLimit lru))))
+    (is (= "LeastRecentlyUsedSettings" (.getSimpleName (class policy))))
+    (is (nil? (opt-get (.segmentedSettings policy))) "not segmented by default"))
+  ;; Segmented (SLRU) — by level count and by proportions
+  (let [by-levels (opt-get (.replacementPolicySettings
+                            (sharding/passivation-settings {:strategy :least-recently-used
+                                                            :active-entity-limit 100
+                                                            :segmented 2})))
+        by-props (opt-get (.replacementPolicySettings
+                           (sharding/passivation-settings {:strategy :least-recently-used
+                                                           :active-entity-limit 100
+                                                           :segmented [0.2 0.8]})))]
+    (is (= 2 (.levels (opt-get (.segmentedSettings by-levels)))))
+    (let [segmented (opt-get (.segmentedSettings by-props))]
+      (is (= [0.2 0.8] (mapv double (scala.jdk.javaapi.CollectionConverters/asJava
+                                     (.proportions segmented))))
+          "proportions are passed through to the segmented levels")))
+  (let [mru (sharding/passivation-settings {:strategy :most-recently-used
+                                            :active-entity-limit 10})]
+    (is (= "MostRecentlyUsedSettings"
+           (.getSimpleName (class (opt-get (.replacementPolicySettings mru)))))))
+  (let [lfu (sharding/passivation-settings {:strategy :least-frequently-used
+                                            :active-entity-limit 10
+                                            :dynamic-aging true})
+        policy (opt-get (.replacementPolicySettings lfu))]
+    (is (= "LeastFrequentlyUsedSettings" (.getSimpleName (class policy))))
+    (is (true? (.dynamicAging policy)))))
+
+(deftest passivation-settings-disabled-and-unknown-test
+  (let [ps (sharding/passivation-settings {:strategy :none})]
+    (is (nil? (opt-get (.idleEntitySettings ps))))
+    (is (nil? (opt-get (.activeEntityLimit ps))))
+    (is (nil? (opt-get (.replacementPolicySettings ps)))))
+  ;; An empty map disables passivation rather than guessing a strategy
+  (is (nil? (opt-get (.idleEntitySettings (sharding/passivation-settings {})))))
+  (is (thrown? IllegalArgumentException
+               (sharding/passivation-settings {:strategy :bogus :active-entity-limit 1})))
+  (is (thrown? IllegalArgumentException
+               (sharding/passivation-settings {:strategy :least-recently-used
+                                               :active-entity-limit 1
+                                               :segmented :nonsense}))))
+
+(deftest sharding-settings-from-opts-test
+  (let [sys (ts/create-cluster-system "sharding-settings-test")]
+    (try
+      ;; :passivate-after is the idle shorthand. (Regression: this used to call
+      ;; ClusterShardingSettings.withPassivateIdleEntityAfter, which does not exist
+      ;; in Pekko 1.6 — every `start` with :passivate-after threw.)
+      (let [^ClusterShardingSettings s (sharding/sharding-settings sys {:passivate-after 120000})
+            idle (opt-get (.idleEntitySettings (.passivationStrategySettings s)))]
+        (is (= 120000 (.toMillis (.timeout idle)))))
+      ;; Full passivation map, role, remember-entities + store mode, plugins
+      (let [^ClusterShardingSettings s
+            (sharding/sharding-settings sys {:role "workers"
+                                             :remember-entities true
+                                             :remember-entities-store :eventsourced
+                                             :journal-plugin-id "pekko.persistence.journal.inmem"
+                                             :snapshot-plugin-id "pekko.persistence.snapshot-store.local"
+                                             :passivation {:strategy :least-recently-used
+                                                           :active-entity-limit 42}})]
+        (is (= "workers" (opt-get (.role s))))
+        (is (true? (.rememberEntities s)))
+        (is (= "eventsourced" (.rememberEntitiesStore s)))
+        (is (= "pekko.persistence.journal.inmem" (.journalPluginId s)))
+        (is (= 42 (opt-get (.activeEntityLimit (.passivationStrategySettings s))))))
+      ;; Defaults: the store mode stays whatever config says (ddata in the test conf)
+      (is (= "ddata" (.rememberEntitiesStore (sharding/sharding-settings sys {}))))
+      (is (thrown? IllegalArgumentException
+                   (sharding/sharding-settings sys {:remember-entities-store :sqlite})))
+      ;; A ready-made PassivationStrategySettings is accepted as-is
+      (let [^ClusterShardingSettings s
+            (sharding/sharding-settings
+             sys {:passivation (sharding/passivation-settings {:idle-timeout 7000})})]
+        (is (= 7000 (.toMillis (.timeout (opt-get (.idleEntitySettings
+                                                   (.passivationStrategySettings s))))))))
+      (finally
+        (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Passivation end-to-end (N5)
+;; ---------------------------------------------------------------------------
+
+(def stopped-entities (atom #{}))
+
+(core/defactor passivating-entity
+  "Counter entity that records its id when stopped, and passivates on request."
+  (init [_] {:count 0})
+  (handle [:inc] (update state :count inc))
+  (handle [:get] (core/reply (:count state)))
+  (handle [:passivate]
+    (sharding/passivate :stop-now)
+    state)
+  (handle :stop-now
+    (core/stop (core/self))
+    state)
+  (on-stop (swap! stopped-entities conj (sharding/entity-id))))
+
+(deftest idle-passivation-stops-entity-test
+  (let [sys (ts/create-cluster-system "idle-passivation-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (reset! stopped-entities #{})
+      (let [region (sharding/start sys passivating-entity
+                     {:type-name "IdlePassivating"
+                      :num-shards 10
+                      :passivation {:strategy :idle
+                                    :idle-timeout 1000
+                                    :idle-interval 200}})]
+        (sharding/tell region "idle-1" [:inc])
+        (is (eventually (= 1 (await-result (sharding/ask region "idle-1" [:get])))))
+        ;; Left alone, the shard passivates it.
+        (is (eventually 15000 (contains? @stopped-entities "idle-1")))
+        ;; A new message recreates it with fresh state.
+        (is (eventually (= 0 (await-result (sharding/ask region "idle-1" [:get]))))))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest manual-passivate-recreates-entity-test
+  (let [sys (ts/create-cluster-system "manual-passivate-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (reset! stopped-entities #{})
+      (let [region (sharding/start sys passivating-entity
+                     {:type-name "ManualPassivating"
+                      :num-shards 10})]
+        (sharding/tell region "manual-1" [:inc])
+        (sharding/tell region "manual-1" [:inc])
+        (is (eventually (= 2 (await-result (sharding/ask region "manual-1" [:get])))))
+        ;; Ask the shard to passivate: the entity gets :stop-now and stops.
+        (sharding/tell region "manual-1" [:passivate])
+        (is (eventually (contains? @stopped-entities "manual-1")))
+        ;; The next message brings it back with fresh state.
+        (is (eventually (= 0 (await-result (sharding/ask region "manual-1" [:get]))))))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest start-with-stop-message-and-remember-entities-test
+  ;; The hand-off stop message goes through a different ClusterSharding.start
+  ;; overload (it also needs an allocation strategy); remember-entities disables
+  ;; automatic passivation but must still route messages.
+  (let [sys (ts/create-cluster-system "stop-message-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys passivating-entity
+                     {:type-name "HandOff"
+                      :num-shards 10
+                      :remember-entities true
+                      :stop-message :stop-now})]
+        (sharding/tell region "handoff-1" [:inc])
+        (is (eventually (= 1 (await-result (sharding/ask region "handoff-1" [:get]))))))
       (finally
         (ts/terminate-system sys)))))
 

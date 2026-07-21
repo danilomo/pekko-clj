@@ -4,8 +4,11 @@
             [pekko-clj.stream :as s]
             [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.stream Materializer]
-           [org.apache.pekko Done]
+           [org.apache.pekko.stream Materializer Attributes RestartSettings UniqueKillSwitch]
+           [org.apache.pekko.stream.javadsl RunnableGraph SinkQueueWithCancel
+                                            SourceQueueWithComplete]
+           [org.apache.pekko.pattern StatusReply]
+           [org.apache.pekko Done NotUsed]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
            [java.util.concurrent CompletableFuture]))
@@ -660,3 +663,377 @@
                  (deliver result (if ex :error :success))))
               (s/run-to-seq *mat*))]
     (is (= :error (deref result 3000 :timeout)))))
+
+;; ---------------------------------------------------------------------------
+;; N1: Materialized values (toMat / viaMat / Keep)
+;; ---------------------------------------------------------------------------
+
+(deftest keep-mat-returns-combiners
+  (is (every? some? [(s/keep-mat :left) (s/keep-mat :right)
+                     (s/keep-mat :both) (s/keep-mat :none)]))
+  (is (thrown-with-msg? IllegalArgumentException #"Unknown Keep combiner"
+                        (s/keep-mat :sideways))))
+
+(deftest to-mat-builds-runnable-graph
+  (let [graph (-> (s/source [1 2 3])
+                  (s/to-mat (s/sink-seq) :right))]
+    (is (instance? RunnableGraph graph))
+    (is (= [1 2 3] (vec (s/await-completion (s/run-graph graph *mat*) 3000))))))
+
+(deftest run-mat-both-returns-clojure-vector
+  ;; Keep/both materializes a japi.Pair; run-mat unwraps it to [left right].
+  (let [[left right] (s/run-mat (s/source [1 2 3]) (s/sink-seq) :both *mat*)]
+    (is (instance? NotUsed left) "left is the Source's materialized value")
+    (is (= [1 2 3] (vec (s/await-completion right 3000))))))
+
+(deftest run-mat-right-matches-run
+  (is (= [1 2] (vec (s/await-completion
+                     (s/run-mat (s/source [1 2]) (s/sink-seq) :right *mat*) 3000)))))
+
+(deftest run-mat-left-keeps-source-value
+  ;; via-kill-switch makes the Source's materialized value the kill switch, so
+  ;; :left is the way to reach it.
+  (let [ks (s/run-mat (s/via-kill-switch (s/source-repeat 1)) (s/sink-ignore) :left *mat*)]
+    (is (instance? UniqueKillSwitch ks))
+    (s/shutdown ks)))
+
+(deftest run-source-queue-returns-queue-and-done
+  (let [{:keys [queue done]} (s/run-source-queue 8 :backpressure (s/sink-seq) *mat*)]
+    (is (instance? SourceQueueWithComplete queue))
+    (s/await-completion (.offer queue 1) 3000)
+    (s/await-completion (.offer queue 2) 3000)
+    (.complete queue)
+    (is (= [1 2] (vec (s/await-completion done 3000))))))
+
+(deftest run-sink-queue-pulls-elements
+  (let [{:keys [queue]} (s/run-sink-queue (s/source [1 2]) *mat*)]
+    (is (instance? SinkQueueWithCancel queue))
+    (is (= 1 (.get (s/await-completion (.pull queue) 3000))))
+    (is (= 2 (.get (s/await-completion (.pull queue) 3000))))
+    (is (false? (.isPresent (s/await-completion (.pull queue) 3000)))
+        "pull yields an empty Optional once the stream completes")))
+
+;; ---------------------------------------------------------------------------
+;; N1: KillSwitches
+;; ---------------------------------------------------------------------------
+
+(deftest run-with-kill-switch-shutdown-completes-stream
+  (let [{:keys [kill-switch done]} (s/run-with-kill-switch
+                                    (s/source-repeat 1) (s/sink-ignore) *mat*)]
+    (is (instance? UniqueKillSwitch kill-switch))
+    (is (nil? (s/await-completion done 200))
+        "an infinite stream does not complete on its own")
+    (s/shutdown kill-switch)
+    (is (some? (s/await-completion done 3000))
+        "shutdown completes the stream gracefully")))
+
+(deftest kill-switch-abort-fails-stream
+  (let [{:keys [kill-switch done]} (s/run-with-kill-switch
+                                    (s/source-repeat 1) (s/sink-ignore) *mat*)]
+    (s/abort kill-switch (RuntimeException. "aborted"))
+    (is (thrown-with-msg? RuntimeException #"aborted" (s/await-completion done 3000)))))
+
+(deftest shared-kill-switch-stops-multiple-streams
+  (let [ks (s/shared-kill-switch "test-switch")
+        done1 (s/run-with (s/via (s/source-repeat 1) (s/shared-kill-switch-flow ks))
+                          (s/sink-ignore) *mat*)
+        done2 (s/run-with (s/via (s/source-repeat 2) (s/shared-kill-switch-flow ks))
+                          (s/sink-ignore) *mat*)]
+    (s/shutdown ks)
+    (is (some? (s/await-completion done1 3000)))
+    (is (some? (s/await-completion done2 3000)))))
+
+;; ---------------------------------------------------------------------------
+;; N1: Supervision
+;; ---------------------------------------------------------------------------
+
+(deftest with-supervision-resume-drops-failing-elements
+  (let [result (-> (s/source [1 0 2])
+                   (s/smap #(/ 10 %))
+                   (s/with-supervision (fn [ex] (when (instance? ArithmeticException ex) :resume)))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= [10 5] (vec result)) "the divide-by-zero element is skipped")))
+
+(deftest with-supervision-stop-fails-stream
+  (is (thrown? ArithmeticException
+               (-> (s/source [1 0 2])
+                   (s/smap #(/ 10 %))
+                   (s/with-supervision (fn [_] :stop))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))))
+  ;; nil from the decider means :stop, matching Pekko's default.
+  (is (thrown? ArithmeticException
+               (-> (s/source [1 0 2])
+                   (s/smap #(/ 10 %))
+                   (s/with-supervision (fn [_] nil))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000)))))
+
+(deftest with-supervision-restart-resets-stage-state
+  ;; scan carries state across elements, so it distinguishes :resume from :restart:
+  ;; :resume keeps the accumulator, :restart resets the stage to its seed.
+  (let [run (fn [directive]
+              (vec (-> (s/source [1 2 :boom 3])
+                       (s/scan 0 (fn [acc x]
+                                   (if (= :boom x)
+                                     (throw (RuntimeException. "boom"))
+                                     (+ acc x))))
+                       (s/with-supervision (fn [_] directive))
+                       (s/run-to-seq *mat*)
+                       (s/await-completion 3000))))]
+    (is (= [0 1 3 6] (run :resume))
+        ":resume keeps the accumulator at 3, so the last element is 3+3")
+    (is (= [0 1 3 0 3] (run :restart))
+        ":restart resets the accumulator to the seed, so it re-emits 0 then 0+3")))
+
+(deftest supervision-strategy-returns-attributes
+  (is (instance? Attributes (s/supervision-strategy (fn [_] :resume)))))
+
+(deftest supervision-rejects-unknown-directive
+  (is (thrown-with-msg? IllegalArgumentException #"Unknown supervision directive"
+                        (-> (s/source [0])
+                            (s/smap #(/ 10 %))
+                            (s/with-supervision (fn [_] :sideways))
+                            (s/run-to-seq *mat*)
+                            (s/await-completion 3000)))))
+
+;; ---------------------------------------------------------------------------
+;; N1: Restart / retry with backoff
+;; ---------------------------------------------------------------------------
+
+(deftest restart-settings-builds-settings
+  (let [rs (s/restart-settings {:min-backoff 100 :max-backoff 2000 :random-factor 0.5
+                                :max-restarts 4 :max-restarts-within 9000})]
+    (is (instance? RestartSettings rs))
+    (is (= 100 (.toMillis (.minBackoff rs))))
+    (is (= 2000 (.toMillis (.maxBackoff rs))))
+    (is (= 0.5 (.randomFactor rs)))
+    (is (= 4 (.maxRestarts rs)))
+    (is (= 9000 (.toMillis (.maxRestartsWithin rs)))))
+  ;; Durations may also be given as java.time.Duration.
+  ;; (Fully qualified: this ns imports scala.concurrent.duration.Duration as `Duration`.)
+  (let [rs (s/restart-settings {:min-backoff (java.time.Duration/ofMillis 50)})]
+    (is (= 50 (.toMillis (.minBackoff rs))))))
+
+(deftest restart-source-restarts-on-completion
+  (let [starts (atom 0)
+        result (-> (s/restart-source {:min-backoff 10 :max-backoff 50}
+                                     (fn [] (s/source [(swap! starts inc)])))
+                   (s/take 3)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 10000))]
+    (is (= [1 2 3] (vec result)) "the source is re-created after each completion")))
+
+(deftest restart-source-on-failures-retries-until-success
+  (let [attempts (atom 0)
+        result (-> (s/restart-source-on-failures
+                    {:min-backoff 10 :max-backoff 50}
+                    (fn [] (if (< (swap! attempts inc) 3)
+                             (s/source-failed (RuntimeException. "boom"))
+                             (s/source [:ok]))))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 10000))]
+    (is (= [:ok] (vec result)))
+    (is (= 3 @attempts) "failed twice, succeeded on the third attempt")))
+
+(deftest restart-source-on-failures-gives-up-after-max-restarts
+  (let [attempts (atom 0)]
+    (is (thrown? Exception
+                 (-> (s/restart-source-on-failures
+                      {:min-backoff 10 :max-backoff 20 :max-restarts 2 :max-restarts-within 5000}
+                      (fn [] (swap! attempts inc) (s/source-failed (RuntimeException. "always"))))
+                     (s/run-to-seq *mat*)
+                     (s/await-completion 10000))))
+    (is (= 3 @attempts) "the initial attempt plus :max-restarts restarts")))
+
+(deftest restart-settings-restart-on-predicate
+  ;; :restart-on false => the failure is not restarted, it fails the stream.
+  (let [attempts (atom 0)]
+    (is (thrown? Exception
+                 (-> (s/restart-source-on-failures
+                      {:min-backoff 10 :max-backoff 20 :restart-on (fn [_] false)}
+                      (fn [] (swap! attempts inc) (s/source-failed (RuntimeException. "nope"))))
+                     (s/run-to-seq *mat*)
+                     (s/await-completion 5000))))
+    (is (= 1 @attempts) "never restarted")))
+
+(deftest restart-flow-passes-elements-through
+  (let [f (s/restart-flow {:min-backoff 10 :max-backoff 50} #(s/flow-from-fn inc))]
+    (is (= [2 3 4] (vec (-> (s/source [1 2 3])
+                            (s/via f)
+                            (s/run-to-seq *mat*)
+                            (s/await-completion 5000)))))))
+
+(deftest restart-flow-on-failures-restarts-failing-flow
+  (let [attempts (atom 0)
+        f (s/restart-flow-on-failures
+           {:min-backoff 10 :max-backoff 50}
+           (fn [] (swap! attempts inc)
+             (s/flow-from-fn (fn [x] (if (= x :boom) (throw (RuntimeException. "boom")) x)))))
+        result (-> (s/source [1 :boom 2])
+                   (s/via f)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 5000))]
+    (is (= 2 @attempts) "the flow was re-created after the failure")
+    (is (= [1] (clojure.core/take 1 (vec result))))))
+
+(deftest restart-sink-receives-elements
+  (let [received (atom [])
+        sink (s/restart-sink {:min-backoff 10 :max-backoff 50}
+                             #(s/sink-foreach (fn [x] (swap! received conj x))))]
+    (s/run-with (s/source [1 2 3]) sink *mat*)
+    (is (eventually (= [1 2 3] @received)))))
+
+(deftest retry-flow-retries-until-decide-fn-accepts
+  (let [f (s/flow-from-fn (fn [n] (if (< n 3) :error :ok)))
+        retried (s/retry-flow {:min-backoff 10 :max-backoff 50 :max-retries 5} f
+                              (fn [in out] (when (= :error out) (inc in))))
+        result (-> (s/source [1])
+                   (s/via retried)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 10000))]
+    (is (= [:ok] (vec result)) "1 -> :error, 2 -> :error, 3 -> :ok")))
+
+(deftest retry-flow-gives-up-after-max-retries
+  (let [f (s/flow-from-fn (fn [_] :error))
+        retried (s/retry-flow {:min-backoff 10 :max-backoff 20 :max-retries 2} f
+                              (fn [in out] (when (= :error out) in)))
+        result (-> (s/source [1])
+                   (s/via retried)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 10000))]
+    (is (= [:error] (vec result)) "the last result is emitted once retries are exhausted")))
+
+;; ---------------------------------------------------------------------------
+;; N1: Flows
+;; ---------------------------------------------------------------------------
+
+(deftest flow-is-identity
+  (is (= [1 2 3] (vec (-> (s/source [1 2 3])
+                          (s/via (s/flow))
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest flow-of-class-is-identity
+  (is (= [1 2] (vec (-> (s/source [1 2])
+                        (s/via (s/flow-of Long))
+                        (s/run-to-seq *mat*)
+                        (s/await-completion 3000))))))
+
+(deftest flow-from-fn-transforms
+  (is (= [2 3 4] (vec (-> (s/source [1 2 3])
+                          (s/via (s/flow-from-fn inc))
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest flow-composes-with-stream-operators
+  ;; The existing ops work on a Flow, not just a Source.
+  (let [f (-> (s/flow) (s/smap inc) (s/sfilter even?))]
+    (is (= [2 4] (vec (-> (s/source [1 2 3])
+                          (s/via f)
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000)))))))
+
+;; ---------------------------------------------------------------------------
+;; N1: Actor interop (ask / askWithStatus / actorRef overloads)
+;; ---------------------------------------------------------------------------
+
+(core/defactor n1-doubler
+  (handle [:double n] (core/reply (* 2 n))))
+
+(core/defactor n1-status-worker
+  (handle [:ok n]  (core/reply (StatusReply/success (* 2 n))))
+  (handle [:err _] (core/reply (StatusReply/error "nope"))))
+
+(deftest ask-emits-actor-replies
+  (let [a (core/spawn *system* n1-doubler nil)
+        result (-> (s/source [[:double 1] [:double 2] [:double 3]])
+                   (s/ask a Long 3000)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 5000))]
+    (is (= [2 4 6] (vec result)) "replies are emitted in element order")))
+
+(deftest ask-with-parallelism-preserves-order
+  (let [a (core/spawn *system* n1-doubler nil)
+        result (-> (s/source (clojure.core/map (fn [n] [:double n]) (range 1 11)))
+                   (s/ask 4 a Long 3000)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 5000))]
+    (is (= (clojure.core/map #(* 2 %) (range 1 11)) (vec result)))))
+
+(deftest ask-accepts-duration-timeout
+  (let [a (core/spawn *system* n1-doubler nil)]
+    (is (= [2] (vec (-> (s/source [[:double 1]])
+                        (s/ask a Long (java.time.Duration/ofSeconds 3))
+                        (s/run-to-seq *mat*)
+                        (s/await-completion 5000)))))))
+
+(deftest ask-with-status-unwraps-success
+  (let [a (core/spawn *system* n1-status-worker nil)
+        result (-> (s/source [[:ok 21]])
+                   (s/ask-with-status a 3000)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 5000))]
+    (is (= [42] (vec result)))))
+
+(deftest ask-with-status-error-fails-stream
+  (let [a (core/spawn *system* n1-status-worker nil)]
+    (is (thrown-with-msg? Throwable #"nope"
+                          (-> (s/source [[:err 1]])
+                              (s/ask-with-status a 3000)
+                              (s/run-to-seq *mat*)
+                              (s/await-completion 5000))))))
+
+(deftest ask-with-status-parallelism-arity
+  (let [a (core/spawn *system* n1-status-worker nil)
+        result (-> (s/source [[:ok 1] [:ok 2]])
+                   (s/ask-with-status 2 a 3000)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 5000))]
+    (is (= [2 4] (vec result)))))
+
+(deftest source-actor-ref-completes-with-custom-message
+  ;; The 4-arity matcher-based Source/actorRef overload.
+  (let [[src ref] (s/source-actor-ref 16 :fail
+                                      {:complete-with #(when (= :finished %) :draining)}
+                                      *mat*)
+        result (s/run-to-seq src *mat*)]
+    (core/! ref 1)
+    (core/! ref 2)
+    (core/! ref :finished)
+    (is (= [1 2] (vec (s/await-completion result 5000)))
+        ":draining emits buffered elements before completing")))
+
+(deftest source-actor-ref-fails-with-custom-message
+  (let [[src ref] (s/source-actor-ref 16 :fail
+                                      {:fail-with #(when (= :boom %) (RuntimeException. "kaboom"))}
+                                      *mat*)
+        result (s/run-to-seq src *mat*)]
+    (core/! ref :boom)
+    (is (thrown-with-msg? RuntimeException #"kaboom" (s/await-completion result 5000)))))
+
+(deftest source-actor-ref-3-arity-still-uses-status-success
+  ;; Regression: the opts arity must not change the existing default behaviour.
+  (let [[src ref] (s/source-actor-ref 16 :fail *mat*)
+        result (s/run-to-seq src *mat*)]
+    (core/! ref 1)
+    (core/! ref (org.apache.pekko.actor.Status$Success. "done"))
+    (is (= [1] (vec (s/await-completion result 5000))))))
+
+(def n1-acked (atom []))
+
+(core/defactor n1-ack-collector
+  (handle :init (do (core/reply :ack) nil))
+  (handle :done (do (swap! n1-acked conj :done) nil))
+  (handle msg   (do (swap! n1-acked conj msg) (core/reply :ack) nil)))
+
+(deftest sink-actor-ref-with-backpressure-acks-each-element
+  (reset! n1-acked [])
+  (let [a (core/spawn *system* n1-ack-collector nil)]
+    (s/run-with (s/source [1 2 3])
+                (s/sink-actor-ref-with-backpressure a :init :ack :done
+                                                    (fn [ex] [:failed (.getMessage ex)]))
+                *mat*)
+    (is (eventually (= [1 2 3 :done] @n1-acked))
+        "elements are acked one at a time, then the completion message arrives")))

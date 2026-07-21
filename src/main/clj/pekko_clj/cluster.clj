@@ -23,8 +23,11 @@
      (cluster/self-member sys)
      (cluster/state-snapshot sys)"
   (:require [pekko-clj.core :as core]
+            [pekko-clj.serialization :as serialization]
             [clojure.string :as str])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef Address AddressFromURIString]
+  (:import [org.apache.pekko Done]
+           [org.apache.pekko.actor ActorSystem ActorRef Address AddressFromURIString
+                                   CoordinatedShutdown CoordinatedShutdown$Reason]
            [org.apache.pekko.cluster Cluster Member MemberStatus ClusterEvent$ClusterDomainEvent
                                      ClusterEvent$MemberUp ClusterEvent$MemberRemoved
                                      ClusterEvent$MemberExited ClusterEvent$MemberDowned
@@ -33,7 +36,9 @@
                                      ClusterEvent$UnreachableMember ClusterEvent$ReachableMember
                                      ClusterEvent$LeaderChanged ClusterEvent$RoleLeaderChanged]
            [com.typesafe.config Config ConfigFactory]
-           [java.util Set List]))
+           [java.util Set List Optional]
+           [java.util.function Supplier]
+           [java.util.concurrent CompletionStage CompletableFuture]))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster Access
@@ -43,6 +48,105 @@
   "Get the Cluster extension for an ActorSystem."
   [^ActorSystem system]
   (Cluster/get system))
+
+;; ---------------------------------------------------------------------------
+;; Split Brain Resolver (SBR) configuration
+;; ---------------------------------------------------------------------------
+
+(def ^:private sbr-provider-class
+  "org.apache.pekko.cluster.sbr.SplitBrainResolverProvider")
+
+(def ^:private sbr-strategies
+  "Map of strategy keyword → Pekko active-strategy config name."
+  {:keep-majority "keep-majority"
+   :static-quorum "static-quorum"
+   :keep-oldest   "keep-oldest"
+   :down-all      "down-all"
+   :lease-majority "lease-majority"})
+
+(defn- sbr-duration
+  "Render a duration for HOCON: a number is milliseconds; a string is used as-is."
+  [d]
+  (cond
+    (number? d) (str (long d) "ms")
+    (string? d) d
+    :else (throw (IllegalArgumentException.
+                  (str "Duration must be a number (ms) or HOCON string, got " (class d))))))
+
+(defn- sbr-down-all-when-unstable
+  "Render :down-all-when-unstable: true→on, false→off, else a duration."
+  [v]
+  (cond
+    (true? v) "on"
+    (false? v) "off"
+    :else (sbr-duration v)))
+
+(defn- hocon-string
+  "Quote a value as a HOCON string literal."
+  [s]
+  (str \" (str/replace (str s) "\"" "\\\"") \"))
+
+(defn split-brain-resolver-config
+  "Build a com.typesafe.config.Config configuring Pekko's Split Brain Resolver
+   (the recommended downing provider). Pass the result as `:extra-config` to
+   `create-system`, or use `create-system`'s `:split-brain-resolver` key which
+   calls this for you.
+
+   Options map:
+   - :active-strategy - :keep-majority (default), :static-quorum, :keep-oldest,
+                        :down-all, or :lease-majority
+   - :stable-after    - quiet period before the SBR decides; a number of
+                        milliseconds or a HOCON duration string (default 20s)
+   - :down-all-when-unstable - true (on), false (off), or a duration; downs all
+                        nodes if no decision is reached in time
+   - :role            - restrict the decision to members with this role
+                        (keep-majority / static-quorum / keep-oldest / lease-majority)
+   - :quorum-size     - required for :static-quorum
+   - :down-if-alone   - :keep-oldest only (default on)
+   - :lease-implementation, :lease-name, :acquire-lease-delay, :release-after
+                        - :lease-majority tuning
+
+   Example:
+     (split-brain-resolver-config {:active-strategy :static-quorum
+                                   :quorum-size 3
+                                   :role \"backend\"
+                                   :stable-after 15000})"
+  ^Config [opts]
+  (let [{:keys [active-strategy stable-after down-all-when-unstable role
+                quorum-size down-if-alone
+                lease-implementation lease-name acquire-lease-delay release-after]
+         :or {active-strategy :keep-majority}} opts
+        strategy-name (or (sbr-strategies active-strategy)
+                          (throw (IllegalArgumentException.
+                                  (str "Unknown SBR strategy: " active-strategy
+                                       " (expected one of " (keys sbr-strategies) ")"))))
+        base "pekko.cluster.split-brain-resolver."
+        lines (cond-> [(str "pekko.cluster.downing-provider-class = " (hocon-string sbr-provider-class))
+                       (str base "active-strategy = " strategy-name)]
+                (some? stable-after)
+                (conj (str base "stable-after = " (sbr-duration stable-after)))
+                (some? down-all-when-unstable)
+                (conj (str base "down-all-when-unstable = " (sbr-down-all-when-unstable down-all-when-unstable))))
+        strat (case active-strategy
+                :keep-majority
+                (cond-> [] role (conj (str base "keep-majority.role = " (hocon-string role))))
+                :static-quorum
+                (cond-> []
+                  (some? quorum-size) (conj (str base "static-quorum.quorum-size = " (long quorum-size)))
+                  role (conj (str base "static-quorum.role = " (hocon-string role))))
+                :keep-oldest
+                (cond-> []
+                  (some? down-if-alone) (conj (str base "keep-oldest.down-if-alone = " (if down-if-alone "on" "off")))
+                  role (conj (str base "keep-oldest.role = " (hocon-string role))))
+                :down-all []
+                :lease-majority
+                (cond-> []
+                  lease-implementation (conj (str base "lease-majority.lease-implementation = " (hocon-string lease-implementation)))
+                  lease-name (conj (str base "lease-majority.lease-name = " (hocon-string lease-name)))
+                  (some? acquire-lease-delay) (conj (str base "lease-majority.acquire-lease-delay-for-minority = " (sbr-duration acquire-lease-delay)))
+                  (some? release-after) (conj (str base "lease-majority.release-after = " (sbr-duration release-after)))
+                  role (conj (str base "lease-majority.role = " (hocon-string role)))))]
+    (ConfigFactory/parseString (str/join "\n" (concat lines strat)))))
 
 ;; ---------------------------------------------------------------------------
 ;; System Creation with Cluster Config
@@ -60,11 +164,20 @@
    - :port - This node's port (default: 7355)
    - :seed-nodes - Vector of seed node addresses
    - :roles - Vector of roles for this node
+   - :split-brain-resolver - A map of Split Brain Resolver options (see
+                     `split-brain-resolver-config`); tunes the downing strategy.
+                     Overrides the generated defaults, but :extra-config wins over it.
+   - :transit-serialization - `true`, or a map of options for
+                     `pekko-clj.serialization/transit-config`, to serialize Clojure
+                     data with Transit instead of Java serialization (which it turns
+                     off unless `:allow-java-serialization true` is passed).
+                     Overridden by :split-brain-resolver and :extra-config.
    - :extra-config - A HOCON string or a com.typesafe.config.Config whose settings
                      are merged with higher precedence over the generated defaults
                      (e.g. to override the default SplitBrainResolver or
                      allow-java-serialization). Takes precedence over everything the
-                     map generates, but still falls back to reference.conf.
+                     map generates (including :split-brain-resolver), but still
+                     falls back to reference.conf.
 
    Example:
      (create-system \"my-app\" {:hostname \"192.168.1.10\"
@@ -72,11 +185,14 @@
                                 :seed-nodes [\"pekko://my-app@192.168.1.10:7355\"
                                              \"pekko://my-app@192.168.1.11:7355\"]
                                 :roles [\"backend\"]
+                                :split-brain-resolver {:active-strategy :keep-majority
+                                                       :stable-after 15000}
                                 :extra-config \"pekko.cluster.min-nr-of-members = 2\"})"
   [name config]
   (let [cfg (if (instance? Config config)
               config
-              (let [{:keys [hostname port seed-nodes roles extra-config]
+              (let [{:keys [hostname port seed-nodes roles extra-config split-brain-resolver
+                            transit-serialization]
                      :or {hostname "127.0.0.1" port 7355}} config
                     seed-nodes-str (if seed-nodes
                                      (str "["
@@ -108,6 +224,11 @@
                         }
                       }")
                     base-cfg (ConfigFactory/parseString config-str)
+                    transit-cfg (when transit-serialization
+                                  (serialization/transit-config
+                                   (if (map? transit-serialization) transit-serialization {})))
+                    sbr-cfg (when split-brain-resolver
+                              (split-brain-resolver-config split-brain-resolver))
                     extra-cfg (cond
                                 (nil? extra-config) nil
                                 (instance? Config extra-config) extra-config
@@ -116,11 +237,12 @@
                                               (str ":extra-config must be a HOCON string or a "
                                                    "com.typesafe.config.Config, got "
                                                    (class extra-config)))))]
-                ;; extra-config overrides the generated defaults, which in turn
-                ;; override reference.conf (applied below).
-                (if extra-cfg
-                  (.withFallback extra-cfg base-cfg)
-                  base-cfg)))]
+                ;; Precedence (highest first): extra-config > split-brain-resolver >
+                ;; transit-serialization > generated defaults > reference.conf (below).
+                (cond-> base-cfg
+                  transit-cfg (as-> c (.withFallback transit-cfg c))
+                  sbr-cfg     (as-> c (.withFallback sbr-cfg c))
+                  extra-cfg   (as-> c (.withFallback extra-cfg c)))))]
     (ActorSystem/create name (.withFallback cfg (ConfigFactory/load)))))
 
 ;; ---------------------------------------------------------------------------
@@ -383,3 +505,116 @@
    This enables graceful shutdown where all nodes coordinate their exit."
   [system]
   (.prepareForFullClusterShutdown (cluster system)))
+
+;; ---------------------------------------------------------------------------
+;; Coordinated Shutdown
+;; ---------------------------------------------------------------------------
+
+(defn coordinated-shutdown
+  "The CoordinatedShutdown extension for `system`. Coordinated shutdown runs
+   registered tasks phase by phase when the ActorSystem terminates (or when
+   `run-coordinated-shutdown` is called), so resources drain in a safe order.
+   Works on any ActorSystem, not only cluster systems."
+  ^CoordinatedShutdown [^ActorSystem system]
+  (CoordinatedShutdown/get system))
+
+(def shutdown-phases
+  "Map of keyword → Pekko CoordinatedShutdown phase name, in execution order.
+   Pass a keyword (or a raw phase string) to `add-shutdown-task`."
+  {:before-service-unbind             (CoordinatedShutdown/PhaseBeforeServiceUnbind)
+   :service-unbind                    (CoordinatedShutdown/PhaseServiceUnbind)
+   :service-requests-done             (CoordinatedShutdown/PhaseServiceRequestsDone)
+   :service-stop                      (CoordinatedShutdown/PhaseServiceStop)
+   :before-cluster-shutdown           (CoordinatedShutdown/PhaseBeforeClusterShutdown)
+   :cluster-sharding-shutdown-region  (CoordinatedShutdown/PhaseClusterShardingShutdownRegion)
+   :cluster-leave                     (CoordinatedShutdown/PhaseClusterLeave)
+   :cluster-exiting                   (CoordinatedShutdown/PhaseClusterExiting)
+   :cluster-exiting-done              (CoordinatedShutdown/PhaseClusterExitingDone)
+   :cluster-shutdown                  (CoordinatedShutdown/PhaseClusterShutdown)
+   :before-actor-system-terminate     (CoordinatedShutdown/PhaseBeforeActorSystemTerminate)
+   :actor-system-terminate            (CoordinatedShutdown/PhaseActorSystemTerminate)})
+
+(def shutdown-reasons
+  "Map of keyword → CoordinatedShutdown.Reason. Pass a keyword (or a Reason, or
+   nil for :unknown) to `run-coordinated-shutdown`."
+  {:unknown                             (CoordinatedShutdown/unknownReason)
+   :actor-system-terminate              (CoordinatedShutdown/actorSystemTerminateReason)
+   :cluster-downing                     (CoordinatedShutdown/clusterDowningReason)
+   :cluster-leaving                     (CoordinatedShutdown/clusterLeavingReason)
+   :cluster-join-unsuccessful           (CoordinatedShutdown/clusterJoinUnsuccessfulReason)
+   :jvm-exit                            (CoordinatedShutdown/jvmExitReason)
+   :incompatible-configuration-detected (CoordinatedShutdown/incompatibleConfigurationDetectedReason)})
+
+(defn- ->phase ^String [phase]
+  (cond
+    (string? phase)  phase
+    (keyword? phase) (or (shutdown-phases phase)
+                         (throw (IllegalArgumentException.
+                                 (str "Unknown shutdown phase " phase " (known: "
+                                      (keys shutdown-phases) ")"))))
+    :else (throw (IllegalArgumentException.
+                  (str "Phase must be a keyword or string, got " (class phase))))))
+
+(defn- ->reason ^CoordinatedShutdown$Reason [reason]
+  (cond
+    (nil? reason)                              (CoordinatedShutdown/unknownReason)
+    (instance? CoordinatedShutdown$Reason reason) reason
+    (keyword? reason) (or (shutdown-reasons reason)
+                          (throw (IllegalArgumentException.
+                                  (str "Unknown shutdown reason " reason " (known: "
+                                       (keys shutdown-reasons) ")"))))
+    :else (throw (IllegalArgumentException.
+                  (str "Reason must be a keyword, CoordinatedShutdown.Reason or nil, got "
+                       (class reason))))))
+
+(defn- done-supplier
+  "Adapt a 0-arg `task-fn` to a Supplier<CompletionStage<Done>>. If the fn returns
+   a CompletionStage the phase awaits it; otherwise the task completes immediately."
+  ^Supplier [task-fn]
+  (reify Supplier
+    (get [_]
+      (let [r (task-fn)]
+        (if (instance? CompletionStage r)
+          r
+          (CompletableFuture/completedFuture (Done/done)))))))
+
+(defn add-shutdown-task
+  "Register a task to run during coordinated shutdown.
+
+   - phase: a keyword from `shutdown-phases` (e.g. :before-actor-system-terminate)
+     or a raw phase name string.
+   - task-name: a unique name for the task within the phase (string/keyword).
+   - task-fn: a 0-arg fn. If it returns a CompletionStage the phase waits for it to
+     complete; any other return value completes the task immediately.
+
+   Tasks in the same phase run in parallel; phases run in order. Returns nil."
+  [system phase task-name task-fn]
+  (.addTask (coordinated-shutdown system) (->phase phase) (str (name task-name))
+            (done-supplier task-fn))
+  nil)
+
+(defn add-cancellable-shutdown-task
+  "Like `add-shutdown-task`, but returns a Cancellable so the task can be removed
+   (via `.cancel`) before shutdown runs."
+  [system phase task-name task-fn]
+  (.addCancellableTask (coordinated-shutdown system) (->phase phase) (str (name task-name))
+                       (done-supplier task-fn)))
+
+(defn add-jvm-shutdown-hook
+  "Run `hook-fn` (0-arg) from a JVM shutdown hook coordinated with Pekko's own
+   shutdown hooks. Returns nil."
+  [system hook-fn]
+  (.addJvmShutdownHook (coordinated-shutdown system)
+                       ^Runnable (reify Runnable (run [_] (hook-fn))))
+  nil)
+
+(defn run-coordinated-shutdown
+  "Trigger coordinated shutdown: run all registered tasks phase by phase (the final
+   phases also terminate the ActorSystem). `reason` is a keyword from
+   `shutdown-reasons`, a CoordinatedShutdown.Reason, or nil (:unknown). Idempotent —
+   calling it again returns the same completion. Returns a CompletableFuture that
+   completes with Done when shutdown finishes."
+  (^CompletableFuture [system] (run-coordinated-shutdown system nil))
+  (^CompletableFuture [system reason]
+   (.toCompletableFuture
+    ^CompletionStage (.run (coordinated-shutdown system) (->reason reason) (Optional/empty)))))

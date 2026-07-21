@@ -96,12 +96,17 @@ Current dependencies in `project.clj`:
 [org.apache.pekko/pekko-actor_3 "1.6.0"]
 [org.apache.pekko/pekko-cluster_3 "1.6.0"]
 [org.apache.pekko/pekko-cluster-sharding_3 "1.6.0"]
+[org.apache.pekko/pekko-cluster-sharding-typed_3 "1.6.0"]  ;; ShardedDaemonProcess only
 [org.apache.pekko/pekko-cluster-tools_3 "1.6.0"]
+[org.apache.pekko/pekko-distributed-data_3 "1.6.0"]  ;; CRDTs (pekko-clj.cluster.ddata)
 [org.apache.pekko/pekko-stream_3 "1.6.0"]
 [org.apache.pekko/pekko-persistence_3 "1.6.0"]
+[org.apache.pekko/pekko-persistence-query_3 "1.6.0"]
 [org.apache.pekko/pekko-http_3 "1.3.0"]
 [org.apache.pekko/pekko-testkit_3 "1.6.0"]
 [org.apache.pekko/pekko-stream-testkit_3 "1.6.0"]
+[com.cognitect/transit-clj "1.0.333"]  ;; Transit serializer (pekko-clj.serialization)
+[cheshire "5.13.0"]                    ;; JSON marshalling (pekko-clj.http)
 ```
 
 For cluster-aware routing, no additional dependencies needed (included in pekko-cluster).

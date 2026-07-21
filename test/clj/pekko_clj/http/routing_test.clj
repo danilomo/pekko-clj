@@ -8,6 +8,9 @@
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.http.javadsl Http]
            [org.apache.pekko.http.javadsl.model HttpRequest StatusCodes]
+           [org.apache.pekko.http.javadsl.model.ws BinaryMessage]
+           [org.apache.pekko.http.javadsl.server ExceptionHandler RejectionHandler]
+           [org.apache.pekko.util ByteString]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -148,3 +151,31 @@
                   (fn [req]
                     (resp/ok "handled")))]
       (is route))))
+
+;; ---------------------------------------------------------------------------
+;; Handler builders & WebSocket helpers (N7)
+;; ---------------------------------------------------------------------------
+
+(deftest handler-builders-test
+  (testing "rejection-handler / exception-handler build real Pekko handlers"
+    (is (instance? RejectionHandler
+                   (routing/rejection-handler {:not-found (routing/complete :not-found "x")})))
+    (is (instance? RejectionHandler
+                   (routing/rejection-handler {:all (fn [_] (routing/complete "all"))})))
+    (is (instance? ExceptionHandler
+                   (routing/exception-handler {Throwable (fn [_] (routing/complete "e"))})))
+    (is (instance? ExceptionHandler
+                   (routing/exception-handler (fn [_] (routing/complete "any"))))
+        "a bare function handles any Throwable")))
+
+(deftest websocket-message-helpers-test
+  (testing "text messages round trip; other messages read as nil"
+    (is (= "hi" (routing/message->text (routing/text-message "hi"))))
+    (is (nil? (routing/message->text
+               (BinaryMessage/create (ByteString/fromString "bytes"))))
+        "binary messages have no text")))
+
+(deftest websocket-route-test
+  (testing "websocket route builds from a Flow of Messages"
+    (is (routing/websocket (routing/text-flow clojure.string/upper-case)))
+    (is (routing/websocket (routing/text-flow identity) "chat-v1"))))

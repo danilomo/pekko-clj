@@ -3,6 +3,7 @@
 
    Provides idiomatic Clojure functions for creating HTTP responses
    with proper content types and status codes."
+  (:require [pekko-clj.http.marshalling :as marshal])
   (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes StatusCode
                                                   ContentTypes ContentType HttpEntities
                                                   ResponseEntity]
@@ -60,6 +61,7 @@
 (def content-types
   "Map of content type keywords to Pekko ContentType objects."
   {:json       ContentTypes/APPLICATION_JSON
+   :edn        marshal/edn-content-type
    :html       ContentTypes/TEXT_HTML_UTF8
    :plain      ContentTypes/TEXT_PLAIN_UTF8
    :xml        ContentTypes/TEXT_XML_UTF8
@@ -92,14 +94,18 @@
       (HttpEntities/create ct ^bytes content))))
 
 (defn json
-  "Create a JSON entity from a string or data structure.
-   If given a map/vector, converts to JSON string using pr-str.
-   For production, use a proper JSON library like cheshire."
+  "Create a JSON entity from Clojure data (encoded with Cheshire) or from an
+   already-encoded JSON string, which is passed through unchanged.
+
+     (json {:name \"ada\" :ids [1 2]})  ;; => {\"name\":\"ada\",\"ids\":[1,2]}"
   [data]
-  (let [content (if (string? data)
-                  data
-                  (pr-str data))]
-    (entity content :json)))
+  (entity (marshal/->json data) :json))
+
+(defn edn
+  "Create an application/edn entity from Clojure data (or a pre-rendered EDN
+   string, passed through unchanged)."
+  [data]
+  (entity (marshal/->edn data) :edn))
 
 (defn html
   "Create an HTML entity from a string."

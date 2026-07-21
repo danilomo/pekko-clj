@@ -4,7 +4,8 @@
    Provides persistent actors that:
    - Store events in a journal
    - Rebuild state by replaying events
-   - Support snapshots for faster recovery
+   - Support snapshots for faster recovery, with optional retention
+   - Tag events so they can be read back with pekko-clj.persistence.query
 
    Example:
      (defactor-persistent shopping-cart
@@ -24,7 +25,11 @@
        (event [:item-removed item-id]
          (update state :items #(remove (fn [i] (= (:id i) item-id)) %)))
 
-       (snapshot-every 100))"
+       ;; Index every event under \"cart\" for (query/events-by-tag j \"cart\")
+       (tagger [event] #{\"cart\"})
+
+       ;; Snapshot every 100 events, keeping the 2 most recent
+       (snapshot-every 100 2))"
   (:require [clojure.core.match :refer [match]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.persistence SnapshotSelectionCriteria]
@@ -60,10 +65,22 @@
 (defn- parse-events [clauses]
   (filter #(and (seq? %) (= 'event (first %))) clauses))
 
-(defn- parse-snapshot-every [clauses]
+(defn- parse-snapshot-every
+  "Returns [every keep-n] for a (snapshot-every n) / (snapshot-every n keep-n)
+   clause; keep-n is nil when retention is not requested."
+  [clauses]
   (let [snapshot-clause (first (filter #(and (seq? %) (= 'snapshot-every (first %))) clauses))]
     (when snapshot-clause
-      (second snapshot-clause))))
+      [(second snapshot-clause) (nth snapshot-clause 2 nil)])))
+
+(defn- parse-delete-events-on-snapshot [clauses]
+  (boolean (some #(and (seq? %) (= 'delete-events-on-snapshot (first %))) clauses)))
+
+(defn- parse-tagger [clauses]
+  (let [tagger-clause (first (filter #(and (seq? %) (= 'tagger (first %))) clauses))]
+    (when tagger-clause
+      (let [[_ bindings & body] tagger-clause]
+        `(fn ~bindings ~@body)))))
 
 (defn- parse-on-recovery-complete [clauses]
   (let [recovery-clause (first (filter #(and (seq? %) (= 'on-recovery-complete (first %))) clauses))]
@@ -105,7 +122,15 @@
    - (init [args] ...)   - Initialize state from args
    - (command pattern & body) - Handle commands, return events via (persist ...)
    - (event pattern & body)   - Apply events to state, return new state
+   - (tagger [event] ...)     - Tags (a collection of strings) to index the event
+                                under, queryable via events-by-tag; nil/empty for
+                                none. Tags never reach the event handler.
    - (snapshot-every n)       - Take snapshot every n events
+   - (snapshot-every n keep)  - ... and keep only the `keep` most recent snapshots
+   - (delete-events-on-snapshot) - Also delete the events those dropped snapshots
+                                cover. Requires (snapshot-every n keep). Events are
+                                gone for good: only use it when nothing replays this
+                                actor's journal (no events-by-tag consumer, no audit).
    - (on-recovery-complete [this] ...) - Called when recovery finishes
 
    In command bodies, `this` (the actor) and `state` (its current value) are
@@ -138,7 +163,9 @@
        (event [:added n]
          (update state :count + n))
 
-       (snapshot-every 50))"
+       (tagger [event] #{\"counter\"})
+
+       (snapshot-every 50 2))"
   [name & clauses]
   (let [docstring (when (string? (first clauses)) (first clauses))
         clauses   (if docstring (rest clauses) clauses)
@@ -146,7 +173,9 @@
         init-fn (parse-init clauses)
         commands (parse-commands clauses)
         events (parse-events clauses)
-        snapshot-every (parse-snapshot-every clauses)
+        [snapshot-every keep-snapshots] (parse-snapshot-every clauses)
+        delete-events-on-snapshot (parse-delete-events-on-snapshot clauses)
+        tagger-fn (parse-tagger clauses)
         on-recovery-complete (parse-on-recovery-complete clauses)
         command-handler (build-command-handler commands)
         event-handler (build-event-handler events)]
@@ -157,6 +186,12 @@
           (throw (ex-info (str "defactor-persistent " name ": `this`/`state` are reserved "
                                "bindings in command bodies — rename them in the command pattern")
                           {:pattern pattern})))))
+    ;; Retention needs a snapshot cadence and a count of snapshots to keep;
+    ;; without both, deleting events would drop history nothing can replace.
+    (when (and delete-events-on-snapshot (not (and snapshot-every keep-snapshots)))
+      (throw (ex-info (str "defactor-persistent " name ": (delete-events-on-snapshot) requires "
+                           "(snapshot-every n keep-n)")
+                      {:snapshot-every snapshot-every :keep-snapshots keep-snapshots})))
     ;; Bind each generated form to a local exactly once (no double splice), then
     ;; reference the locals from both the actor-def map and its :make-props.
     `(def ~(if docstring (vary-meta name assoc :doc docstring) name)
@@ -165,6 +200,9 @@
              init-fn#              ~init-fn
              persistence-id-fn#    ~persistence-id-fn
              snapshot-every#       ~snapshot-every
+             keep-snapshots#       ~keep-snapshots
+             delete-events#        ~delete-events-on-snapshot
+             tagger#               ~tagger-fn
              on-recovery-complete# ~on-recovery-complete]
          {:type :persistent-actor
           :persistence-id-fn persistence-id-fn#
@@ -172,6 +210,9 @@
           :command-handler command-handler#
           :event-handler event-handler#
           :snapshot-every snapshot-every#
+          :keep-snapshots keep-snapshots#
+          :delete-events-on-snapshot delete-events#
+          :tagger tagger#
           :on-recovery-complete on-recovery-complete#
           :make-props (fn [args#]
                         (let [initial-state# (when init-fn# (init-fn# args#))
@@ -181,6 +222,9 @@
                            :command-handler command-handler#
                            :event-handler event-handler#
                            :snapshot-every snapshot-every#
+                           :keep-snapshots keep-snapshots#
+                           :delete-events-on-snapshot delete-events#
+                           :tagger tagger#
                            :on-recovery-complete on-recovery-complete#}))}))))
 
 ;; ---------------------------------------------------------------------------

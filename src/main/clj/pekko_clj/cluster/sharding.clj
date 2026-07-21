@@ -32,10 +32,17 @@
      ;; Or use EntityRef for more direct access
      (def order-ref (sharding/entity-ref sys \"Order\" \"order-123\"))
      (sharding/tell-entity order-ref [:add-item {:sku \"XYZ\" :qty 1}])
-     (sharding/ask-entity order-ref :get-items)"
+     (sharding/ask-entity order-ref :get-items)
+
+   Idle entities can be passivated automatically (see `start`'s :passivation and
+   `passivation-settings`) or on request (`passivate`). For always-on workers that
+   are not addressed by entity id, see `pekko-clj.cluster.daemon`."
   (:require [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorSystem ActorRef Props]
            [org.apache.pekko.cluster.sharding ClusterSharding ClusterShardingSettings
+                                              ClusterShardingSettings$PassivationStrategySettings
+                                              ClusterShardingSettings$PassivationStrategySettings$LeastRecentlyUsedSettings
+                                              ClusterShardingSettings$PassivationStrategySettings$LeastFrequentlyUsedSettings
                                               ShardRegion$MessageExtractor
                                               ShardRegion$HashCodeMessageExtractor
                                               ShardRegion$Passivate
@@ -43,6 +50,8 @@
                                               ShardRegion$ClusterShardingStats
                                               ShardRegion$ShardRegionStats]
            [pekko_clj.actor CljActor]
+           [com.typesafe.config Config ConfigFactory]
+           [java.time Duration]
            [scala.concurrent.duration FiniteDuration]
            [java.util.concurrent TimeUnit]))
 
@@ -88,8 +97,119 @@
   (.name (.path ^ActorRef (core/self))))
 
 ;; ---------------------------------------------------------------------------
+;; Passivation strategies
+;; ---------------------------------------------------------------------------
+
+(defn- ->duration
+  "Coerce milliseconds or a java.time.Duration to a java.time.Duration."
+  ^Duration [d]
+  (if (instance? Duration d) d (Duration/ofMillis (long d))))
+
+(defn- lru-settings
+  "LeastRecentlyUsedSettings, optionally segmented (SLRU): a number of levels, or
+   a sequence of fractional proportions per level."
+  [segmented]
+  (let [base (ClusterShardingSettings$PassivationStrategySettings$LeastRecentlyUsedSettings/defaults)]
+    (cond
+      (nil? segmented) base
+      (number? segmented) (.withSegmented base (int segmented))
+      (sequential? segmented) (.withSegmentedProportions base (java.util.ArrayList. ^java.util.Collection
+                                                                                    (mapv double segmented)))
+      :else (throw (IllegalArgumentException.
+                    (str ":segmented must be a number of levels or a sequence of "
+                         "proportions, got " (class segmented)))))))
+
+(defn passivation-settings
+  "Build Pekko's PassivationStrategySettings from a Clojure map. Pass the result (or
+   just the map) as `start`'s `:passivation` option.
+
+   Options map:
+   - :strategy - :idle (default when only :idle-timeout is given), :least-recently-used,
+                 :most-recently-used, :least-frequently-used, or :none to disable
+                 automatic passivation entirely
+   - :idle-timeout  - passivate an entity idle for this long (ms or java.time.Duration)
+   - :idle-interval - how often idle entities are checked (default: half the timeout)
+   - :active-entity-limit - passivate when a region holds more than this many entities
+                 (required for the replacement-policy strategies)
+   - :segmented - :least-recently-used only — number of SLRU levels, or a sequence of
+                 fractional proportions (e.g. [0.2 0.8])
+   - :dynamic-aging - :least-frequently-used only — age frequency counts over time
+
+   Returns: ClusterShardingSettings.PassivationStrategySettings
+
+   Note: Pekko disables automatic passivation entirely when `:remember-entities` is on.
+
+   Example:
+     (passivation-settings {:strategy :least-recently-used
+                            :active-entity-limit 10000
+                            :segmented [0.2 0.8]})"
+  ^ClusterShardingSettings$PassivationStrategySettings [opts]
+  (let [{:keys [strategy idle-timeout idle-interval active-entity-limit segmented dynamic-aging]} opts
+        strategy (or strategy (if idle-timeout :idle :none))]
+    (if (#{:none :off} strategy)
+      (ClusterShardingSettings$PassivationStrategySettings/disabled)
+      (let [base (cond-> (ClusterShardingSettings$PassivationStrategySettings/defaults)
+                   (and idle-timeout idle-interval)
+                   (.withIdleEntityPassivation (->duration idle-timeout) (->duration idle-interval))
+
+                   (and idle-timeout (not idle-interval))
+                   (.withIdleEntityPassivation (->duration idle-timeout))
+
+                   active-entity-limit
+                   (.withActiveEntityLimit (int active-entity-limit)))]
+        (case strategy
+          :idle base
+          :least-recently-used (.withReplacementPolicy base (lru-settings segmented))
+          :most-recently-used (.withMostRecentlyUsedReplacement base)
+          :least-frequently-used
+          (.withReplacementPolicy
+           base
+           (cond-> (ClusterShardingSettings$PassivationStrategySettings$LeastFrequentlyUsedSettings/defaults)
+             dynamic-aging (.withDynamicAging true)))
+          (throw (IllegalArgumentException.
+                  (str "Unknown passivation strategy: " strategy
+                       " (expected :idle, :least-recently-used, :most-recently-used, "
+                       ":least-frequently-used or :none)"))))))))
+
+;; ---------------------------------------------------------------------------
 ;; Sharding Setup
 ;; ---------------------------------------------------------------------------
+
+(def ^:private remember-entities-stores
+  {:ddata "ddata"
+   :eventsourced "eventsourced"})
+
+(defn sharding-settings
+  "Build ClusterShardingSettings from `start`'s options map (see `start` for the
+   keys). Exposed so callers can inspect or further customise the settings."
+  ^ClusterShardingSettings [^ActorSystem system opts]
+  (let [{:keys [role remember-entities remember-entities-store journal-plugin-id
+                snapshot-plugin-id passivation passivate-after]} opts
+        ;; The remember-entities store mode has no `with…` setter — it is read from
+        ;; config — so start from the system's own sharding section and override it.
+        sharding-cfg (.getConfig (.config (.settings system)) "pekko.cluster.sharding")
+        store (when remember-entities-store
+                (or (remember-entities-stores remember-entities-store)
+                    (throw (IllegalArgumentException.
+                            (str "Unknown :remember-entities-store: " remember-entities-store
+                                 " (expected :ddata or :eventsourced)")))))
+        ^Config cfg (if store
+                      (.withFallback (ConfigFactory/parseString
+                                      (str "remember-entities-store = \"" store "\""))
+                                     sharding-cfg)
+                      sharding-cfg)
+        passivation-opts (cond
+                           passivation passivation
+                           passivate-after {:strategy :idle :idle-timeout passivate-after})]
+    (cond-> (ClusterShardingSettings/create cfg)
+      role (.withRole ^String role)
+      remember-entities (.withRememberEntities true)
+      journal-plugin-id (.withJournalPluginId ^String journal-plugin-id)
+      snapshot-plugin-id (.withSnapshotPluginId ^String snapshot-plugin-id)
+      passivation-opts (.withPassivationStrategy
+                        (if (instance? ClusterShardingSettings$PassivationStrategySettings passivation-opts)
+                          passivation-opts
+                          (passivation-settings passivation-opts))))))
 
 (defn start
   "Start cluster sharding for an entity type.
@@ -105,8 +225,19 @@
      - :type-name - Name for this entity type (required)
      - :role - Role constraint (only nodes with this role host entities)
      - :num-shards - Number of shards (default: 100)
-     - :passivate-after - Passivate idle entities after duration (ms)
-     - :remember-entities - Remember entity IDs across restarts (default: false)
+     - :passivate-after - Passivate idle entities after this many ms (shorthand for
+                          :passivation {:strategy :idle :idle-timeout ms})
+     - :passivation - Passivation strategy: a map for `passivation-settings` (idle
+                          timeouts and/or an active-entity limit with an LRU/MRU/LFU
+                          replacement policy), or a PassivationStrategySettings
+     - :remember-entities - Restart entities after a shard moves (default: false).
+                          Turning this on disables automatic passivation.
+     - :remember-entities-store - :ddata (default) or :eventsourced; how remembered
+                          entity ids are stored. :eventsourced needs a journal.
+     - :journal-plugin-id / :snapshot-plugin-id - Persistence plugins to use for the
+                          :eventsourced remember-entities store
+     - :stop-message - Message sent to an entity to stop it gracefully during shard
+                          rebalance/hand-off (default: Pekko's PoisonPill)
 
    Returns the ShardRegion ActorRef.
 
@@ -118,23 +249,25 @@
        {:type-name \"Order\"
         :role \"orders\"
         :num-shards 100
-        :passivate-after 300000})"
+        :passivation {:strategy :least-recently-used
+                      :active-entity-limit 10000}
+        :stop-message :stop-now})"
   [^ActorSystem system actor-def opts]
-  (let [{:keys [type-name role num-shards passivate-after remember-entities]
-         :or {num-shards 100 remember-entities false}} opts
+  (let [{:keys [type-name num-shards stop-message]
+         :or {num-shards 100}} opts
         ;; Create a Props - entity-id will be extracted from messages
         ;; and passed via the message extractor
         props (CljActor/create ((:make-props actor-def) nil))
-        settings (cond-> (ClusterShardingSettings/create system)
-                   role (.withRole role)
-                   passivate-after
-                   (.withPassivateIdleEntityAfter
-                     (java.time.Duration/ofMillis passivate-after))
-                   remember-entities (.withRememberEntities true))
+        settings (sharding-settings system opts)
         extractor (create-message-extractor num-shards)
         sharding (ClusterSharding/get system)]
-    ;; Start the shard region with Props and MessageExtractor
-    (.start sharding type-name props settings extractor)))
+    ;; Start the shard region with Props and MessageExtractor. A hand-off stop
+    ;; message requires the overload that also takes an allocation strategy.
+    (if (some? stop-message)
+      (.start sharding type-name props settings extractor
+              (.defaultShardAllocationStrategy sharding settings)
+              stop-message)
+      (.start sharding type-name props settings extractor))))
 
 (defn start-proxy
   "Start a proxy-only shard region.
@@ -310,24 +443,30 @@
 (defn passivate
   "Request passivation for an entity from within its actor.
 
-   Call this from within an entity actor to request graceful shutdown.
-   The entity will receive the stop-message before being stopped.
+   Call this from within an entity actor to request graceful shutdown: the shard
+   buffers any further messages for this entity, sends it `stop-message`, and stops
+   it once that message is handled. The entity is recreated on the next message.
 
    Arguments:
-   - context: The actor context (use core/context to get it)
+   - context: The actor context (defaults to the current actor's)
    - stop-message: Message the entity will receive before stopping
+
+   To actually stop on the stop-message, handle it by stopping self — e.g. with
+   (core/stop (core/self)).
 
    Example:
      (core/defactor my-entity
        (handle :cleanup
-         (sharding/passivate (core/context) :final-stop)
+         (sharding/passivate :final-stop)
          state)
        (handle :final-stop
          (save-state! state)
-         :stop))"
-  [context stop-message]
-  (let [parent (.parent context)]
-    (core/! parent (ShardRegion$Passivate. stop-message))))
+         (core/stop (core/self))
+         state))"
+  ([stop-message] (passivate (core/context) stop-message))
+  ([^org.apache.pekko.actor.ActorContext context stop-message]
+   (let [parent (.parent context)]
+     (core/! parent (ShardRegion$Passivate. stop-message)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Health Checks

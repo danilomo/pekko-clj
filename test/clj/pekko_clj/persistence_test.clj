@@ -135,6 +135,42 @@
   (event [:incremented]
     (update state :count inc)))
 
+(p/defactor-persistent retained-counter
+  "snapshot-every with retention: snapshot every 2 events, keep only 1 snapshot."
+  :persistence-id (fn [args] (str "retained-" (:id args)))
+
+  (init [_] {:count 0})
+
+  (command :increment
+    (p/persist [:incremented]))
+
+  (command :get
+    (p/reply (:count state)))
+
+  (event [:incremented]
+    (update state :count inc))
+
+  (snapshot-every 2 1))
+
+(p/defactor-persistent retained-deleting-counter
+  "snapshot-every with retention AND delete-events-on-snapshot: events the kept
+   snapshot subsumes are deleted from the journal."
+  :persistence-id (fn [args] (str "retained-del-" (:id args)))
+
+  (init [_] {:count 0})
+
+  (command :increment
+    (p/persist [:incremented]))
+
+  (command :get
+    (p/reply (:count state)))
+
+  (event [:incremented]
+    (update state :count inc))
+
+  (snapshot-every 2 1)
+  (delete-events-on-snapshot))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests
 ;; ---------------------------------------------------------------------------
@@ -332,6 +368,64 @@
 (deftest defactor-persistent-docstring-preserved
   (is (= "Exercises p/reply, p/recovering?, and p/trigger-snapshot!."
          (:doc (meta #'reply-helper-actor)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: snapshot retention (N2)
+;; ---------------------------------------------------------------------------
+
+(deftest snapshot-retention-recovers-correctly
+  ;; snapshot-every 2 keep 1 deletes older snapshots as new ones are taken;
+  ;; recovery must still reconstruct the correct state from the kept snapshot
+  ;; (+ any events after it).
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys retained-counter {:id id})]
+          (dotimes [_ 6] (core/! actor :increment))
+          (is (eventually (= 6 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))
+    ;; Recover in a fresh system.
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys retained-counter {:id id})]
+          (is (eventually (= 6 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest snapshot-retention-with-event-deletion-recovers-correctly
+  ;; delete-events-on-snapshot removes events the kept snapshot already covers.
+  ;; Recovery loads the latest snapshot and replays only events after it, so the
+  ;; state is still correct even though early events are gone.
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys retained-deleting-counter {:id id})]
+          (dotimes [_ 6] (core/! actor :increment))
+          (is (eventually (= 6 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys retained-deleting-counter {:id id})]
+          (is (eventually (= 6 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest defactor-persistent-rejects-delete-events-without-retention
+  ;; delete-events-on-snapshot needs (snapshot-every n keep) — deleting events
+  ;; without a retained snapshot would drop unrecoverable history.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent bad-retention
+                            :persistence-id (fn [_] "x")
+                            (init [_] {})
+                            (command :x (p/persist [:e]))
+                            (event [:e] state)
+                            (snapshot-every 5)
+                            (delete-events-on-snapshot)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
 
 (deftest defactor-persistent-rejects-state-shadow-in-command
   ;; H6: `this`/`state` are reserved anaphors in command bodies (macroexpand-1

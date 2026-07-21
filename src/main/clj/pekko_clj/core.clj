@@ -1,7 +1,7 @@
 (ns pekko-clj.core
   (:require [clojure.core.match :as m])
   (:import [org.apache.pekko.actor ActorSystem ActorRef ActorRefFactory ActorContext
-                                   ActorSelection PoisonPill]
+                                   ActorSelection PoisonPill Props ReceiveTimeout]
            [org.apache.pekko.pattern Patterns AskTimeoutException]
            [pekko_clj.actor CljActor BecomeResult]
            [com.typesafe.config Config]
@@ -74,6 +74,13 @@
   [actor-def args]
   (CljActor/create ((:make-props actor-def) args)))
 
+(defn actor-props
+  "The raw Pekko Props for a `defactor` `actor-def` (optionally with init `args`).
+   Use for advanced setups — decorate the returned Props with `.withMailbox` /
+   `.withDispatcher` and spawn it with `spawn-props`."
+  (^Props [actor-def] (make-props actor-def nil))
+  (^Props [actor-def args] (make-props actor-def args)))
+
 (defn spawn
   "Spawn a new actor.
 
@@ -95,6 +102,13 @@
        (.actorOf ^ActorContext (.getContext *current-actor*) props))))
   ([^ActorSystem system actor-def args]
    (.actorOf system (make-props actor-def args))))
+
+(defn spawn-props
+  "Spawn an actor from a raw Pekko `Props` (e.g. one from `actor-props` decorated
+   with `.withMailbox`/`.withDispatcher`). With one argument, spawns a child of the
+   current actor; otherwise pass an ActorSystem or ActorContext."
+  ([^Props props] (.actorOf (context) props))
+  ([^ActorRefFactory factory ^Props props] (.actorOf factory props)))
 
 (def ^:dynamic *timeout* 30000)
 
@@ -392,6 +406,39 @@
   "Cancel all timers for this actor."
   []
   (.cancelAllTimers *current-actor*))
+
+;; ReceiveTimeout
+(def receive-timeout
+  "The Pekko ReceiveTimeout singleton — the message an actor receives when its
+   receive-timeout elapses (see `set-receive-timeout`). Match it with
+   `receive-timeout?`."
+  (ReceiveTimeout/getInstance))
+
+(defn receive-timeout?
+  "True if `msg` is the ReceiveTimeout message."
+  [msg]
+  (identical? msg receive-timeout))
+
+(defn set-receive-timeout
+  "Arrange for the current actor to be sent the `receive-timeout` message if it
+   receives no message for `timeout` (a java.time.Duration or a number of
+   milliseconds). Any received message resets the timer. Setting a new timeout
+   replaces the previous one; use `cancel-receive-timeout` to turn it off. Call
+   during init or a handler. Returns nil.
+
+   Note: the timer is scheduled with the arrival of the last message and is not
+   reset by cancel/reschedule while a message is being processed."
+  [timeout]
+  (let [ms (if (instance? Duration timeout) (.toMillis ^Duration timeout) (long timeout))]
+    (.setReceiveTimeout (context)
+                        (scala.concurrent.duration.Duration/create ms TimeUnit/MILLISECONDS)))
+  nil)
+
+(defn cancel-receive-timeout
+  "Disable the current actor's receive timeout. Returns nil."
+  []
+  (.setReceiveTimeout (context) (scala.concurrent.duration.Duration/Undefined))
+  nil)
 
 ;; DeathWatch functions
 (defn watch

@@ -55,15 +55,19 @@ Everything is classic Pekko bridged via the Java classes in `src/main/java/pekko
 | H4 | Restore singleton message-passing test | Hardening | DONE | B6, H1, H2 | low |
 | H5 | Core DX polish (`context`, `stop`, `actor-selection`, …) | Hardening | DONE | B1, B2, B3 | low |
 | H6 | Macro hygiene & docs | Hardening | DONE | B1, B4 | low |
-| N1 | Streams depth (mat values, KillSwitch, supervision, actor interop) | New | TODO | B7, F1 | medium |
-| N2 | Persistence query + event tagging + snapshot retention | New | TODO | B4, N1 | medium |
-| N3 | Distributed Pub-Sub / Topic | New | TODO | B5 | low |
-| N4 | Clojure-data serializer (Transit) + bindings helper | New | TODO | B5 | medium |
-| N5 | Sharding: passivation, remember-entities, daemon-process | New | TODO | B8 | medium |
-| N6 | Split-Brain-Resolver + CoordinatedShutdown helpers | New | TODO | B5 | low |
-| N7 | HTTP routing-DSL completion + marshalling + websockets | New | TODO | B9 | medium |
-| N8 | Distributed Data (selective CRDTs) | New | TODO | B5, N3 | medium |
-| N9 | Classic actor extras (ReceiveTimeout, EventStream, …) | New | TODO | B1, B3, H5 | low |
+| N1 | Streams depth (mat values, KillSwitch, supervision, actor interop) | New | DONE | B7, F1 | medium |
+| N2 | Persistence query + event tagging + snapshot retention | New | DONE | B4, N1 | medium |
+| N3 | Distributed Pub-Sub / Topic | New | DONE | B5 | low |
+| N4 | Clojure-data serializer (Transit) + bindings helper | New | DONE | B5 | medium |
+| N5 | Sharding: passivation, remember-entities, daemon-process | New | DONE | B8 | medium |
+| N6 | Split-Brain-Resolver + CoordinatedShutdown helpers | New | DONE | B5 | low |
+| N7 | HTTP routing-DSL completion + marshalling + websockets | New | DONE | B9 | medium |
+| N8 | Distributed Data (selective CRDTs) | New | DONE | B5, N3 | medium |
+| N9 | Classic actor extras (ReceiveTimeout, EventStream, …) | New | DONE | B1, B3, H5 | low |
+
+**Status (2026-07-21): the epic is COMPLETE** — every story (B1–B10, H1–H6, N1–N9, F0–F1) is
+`DONE`, including the optional N8/N9. `lein test`: 466 tests / 981 assertions / 0 failures /
+0 errors. Remaining work lives in the Backlog section below.
 
 **Definition of done for the epic:** all B + H stories `DONE`; N1–N7 `DONE` (N8/N9 optional);
 this file and `docs/specs/*` reflect reality; version pins consistent across
@@ -489,7 +493,7 @@ Document/guard the reserved anaphors `state` (`defactor`) and `this`/`state`
 
 New namespaces under `src/main/clj/pekko_clj/`. N1/N2 are highest leverage (gate CQRS).
 
-### N1 · Streams depth — `TODO`
+### N1 · Streams depth — `DONE`
 **Deps:** B7, F1. (Largest — may split N1a/N1b.)
 Materialized values (`toMat`/`viaMat` + `Keep.left/right/both`; return `SourceQueue`/
 `SinkQueue` + completion futures as a Clojure map, e.g. `{:done … :queue …}`). KillSwitch
@@ -497,8 +501,63 @@ Materialized values (`toMat`/`viaMat` + `Keep.left/right/both`; return `SourceQu
 `RestartSource/Flow/Sink.withBackoff`; `RetryFlow.withBackoff`). Actor interop
 (`Flow.ask`/`askWithStatus`; finalize `Source/Sink.actorRef*` non-deprecated overloads).
 Reuse the 90+ ops in `stream.clj` and `materializer` (`stream.clj:38`).
+- **Done (2026-07-15):** all four areas landed in `pekko-clj.stream` (no split needed).
+  **Materialized values:** `keep-mat` (:left/:right/:both/:none — named to avoid shadowing
+  `clojure.core/keep`), `via-mat`, `to-mat` (→ `RunnableGraph`), `run-graph`, `run-mat`; a
+  `Keep/both` `japi.Pair` is unwrapped to a Clojure vector `[left right]` rather than leaking
+  the Java type. Map-returning conveniences per the story: `run-source-queue` →
+  `{:queue SourceQueueWithComplete :done …}` and `run-sink-queue` → `{:queue SinkQueueWithCancel}`.
+  **KillSwitch:** `kill-switch-single`, `via-kill-switch`, `run-with-kill-switch` →
+  `{:kill-switch :done}`, `shared-kill-switch` + `shared-kill-switch-flow`, and polymorphic
+  `shutdown`/`abort` over the `KillSwitch` interface.
+  **Supervision:** `supervision-strategy` (decider fn Throwable → `:stop`/`:resume`/`:restart`,
+  nil ⇒ `:stop` per Pekko's default) via `ActorAttributes/withSupervisionStrategy`,
+  `with-attributes`, `with-supervision`; `restart-settings` (opts map → `RestartSettings`,
+  incl. `:max-restarts`/`:max-restarts-within`/`:restart-on`), `restart-source`,
+  `restart-source-on-failures`, `restart-flow`, `restart-flow-on-failures`, `restart-sink`,
+  `retry-flow`. Durations accept a `java.time.Duration` or milliseconds throughout.
+  **Actor interop:** `flow`/`flow-of`/`flow-from-fn` (the ns had **no** Flow constructors before,
+  despite importing `Flow` — `via`/`restart-flow`/`retry-flow` all need one; the existing ops
+  work on a Flow unchanged), `ask` (+ parallelism arity), `ask-with-status`,
+  `source-actor-ref` 4-arity opts map (`:complete-with`/`:fail-with` → the matcher-based
+  `Source/actorRef` overload), `sink-actor-ref-with-backpressure`.
+- **`Flow.askWithStatus` does NOT exist in Pekko 1.6.0** (verified: zero hits for `askWithStatus`
+  across the whole unpacked `pekko-stream_3-1.6.0.jar`, javadsl **and** scaladsl — it is an
+  Akka-only API; `org.apache.pekko.pattern.StatusReply` itself does exist in pekko-actor). So
+  `ask-with-status` asks for a `StatusReply` and unwraps it (success → value, error → stream
+  failure) — same semantics, one extra `smap` stage. Documented in its docstring.
+- **Deprecation check (completes B7's deferral):** re-verified via `javap -v` that
+  `Source/actorRef(int, OverflowStrategy)` and `Sink/actorRef(ActorRef, Object)` carry **no**
+  `Deprecated` attribute in 1.6.0 — they stay as the 3-arity/simple forms. The matcher-based
+  `Source/actorRef` and `Sink/actorRefWithBackpressure` are now exposed for callers who want
+  explicit completion/failure control or ack-based backpressure.
+- **Cleanup:** deduped the three copy-pasted overflow-strategy `case` blocks (`buffer`,
+  `source-actor-ref`, `source-queue` — each with a different default and only one supporting
+  `:backpressure`) into one private `->overflow-strategy [strategy default]`, preserving each
+  call site's default. Added a private `->duration` (mirrors `circuit_breaker.clj`). Fixed the
+  ns docstring's example, which passed `sys` to `run-foreach` (it takes a **materializer**), and
+  documented the new surface there.
+- **Tests (`stream_test.clj`, +39 → 106 in the ns):** mat-value keeps (`:both` → vector, `:left`
+  reaching a kill switch through `via-kill-switch`), queue map forms driven end-to-end
+  (offer/complete, pull → empty `Optional`), kill-switch shutdown (asserting the infinite stream
+  does *not* complete first) / abort / shared-switch stopping two streams, supervision
+  `:resume`-drops-vs-`:stop`-fails and a `scan`-based test that genuinely discriminates
+  `:restart` (`[0 1 3 0 3]`, state reset) from `:resume` (`[0 1 3 6]`, state kept) — both verified
+  against real output, unknown-directive throw, `restart-settings` field-by-field, restart-on-
+  completion vs on-failure-only, give-up-after-`:max-restarts` (exactly 3 attempts),
+  `:restart-on` false ⇒ no restart, restart flow/sink, `retry-flow` retry-until-accept and
+  give-up, Flow constructors + composition with existing ops, `ask` (order, parallelism,
+  Duration timeout), `ask-with-status` success/error/parallelism, `source-actor-ref`
+  `:complete-with`/`:fail-with` + a regression that the 3-arity `Status$Success` path is
+  unchanged, and the ack-based backpressure sink. Full suite green before (357 tests / 663
+  assertions) and after (**396 tests / 724 assertions / 0 failures / 0 errors**); the stream ns
+  ran 3× clean to check the backoff-timed tests for flakiness.
+- **Note:** no `docs/specs/*` checklist covers streams (no stream parity spec exists — see the
+  roll-up table), so nothing to tick there. `stream.clj` keeps its deliberate H3 reflection
+  posture: no `^Source` hints on the polymorphic ops (they must accept `Source`/`Flow`/`SubSource`,
+  which share no supertype with `.map`), reflection being construction-time only. **Unblocks N2.**
 
-### N2 · Persistence query + event tagging + snapshot retention — `TODO`
+### N2 · Persistence query + event tagging + snapshot retention — `DONE`
 **Deps:** B4, N1.
 `withTagger`/`tagsFor` on `defactor-persistent`; snapshot retention (`snapshotEvery(n,keepN)`,
 `deleteEventsOnSnapshot`) atop the existing helpers (`persistence.clj:227-256`). New
@@ -506,53 +565,306 @@ Reuse the 90+ ops in `stream.clj` and `materializer` (`stream.clj:38`).
 `eventsByPersistenceId`, `persistenceIds`; map `EventEnvelope` + `Offset` to Clojure data
 (returns a `Source`, composes with N1). LevelDB backs `eventsByTag` but **not**
 `eventsBySlice` — document it.
+- **Done (2026-07-16):** added `pekko-persistence-query_3` 1.6.0 (`project.clj` + README module
+  table). **Tagging:** a `(tagger [event] ...)` clause on `defactor-persistent` returns tags
+  (any collection of strings/keywords) for an event; `CljPersistentActor.withTags` wraps the
+  event in a `journal.Tagged` envelope at persist time (only when the tagger returns tags), and
+  `applyEvent` unwraps `Tagged` so the event handler and recovery only ever see the raw event.
+  **Snapshot retention:** `(snapshot-every n keep)` deletes snapshots older than the `keep` most
+  recent (`applyRetention` on `SaveSnapshotSuccess`: `deleteUpTo = seqNr - keep*n`); optional
+  `(delete-events-on-snapshot)` also `deleteMessages(deleteUpTo)` the subsumed events (macro
+  guard: requires the 3-arg `snapshot-every`). `createReceive` now matches the journal/snapshot
+  protocol replies (`SaveSnapshot*`/`Delete*`) so retention runs and infra messages never reach
+  the command handler; failures are logged, not routed. **Query ns** (`pekko-clj.persistence.query`):
+  `read-journal` (`getReadJournalFor`, default LevelDB), live + `current-` variants of
+  `events-by-tag`/`events-by-persistence-id`/`persistence-ids`, `envelope->map`
+  (`{:offset :persistence-id :sequence-nr :event :timestamp}`), `offset->clj` + `no-offset`/
+  `sequence-offset` (NoOffset is a Scala case object → matched by value), each returning a
+  pekko-clj.stream `Source` that composes with N1. Capability-missing journals throw a clear error.
+- **Backend note (documented in the ns):** LevelDB backs `events-by-tag` but has no
+  `eventsBySlice` provider (typed, slice-based) — use tags for cross-persistence-id fan-in.
+- **Tests:** `persistence_test.clj` — retention recovery (keep-1 + delete-events both reconstruct
+  state) and the delete-events-without-retention macro guard. New `persistence/query_test.clj`
+  (12 tests) — `offset->clj`/`envelope->map` shape, `current-events-by-persistence-id`,
+  `current-events-by-tag` fan-in across two actors + offset-resume, `current-persistence-ids`,
+  a live `events-by-tag` picking up a new event, capability-error, and an observable
+  delete-events-on-snapshot check (only seq 5 & 6 survive after 6 events). Tag queries filter by
+  the test's own persistence-ids since a tag fans in across the shared journal. Full suite green
+  before (396 tests / 724 assertions) and after (**408 tests / 752 assertions / 0 failures / 0
+  errors**). Feeds CQRS read-models; no `docs/specs/*` covers persistence (tracked by this story).
 
-### N3 · Distributed Pub-Sub / Topic — `TODO`
+### N3 · Distributed Pub-Sub / Topic — `DONE`
 **Deps:** B5. (High value, small surface.)
 New `pekko-clj.cluster.pubsub` over `DistributedPubSub(system).mediator`
 (`pekko-cluster-tools` already on classpath): `subscribe`/`unsubscribe`/`publish`/`send`/
 `send-to-all`; reuse `defactor` for subscribers.
+- **Done (2026-07-14):** new `pekko-clj.cluster.pubsub` wraps the `DistributedPubSubMediator`.
+  `mediator` returns the extension's mediator ref; topic pub-sub via `subscribe`/`unsubscribe`/
+  `publish` (with grouped subscriptions + `:one-per-group` consumer-group publish); path-based
+  point-to-point via `put`/`remove`/`send` (`local-affinity`) and broadcast via `send-to-all`
+  (`all-but-self`). `subscribe` is polymorphic on its final arg: an `ActorRef` is subscribed
+  directly (receives raw messages + a `SubscribeAck`), a **function** spawns an internal
+  `defactor` `topic-subscriber` that self-subscribes and calls the handler per message (acks
+  swallowed) — the "reuse `defactor` for subscribers" ask. `subscribe-ack?`/`unsubscribe-ack?`
+  predicates let users match acks on their own actors. Every op takes an ActorSystem **or** a
+  cached mediator `ActorRef` as its first arg (usable inside actor handlers). `send`/`remove`
+  excluded from `clojure.core`.
+- **Tests (`cluster/pubsub_test.clj`):** 8 tests on a single-node cluster — mediator identity,
+  topic publish→subscribe delivery, fan-out to multiple subscribers, direct-`ActorRef`
+  subscription, unsubscribe stops delivery, grouped + one-per-group publish, and `put`+`send` /
+  `send-to-all` point-to-point routing (async registration handled with `eventually`-retry).
+  Full suite green (327 tests / 595 assertions / 0 failures / 0 errors). Unblocks **N8**
+  (Distributed Data also needs N3). No `docs/specs/*` checklist covers pub-sub (module has no
+  spec — tracked entirely by this story).
 
-### N4 · Clojure-data serializer (Transit) + bindings helper — `TODO`
+### N4 · Clojure-data serializer (Transit) + bindings helper — `DONE`
 **Deps:** B5.
 `com.cognitect/transit-clj` is declared but **unused** — the intended feature. Implement a
 `SerializerWithStringManifest` (Java class under `src/main/java/pekko_clj/actor/` or
 `gen-class`) backed by Transit + a config helper for `serializers`/`serialization-bindings`/
 `serialization-identifiers`. Wire into `create-system` (B5) and flip `allow-java-serialization`
 off once bound.
+- **Done (2026-07-21):** Java `CljTransitSerializer extends SerializerWithStringManifest`
+  (`(ExtendedActorSystem)` constructor, so Pekko can instantiate it) is a thin bridge: it reads
+  its identifier from `pekko.actor.serialization-identifiers."pekko_clj.actor.CljTransitSerializer"`
+  (default 9001) and the Transit format from `pekko-clj.serialization.transit.format` (default
+  json), then calls `write-bytes`/`read-bytes` in the new **`pekko-clj.serialization`** ns. The
+  manifest is the constant `"clj"` — Transit is self-describing, so no class name is needed.
+  `gen-class` was rejected: it needs AOT, and the suite runs without it.
+- **`pekko-clj.serialization`:** `write-bytes`/`read-bytes` (arities `[obj]`, `[obj system]`,
+  `[obj system format]`; `:json`/`:json-verbose`/`:msgpack`, validated) usable standalone, e.g.
+  for writing Clojure data to an external store. **ActorRefs embedded anywhere in a message
+  round-trip**: a write handler renders them with `path.toSerializationFormatWithAddress(provider
+  .getDefaultAddress())` under the `"pekko/ref"` tag and a read handler resolves them via
+  `provider.resolveActorRef` (Transit's handler lookup walks superclasses, so registering the
+  abstract `ActorRef` covers `LocalActorRef`/`RepointableActorRef`). Handler maps are built once
+  per system and cached in a **weak**-keyed map so terminated systems stay collectable — which
+  only works because the handlers reach the system through a `WeakReference`; capturing it
+  directly made the cached value pin its own key (fixed in the epic's review pass).
+  Config helpers: `serialization-config` (generic `serializers`/`serialization-bindings`/
+  `serialization-identifiers`/`allow-java-serialization` builder) and `transit-config` on top of
+  it (`:alias`/`:identifier`/`:format`/`:bindings`/`:extra-bindings`/`:allow-java-serialization`),
+  binding `IPersistentCollection` (maps/vectors/lists/sets/seqs), `Keyword`, `Symbol`, `Ratio`,
+  `BigInt` by default and **turning Java serialization off** (opt back in with
+  `:allow-java-serialization true`).
+- **Wired into `create-system`** as `:transit-serialization` (`true` or a `transit-config` opts
+  map). Precedence is now `:extra-config` > `:split-brain-resolver` > `:transit-serialization` >
+  generated defaults, so it overrides the generated `allow-java-serialization = on`.
+- **Tests (`serialization_test.clj`, 15):** data round trip incl. keyword/symbol/set/ratio/bigint
+  identity, all three formats + msgpack≠json bytes, unknown-format throws, ActorRef round trip,
+  `serialization-config`/`transit-config` config shapes (defaults, options, `:bindings` replacing
+  the defaults), the real Pekko path (`findSerializerFor` picks the serializer for Clojure data
+  but not for Strings, identifier + manifest, `Serialization.deserialize` round trip in json and
+  msgpack, a deserialized ref still delivers messages), `create-system` wiring + `:extra-config`
+  precedence, and an end-to-end actor exchange under `pekko.actor.serialize-messages = on` that
+  asserts the delivered payload is `=` but **not `identical?`** to the sent one — proof it really
+  went through `toBinary`/`fromBinary`. (A plain `serialize-messages` check is not enough on its
+  own: Pekko *skips* the verification round trip when the chosen serializer is
+  `DisabledJavaSerializer`, verified by disassembling `Dispatch.serializeAndDeserializePayload`.)
+  Full suite green before (408 tests / 752 assertions) and after (**423 tests / 811 assertions /
+  0 failures / 0 errors**); `lein check` reports 0 reflection warnings for the new namespace.
+- **Note:** no `docs/specs/*` file covers serialization (grep confirms), so nothing to tick;
+  documented in `README.md` (Features bullet + a `## Serialization` section). Records still need
+  a per-type Transit handler — documented in the ns docstring and README.
+- **Milestone N remaining:** N5 (sharding passivation), N7 (HTTP DSL), N8 (ddata, optional).
 
-### N5 · Sharding: passivation, remember-entities, daemon-process — `TODO`
+### N5 · Sharding: passivation, remember-entities, daemon-process — `DONE`
 **Deps:** B8.
 Idle passivation + active-limit strategies (LRU/SLRU/LFU/MRU via `passivation.*`) + manual
 stop-message hook (`Entity.withStopMessage`); confirm `passivate` (`sharding.clj:303`) drives
 a real flow. Surface `remember-entities` (`ddata`/`eventsourced` store) and
 `ShardedDaemonProcess.init`. Update `docs/specs/sharding-parity-spec.md`.
+- **Bug found + fixed (the F1 deprecation follow-up):** `start` called
+  `ClusterShardingSettings.withPassivateIdleEntityAfter`, which **does not exist in Pekko
+  1.6** (`javap` confirms; the call was reflective, so it compiled) — every `start` with
+  `:passivate-after` threw at runtime. No test covered it. It now routes through the current
+  passivation-strategy API.
+- **Done (2026-07-21):** `passivation-settings` builds a
+  `ClusterShardingSettings$PassivationStrategySettings` **programmatically** (1.6 exposes a
+  builder, so no HOCON generation as the spec assumed): `:strategy` `:idle` /
+  `:least-recently-used` / `:most-recently-used` / `:least-frequently-used` / `:none`, with
+  `:idle-timeout`/`:idle-interval` (ms or `java.time.Duration`), `:active-entity-limit`,
+  `:segmented` (SLRU: level count or proportions vector) and `:dynamic-aging` (LFU). Idle and
+  limit-based passivation compose in one map. New public `sharding-settings` builds the whole
+  `ClusterShardingSettings` from `start`'s opts, adding `:remember-entities-store`
+  (`:ddata`/`:eventsourced` — no `with…` setter exists, so it overrides the key in the system's
+  own `pekko.cluster.sharding` config section and rebuilds the settings from it),
+  `:journal-plugin-id`/`:snapshot-plugin-id`, and keeping `:role`/`:remember-entities`.
+  `start` gained `:stop-message` (hand-off stop for rebalance), which needs the
+  `start(…, allocationStrategy, handOffStopMessage)` overload — it passes
+  `defaultShardAllocationStrategy`. `passivate` gained a 1-arity using the current context
+  and its docstring now says how to actually stop (`(core/stop (core/self))`).
+- **Daemon process:** new `pekko-clj.cluster.daemon` (`start`, `settings`).
+  `ShardedDaemonProcess` is **typed-only**, so this is the epic's sanctioned narrow typed
+  shim: Java `CljDaemonProcess.wrap(Props)` returns a typed `Behavior` that spawns the classic
+  `defactor` actor as its child, forwards every message (incl. the stop message) to it, and
+  stops itself when the child terminates so Pekko restarts the instance. Each worker's `init`
+  receives its index (0…n-1). Adds `pekko-cluster-sharding-typed_3` 1.6.0 (pulls
+  actor-typed/cluster-typed/slf4j); nothing user-facing becomes typed.
+- **Test-config fixes:** `cluster-test.conf` used the deprecated
+  `passivate-idle-entity-after = off` (the WARN F1 recorded) → now `passivation.strategy =
+  "none"`; and `distributed-data.durable.keys = []`, because remember-entities via ddata
+  writes through the **durable LMDB** replicator by default, which crashed the JVM
+  (`IllegalAccessError`, needs `--add-opens=java.base/sun.nio.ch=ALL-UNNAMED`).
+- **Tests:** `sharding_test.clj` +7 — strategy-settings shapes for idle (timeout/interval),
+  LRU + SLRU (levels and proportions), MRU, LFU dynamic-aging, disabled, unknown-strategy and
+  bad-`:segmented` throws; `sharding-settings` from opts (incl. the `:passivate-after`
+  regression, store mode, plugins, unknown store throw, pre-built settings object); and three
+  end-to-end runs — idle passivation stops an entity and the next message recreates it with
+  fresh state, manual `passivate` → stop-message → recreate, and a region started with
+  `:stop-message` + `:remember-entities` still routing. New `cluster/daemon_test.clj` (3):
+  settings, all `n` workers started with their index, stop-message variant. Full suite green
+  before (423 tests / 811 assertions) and after (**433 tests / 859 assertions / 0 failures /
+  0 errors**); no reflection warnings in the new namespace.
+- **Docs:** ticked `sharding-parity-spec.md` (advanced passivation, remember-entities store,
+  hand-off stop message, daemon process — all now ✅; external/custom allocation stay ❌),
+  corrected its stale pre-B8 message-flow diagram, and updated the README sharding section
+  (which still showed the removed `[:entity-message id msg]` pattern) + module table.
+- **Milestone N remaining:** N7 (HTTP DSL). N8 (Distributed Data) is optional for the DoD.
 
-### N6 · Split-Brain-Resolver + CoordinatedShutdown helpers — `TODO`
+### N6 · Split-Brain-Resolver + CoordinatedShutdown helpers — `DONE`
 **Deps:** B5.
 SBR config helper (`keep-majority`/`static-quorum`/`keep-oldest`/`down-all`/`lease-majority`,
 `stable-after`, `down-all-when-unstable`) layered on `create-system`. `CoordinatedShutdown`
 wrapper (`addTask`, `run`, `addJvmShutdownHook`) extending `prepare-for-shutdown`
 (`cluster.clj:358`).
+- **Done (2026-07-14):** both features added to `pekko-clj.cluster`.
+  **SBR:** `split-brain-resolver-config` builds a `Config` for any of the five strategies
+  (`:keep-majority`/`:static-quorum`/`:keep-oldest`/`:down-all`/`:lease-majority`) with
+  `:stable-after` (ms number or HOCON string), `:down-all-when-unstable` (true→on/false→off/
+  duration), `:role`, `:quorum-size`, `:down-if-alone`, and the `:lease-*` knobs — sets the
+  `downing-provider-class` too, so it is self-contained. Wired into `create-system` via a new
+  `:split-brain-resolver` map key (precedence: `:extra-config` > `:split-brain-resolver` >
+  generated defaults > reference.conf). **CoordinatedShutdown:** `coordinated-shutdown` (the
+  extension, works on any system), `shutdown-phases` / `shutdown-reasons` keyword→value maps,
+  `add-shutdown-task` (a 0-arg fn; a returned `CompletionStage` is awaited, else completes with
+  `Done`), `add-cancellable-shutdown-task` (returns a `Cancellable`), `add-jvm-shutdown-hook`,
+  and `run-coordinated-shutdown` (→ `CompletableFuture<Done>`; reason keyword/Reason/nil).
+- **Tests (`coordination_test.clj`, 16):** SBR config rendering for every strategy + duration/
+  on-off/role/quorum handling + unknown-strategy throw; `create-system` merges SBR into the live
+  system config and `:extra-config` wins over it; shutdown phase/reason maps; a task runs on
+  shutdown; a `CompletionStage`-returning task is awaited; a cancelled task does not run; bad
+  phase/reason throw; hook returns nil. Full suite green (343 tests / 631 assertions / 0
+  failures / 0 errors). Ticked SBR + coordinated-shutdown in `cluster-parity-spec.md`.
 
-### N7 · HTTP routing-DSL completion + marshalling + websockets — `TODO`
+### N7 · HTTP routing-DSL completion + marshalling + websockets — `DONE`
 **Deps:** B9.
 Finish the partial routing DSL (`http/routing.clj`): real param/header/body extraction
 (`with-request-body` is stubbed), `RejectionHandler`/`ExceptionHandler`, a thin `entity`↔
 EDN/JSON marshalling layer over Cheshire/Jsonista + existing `response`/`entity` builders.
 Websockets (`handleWebSocketMessages` over a streams `Flow`, reuses N1).
+- **Done (2026-07-21):** added `cheshire` 5.13.0 (`project.clj`, README module table,
+  `docs/specs/README.md`). New **`pekko-clj.http.marshalling`**: `->json`/`json->` (Cheshire,
+  keys keywordized by default, strings passed through so an encoded body is never
+  double-encoded), `->edn`/`edn->` (**`clojure.edn`** — no eval, tested against a `#=` payload),
+  `unmarshal` (dispatches on a ContentType/string/keyword; unknown types return the raw body)
+  and an `application/edn` `ContentType`.
+- **Bug found + fixed:** `response/json` rendered data with `pr-str`, i.e. it served **EDN under
+  an `application/json` content type** (`{:a 1}`). It now encodes real JSON; `response/edn` and
+  the `:edn` content type are new.
+- **Body extraction:** `with-request-body` was a stub — it built a `CompletionStage<Route>` and
+  passed it to `completeWithFuture`, so it only "worked" when the handler happened to return a
+  response. Rewritten on `extractStrictEntity`: the body is buffered and the handler gets a plain
+  **string** (timeout arity, default 5s). On top of it: `with-json-body`, `with-edn-body` and
+  `with-body` (parses by request Content-Type), each completing **400** on a malformed body
+  instead of throwing. Out: `complete-json` / `complete-edn`.
+- **Extraction:** `params` (all query params → keyword map), `form-field`, `form-field-opt`,
+  `form-fields` (form body → keyword map) — joining the existing `param`/`param-opt`/
+  `header-value`/`header-value-opt`.
+- **Failure handling:** `rejection-handler` (`:not-found` / `:all` / `:handle` class→fn map) and
+  `exception-handler` (class→fn map, or one fn for any Throwable — note it builds through
+  `japi.pf.FI$Apply`, not `java.util.function.Function`), applied with `handle-rejections` /
+  `handle-exceptions`.
+- **Websockets:** `websocket` (`handleWebSocketMessages`, plus a subprotocol arity),
+  `text-message`, `message->text` (nil for binary/streamed) and `text-flow`, which builds the
+  `Flow<Message,Message>` out of N1's stream ops (`flow-of`/`smap`/`sfilter`).
+- **Tests:** new `http/marshalling_test.clj` (9) — JSON/EDN round trips, the pr-str regression,
+  malformed-input throw, safe EDN read, content-type dispatch, and the `json`/`edn` entity
+  builders. `http/integration_test.clj` +9 driving a **real server**: JSON round trip (handler
+  sees keywordized data, response is JSON), malformed JSON → 400, EDN round trip (a set
+  survives), `with-request-body` string handling, query params, form fields, exception handler
+  (per-class → 400 vs fallback → 500), rejection handler (custom 404 + a 405 MethodRejection),
+  and a **websocket echo** over a real client (`singleWebSocketRequest`, asserts the 101 upgrade
+  and the uppercased reply). `http/routing_test.clj` +3 for the handler builders and ws helpers.
+  Full suite green before (433 tests / 859 assertions) and after (**454 tests / 913 assertions /
+  0 failures / 0 errors**).
+- **Note:** no `docs/specs/*` file covers HTTP (the roll-up table records it as spec-less), so
+  nothing to tick; documented instead in the `routing` ns docstring and a new README `## HTTP`
+  section. `routing.clj` keeps its pre-existing reflective interop style (H3 scoped
+  reflection-freedom to `core.clj`'s per-message path).
+- **Milestone N remaining:** only N8 (Distributed Data), which the epic marks optional — so the
+  epic's definition of done (B + H + N1–N7) is **met**.
 
-### N8 · Distributed Data (selective CRDTs) — `TODO`
+### N8 · Distributed Data (selective CRDTs) — `DONE`
 **Deps:** B5, N3. (Lower priority within N.)
 New `pekko-clj.cluster.ddata` over `DistributedData(system).replicator`: common CRDTs
 (`ORSet`, `LWWMap`, `PNCounter`) + four commands (`Update`/`Get`/`Subscribe`/`Delete`) with
 consistency levels. Keep it opinionated — not the whole CRDT zoo.
+- **Done (2026-07-21):** new `pekko-clj.cluster.ddata` (declares the
+  `pekko-distributed-data_3` dep explicitly — it was already a pekko-cluster transitive).
+  Extension access: `distributed-data`, `replicator` (ActorSystem **or** a cached replicator
+  ref), `self-address`. Keys: `or-set-key` / `lww-map-key` / `pn-counter-key` + `key-id` and
+  the `empty-*` constructors. Consistency: `write-consistency` / `read-consistency`
+  (`:local` default, `:majority`, `:all` with a timeout; unknown level throws).
+- **Commands** — `update!`, `get-data`, `delete!`, `subscribe`/`unsubscribe` — all return a
+  **`CompletableFuture` of a Clojure map** rather than Pekko response classes: `:status` is
+  `:success` / `:not-found` / `:timeout` / `:deleted` / `:failure` (a throwing modify fn
+  surfaces as `ModifyFailure` → `{:status :failure :error … :cause …}`). Values come back as
+  Clojure data via `crdt->clj` (ORSet → set, LWWMap → map, PNCounter → **long** when it fits,
+  else bigint — so `(= 5 (value …))` works), with the raw CRDT kept under `:data`.
+  `subscribe` mirrors N3's pub-sub shape: an `ActorRef` gets raw `Changed`/`Deleted` messages
+  (convert with `change->map`), a function gets `{:key :value :data :deleted?}` from an
+  internal `defactor` subscriber. Blocking `value` convenience for the common read.
+- **Opinionated per-type ops** (they fill in the empty value and the node address, so users
+  never touch `SelfUniqueAddress`): `add!` / `remove!` (ORSet), `put!` / `remove-key!`
+  (LWWMap), `increment!` / `decrement!` (PNCounter). `update!` stays as the escape hatch —
+  it takes `(fn [current] new-crdt)` and an `:initial`, wrapping it in `FnWrapper` for the
+  Scala `Function1` the `Replicator.Update` constructor wants.
+- **Tests (`cluster/ddata_test.clj`, 10 / 62 assertions):** keys and key-ids, every
+  consistency level + unknown-level throws, `crdt->clj` conversions, replicator/self-address
+  access and ref pass-through, ORSet add/remove with `:not-found` before first write, LWWMap
+  put/overwrite/remove, PNCounter increment/decrement reading back as plain numbers, generic
+  `update!` (incl. `:majority` on a single-node cluster and a throwing modify fn),
+  subscribe → change notifications → unsubscribe stops them, and delete making a key
+  permanently `:deleted` for both reads and writes. Full suite green before (454 tests /
+  913 assertions) and after (**464 tests / 975 assertions / 0 failures / 0 errors**);
+  `lein check` reports 0 reflection warnings for the new namespace.
+- **Docs:** no `docs/specs/*` file covers ddata, so nothing to tick; documented in the ns
+  docstring, a README `### Distributed Data (CRDTs)` subsection + module table row, and the
+  `docs/specs/README.md` dependency block. Replicated values cross nodes, so the ns notes
+  that elements need a serializer — N4's Transit one covers Clojure data.
+- **Milestone N is COMPLETE** — N1–N9 all `DONE`, so every story in the epic is finished.
 
-### N9 · Classic actor extras — `TODO`
+### N9 · Classic actor extras — `DONE`
 **Deps:** B1, B3, H5.
 `ReceiveTimeout` (`context.setReceiveTimeout`), `EventStream`/dead-letter subscription helpers
 (generalize the cluster-event subscriber `cluster.clj:302`), `UnboundedPriorityMailbox`
 helper, `CircuitBreaker` wrapper.
+- **Done (2026-07-14):** all four delivered.
+  **ReceiveTimeout** (in `core`): `set-receive-timeout` (java.time.Duration or ms; converts to the
+  Scala `Duration` the API wants), `cancel-receive-timeout` (→ `Duration.Undefined`), the
+  `receive-timeout` singleton value + `receive-timeout?` predicate. Also added `actor-props`
+  (the raw Pekko `Props` for a `defactor`) and `spawn-props` (spawn from a decorated `Props`) to
+  support mailbox/dispatcher setups. **EventStream** — new `pekko-clj.event-stream`:
+  `event-stream`, polymorphic `subscribe` (ActorRef or handler-fn, class-keyed) /`unsubscribe`/
+  `publish`, and `subscribe-dead-letters` / `subscribe-unhandled` conveniences with
+  `dead-letter->map` / `unhandled->map` (generalizes the cluster-event subscriber). **Priority
+  mailbox** — Java `CljPriorityMailbox` (a `(Settings, Config)`-instantiable
+  `UnboundedStablePriorityMailbox` that resolves a Clojure priority fn named in config), plus
+  `pekko-clj.mailbox` (`priority-mailbox-config` builds the mailbox `Config`; `with-mailbox`
+  attaches it to `Props`). **CircuitBreaker** — new `pekko-clj.circuit-breaker`:
+  `circuit-breaker`, sync `call` / async `call-async`, `succeed`/`fail`, `open?`/`closed?`,
+  `on-open`/`on-close`/`on-half-open`.
+- **Tests (4 new ns, 14 tests):** `receive_timeout_test` (fires when idle, accepts a Duration,
+  cancel silences it), `event_stream_test` (subscribe/publish, unsubscribe stops delivery,
+  dead-letters, unhandled-message + recipient), `mailbox_test` (config shape for var/symbol/
+  string forms; a gated actor proves higher-priority messages dequeue first), `circuit_breaker_test`
+  (success, opens after N failures → `CircuitBreakerOpenException`, async call, on-open listener,
+  manual fail). `core.clj` stays reflection-free; new namespaces have no reflection warnings. Full
+  suite green (357 tests / 663 assertions / 0 failures / 0 errors). No `docs/specs/*` covers these
+  modules (core/event-stream/mailbox/circuit-breaker) — tracked entirely by this story.
+- **Milestone N remaining (at time of N9):** N1, N2 (needs N1), N4, N5, N7, N8. N3/N6/N9 `DONE`.
+  N1 has since landed, which unblocks N2.
 
 ---
 
@@ -597,9 +909,9 @@ into the stories above):
 
 | Module | Parity | Remaining gaps | Story |
 |--------|--------|----------------|-------|
-| Cluster (`cluster-parity-spec.md`) | ~95% | Multi-DC (§6) | backlog; SBR/coord-shutdown → N6 |
+| Cluster (`cluster-parity-spec.md`) | ~97% | Multi-DC (§6) | backlog (SBR/coord-shutdown done in N6) |
 | Routing (`routing-parity-spec.md`) | ~95% | `prefer-local-routees` | backlog |
-| Sharding (`sharding-parity-spec.md`) | ~85% | advanced passivation, external/custom allocation, remember-entities-store | N5 (+ backlog for external/custom) |
+| Sharding (`sharding-parity-spec.md`) | ~95% | external/custom shard allocation | backlog (passivation/remember-entities-store/daemon-process done in N5) |
 | Singleton (`singleton-parity-spec.md`) | ~95% | lease integration | backlog |
 | Core / Persistence / Stream / HTTP / Serialization | — (no spec yet) | see B/N stories | this epic |
 

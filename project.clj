@@ -6,13 +6,21 @@
   :dependencies [[org.clojure/clojure "1.11.1"]
                  [org.clojure/core.match "1.1.0"]
                  [com.cognitect/transit-clj "1.0.333"]
+                 ;; JSON marshalling for pekko-clj.http
+                 [cheshire "5.13.0"]
                  [org.apache.pekko/pekko-actor_3 "1.6.0"]
                  [org.apache.pekko/pekko-stream_3 "1.6.0"]
                  [org.apache.pekko/pekko-persistence_3 "1.6.0"]
+                 [org.apache.pekko/pekko-persistence-query_3 "1.6.0"]
                  ;; Clustering
                  [org.apache.pekko/pekko-cluster_3 "1.6.0"]
                  [org.apache.pekko/pekko-cluster-sharding_3 "1.6.0"]
                  [org.apache.pekko/pekko-cluster-tools_3 "1.6.0"]
+                 ;; CRDTs (pekko-clj.cluster.ddata) — also a pekko-cluster transitive
+                 [org.apache.pekko/pekko-distributed-data_3 "1.6.0"]
+                 ;; Typed sharding — only for ShardedDaemonProcess, which has no
+                 ;; classic API (see pekko-clj.cluster.daemon)
+                 [org.apache.pekko/pekko-cluster-sharding-typed_3 "1.6.0"]
                  ;; HTTP
                  [org.apache.pekko/pekko-http_3 "1.3.0"]
                  ;; TestKit — powers the pekko-clj.test companion namespace

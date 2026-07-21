@@ -14,6 +14,9 @@ pekko-clj provides a declarative `defactor` macro with implicit state binding, `
 - **Cluster Sharding** - Distribute actors across cluster nodes
 - **Cluster Singletons** - Exactly-one actor instances with supervision
 - **Routers** - Pool and group routers with multiple strategies
+- **Distributed Data** - Replicated CRDTs (set, map, counter) with consistency levels
+- **Clojure-Data Serialization** - Transit serializer for messages, events and remoting
+- **HTTP** - Routing DSL with JSON/EDN marshalling, rejection/exception handling, websockets
 
 ## Quick Start
 
@@ -75,10 +78,13 @@ pekko-clj includes these Apache Pekko modules:
 | `pekko-actor_3` | 1.6.0 | Core actor system |
 | `pekko-stream_3` | 1.6.0 | Reactive streams |
 | `pekko-persistence_3` | 1.6.0 | Event sourcing |
+| `pekko-persistence-query_3` | 1.6.0 | Read-side event queries (`pekko-clj.persistence.query`) |
 | `pekko-cluster_3` | 1.6.0 | Clustering |
 | `pekko-cluster-sharding_3` | 1.6.0 | Cluster sharding |
 | `pekko-cluster-tools_3` | 1.6.0 | Singletons, pub-sub |
-| `pekko-http_3` | 1.3.0 | HTTP server/client |
+| `pekko-distributed-data_3` | 1.6.0 | CRDTs (`pekko-clj.cluster.ddata`) |
+| `pekko-cluster-sharding-typed_3` | 1.6.0 | ShardedDaemonProcess (`pekko-clj.cluster.daemon`) |
+| `pekko-http_3` | 1.3.0 | HTTP server/client, websockets |
 | `pekko-testkit_3` | 1.6.0 | `pekko-clj.test` companion |
 | `pekko-stream-testkit_3` | 1.6.0 | Stream test probes |
 
@@ -272,6 +278,57 @@ Create cluster-enabled actor systems:
 (cluster/state-snapshot sys)  ;; Full state as map
 ```
 
+### Distributed Data (CRDTs)
+
+Replicated, conflict-free state — a set, a map and a counter — that every node can
+write without coordination:
+
+```clojure
+(require '[pekko-clj.cluster.ddata :as ddata])
+
+(def online (ddata/or-set-key "online-users"))
+
+(ddata/add! sys online "ada")            ;; => CompletableFuture of {:status :success …}
+(ddata/value sys online)                 ;; => #{"ada"}
+
+(ddata/increment! sys (ddata/pn-counter-key "hits") 1)
+(ddata/put! sys (ddata/lww-map-key "config") "level" "debug")
+
+;; React to changes made anywhere in the cluster
+(ddata/subscribe sys online (fn [{:keys [value]}] (println "online:" value)))
+```
+
+Reads and writes default to `:local`; pass `{:consistency :majority}` (or `:all`)
+where a command must reach other nodes first.
+
+## Serialization
+
+Pekko cannot serialize Clojure data on its own, so remoting, sharding and persistence
+would fall back to Java serialization. `pekko-clj.serialization` provides a Transit
+serializer instead:
+
+```clojure
+(ns my-app.serialization
+  (:require [pekko-clj.cluster :as cluster]
+            [pekko-clj.serialization :as ser]))
+
+;; Turn it on for a cluster system (also turns Java serialization off)
+(def sys (cluster/create-system "my-app"
+           {:port 7355
+            :transit-serialization true}))          ;; or {:format :msgpack ...}
+
+;; Or build the Config yourself and merge it into any system
+(ser/transit-config {:format :msgpack
+                     :extra-bindings ["my.app.SomeIface"]})
+
+;; Direct use, e.g. writing Clojure data to an external store
+(ser/read-bytes (ser/write-bytes {:a [1 2 #{:x}]}))  ;; => {:a [1 2 #{:x}]}
+```
+
+Maps, vectors, lists, sets, keywords, symbols, ratios and big integers are bound to the
+serializer by default, and `ActorRef`s embedded in a message survive the round trip.
+Records need a Transit handler, so prefer plain maps in messages and persisted events.
+
 ## Cluster Sharding
 
 Distribute actors across the cluster:
@@ -280,17 +337,21 @@ Distribute actors across the cluster:
 (ns my-app.sharding
   (:require [pekko-clj.cluster.sharding :as sharding]))
 
+;; Entities match the raw message they are sent and read their own id with
+;; (sharding/entity-id).
 (defactor order-entity
-  (init [args] {:order-id (:entity-id args) :items []})
+  (init [_] {:items []})
 
-  (handle [:entity-message id msg]
-    (case (first msg)
-      :add-item (update state :items conj (second msg))
-      :get-items (do (reply (:items state)) state))))
+  (handle [:add-item item] (update state :items conj item))
+  (handle [:get-items] (reply {:order-id (sharding/entity-id) :items (:items state)})))
 
 ;; Start sharding region
 (def region (sharding/start sys order-entity
-              {:type-name "Order" :num-shards 100}))
+              {:type-name "Order"
+               :num-shards 100
+               ;; Passivate idle entities, or cap how many stay active per region:
+               ;; {:strategy :least-recently-used :active-entity-limit 10000}
+               :passivation {:strategy :idle :idle-timeout 300000}}))
 
 ;; Send messages to entities
 (sharding/tell region "order-123" [:add-item {:sku "ABC"}])
@@ -298,6 +359,20 @@ Distribute actors across the cluster:
 ;; Or use EntityRef for cleaner API
 (def order (sharding/entity-ref sys "Order" "order-123"))
 (sharding/tell-entity order [:add-item {:sku "XYZ"}])
+```
+
+For always-on workers that are not addressed by entity id (queue consumers,
+projections, periodic jobs), use the Sharded Daemon Process — Pekko keeps exactly
+`n` instances running and moves them when the cluster changes:
+
+```clojure
+(require '[pekko-clj.cluster.daemon :as daemon])
+
+(defactor partition-worker
+  (init [i] {:partition i})            ;; init receives the index 0 … n-1
+  (handle [:poll] (consume! (:partition state)) state))
+
+(daemon/start sys "partition-workers" 4 partition-worker)
 ```
 
 ## Cluster Singletons
@@ -367,6 +442,42 @@ Distribute messages across actor pools:
                      :max-instances-per-node 2
                      :allow-local-routees true}))
 ```
+
+## HTTP
+
+A routing DSL over Pekko HTTP, with JSON/EDN marshalling, failure handling and
+websockets:
+
+```clojure
+(ns my-app.http
+  (:require [pekko-clj.http.core :as http]
+            [pekko-clj.http.routing :as r]
+            [pekko-clj.http.response :as resp]))
+
+(def app
+  (r/handle-exceptions
+    (r/exception-handler {Throwable (fn [e] (r/complete :internal-server-error (.getMessage e)))})
+    (r/handle-rejections
+      (r/rejection-handler {:not-found (r/complete-json :not-found {:error "not found"})})
+      (r/routes
+        (r/path "users"
+          (r/routes
+            ;; Query params as a Clojure map
+            (r/method-get (r/path-end (r/params (fn [{:keys [page]}] (r/complete-json (list-users page))))))
+            ;; JSON in, JSON out (a malformed body completes 400)
+            (r/method-post (r/path-end (r/with-json-body #(r/complete-json :created (create-user! %)))))))
+        ;; Websockets over a stream Flow
+        (r/path "echo" (r/websocket (r/text-flow clojure.string/upper-case)))))))
+
+;; Bind it
+(def binding (http/bind-server sys "0.0.0.0" 8080 app))
+```
+
+Body helpers: `with-request-body` (string), `with-json-body`, `with-edn-body`,
+`with-body` (parsed by Content-Type). Response helpers: `complete-json`,
+`complete-edn`, and the `pekko-clj.http.response` builders (`ok`, `created`,
+`not-found`, `redirect`, …). Encoding/decoding lives in
+`pekko-clj.http.marshalling` (Cheshire for JSON, `clojure.edn` for EDN).
 
 ## Design Principles
 
