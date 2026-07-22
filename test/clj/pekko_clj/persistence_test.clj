@@ -83,7 +83,7 @@
   (init [_] {:items []})
 
   (command [:add-two a b]
-    (p/persist [[:added a] [:added b]]))
+    (p/persist-all [[:added a] [:added b]]))
 
   (command :get
     (.reply this (:items state))
@@ -91,6 +91,24 @@
 
   (event [:added item]
     (update state :items conj item)))
+
+;; Regression: a single event whose value is itself a vector-of-vectors must be
+;; stored as ONE event (the old shape-inspection heuristic would have split it).
+(p/defactor-persistent vector-event-actor
+  :persistence-id (fn [args] (str "vecev-" (:id args)))
+
+  (init [_] {:events []})
+
+  (command [:record pairs]
+    ;; `pairs` is e.g. [[1 2] [3 4]] — one event, not two.
+    (p/persist [:recorded pairs]))
+
+  (command :get
+    (.reply this (:events state))
+    nil)
+
+  (event [:recorded pairs]
+    (update state :events conj pairs)))
 
 (def recovery-completed (atom false))
 
@@ -261,6 +279,27 @@
       (is (eventually (= [:a :b :c :d] (core/<! actor :get 3000))))
       (finally
         (terminate-system sys)))))
+
+(deftest persistent-actor-single-vector-of-vectors-event
+  ;; A single event that is a vector whose first element is itself a vector must
+  ;; be persisted as ONE event, and survive recovery intact — proving persist no
+  ;; longer splits by shape (only persist-all persists multiple events).
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys vector-event-actor {:id id})]
+          (core/! actor [:record [[1 2] [3 4]]])
+          ;; One event recorded, held whole (not split into [1 2] and [3 4]).
+          (is (eventually (= [[[1 2] [3 4]]] (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))
+    ;; Recover: the single compound event replays unchanged.
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys vector-event-actor {:id id})]
+          (is (eventually (= [[[1 2] [3 4]]] (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))))
 
 (deftest persistent-actor-multiple-events-recovery
   (let [id (unique-id)]

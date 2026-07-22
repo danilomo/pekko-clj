@@ -10,9 +10,7 @@ import clojure.lang.RT;
 import clojure.lang.IDeref;
 import clojure.lang.IFn;
 import clojure.lang.Keyword;
-import clojure.lang.PersistentVector;
 import clojure.lang.ILookup;
-import clojure.lang.Seqable;
 import clojure.lang.ISeq;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -126,33 +124,25 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
       .match(DeleteSnapshotsSuccess.class, msg -> {})
       .match(DeleteMessagesSuccess.class, msg -> {})
       .matchAny(command -> {
-        // Call command handler: (fn [this command] ...) -> event or [events...] or nil
+        // Call command handler: (fn [this command] ...) -> event, (persist-all ...)
+        // marker, or nil. No shape inspection: a returned value is a single event
+        // whatever its shape unless it is an explicit PersistAll marker, which
+        // removes the "vector of vectors" ambiguity of the old heuristic.
         Object result = commandHandler.invoke(this, command);
 
         if (result == null) {
-          // No event to persist
+          // No event to persist.
           return;
         }
 
-        // Check if result is a vector of events or a single event
-        if (result instanceof PersistentVector) {
-          PersistentVector events = (PersistentVector) result;
-          if (events.count() == 0) {
-            return;
-          }
-
-          // Check if first element is itself a vector (multiple events)
-          Object first = events.nth(0);
-          if (first instanceof PersistentVector) {
-            // Multiple events - persist all sequentially
-            ISeq seq = ((Seqable) events).seq();
-            persistAllEvents(seq);
-          } else {
-            // Single event as vector
-            persistEvent(result);
+        if (result instanceof PersistAll) {
+          // Multiple events (from persist-all) - persist sequentially, in order.
+          ISeq events = ((PersistAll) result).events;
+          if (events != null) {
+            persistAllEvents(events);
           }
         } else {
-          // Single non-vector event
+          // Any other value is a single event, whatever its shape.
           persistEvent(result);
         }
       })

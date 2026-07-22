@@ -365,16 +365,24 @@
 (defn members-by-age
   "Get cluster members sorted by age (oldest first).
 
-   This is useful for singleton-like patterns where the oldest
-   node should take responsibility. Members are sorted by their
-   upNumber (join order), with the oldest member having the lowest number.
+   Useful for singleton-like patterns where the oldest node should take
+   responsibility. Uses Pekko's own age ordering (`Member.isOlderThan`): by
+   upNumber, with the node address as the tiebreaker when two members share an
+   upNumber — the same ordering the oldest-based cluster singleton uses. This is
+   more precise than sorting on upNumber alone (which leaves ties unordered).
 
-   Returns a sequence of member maps."
+   Returns a sequence of member maps.
+
+   Note: single data center only — Pekko's age ordering is undefined across data
+   centers (multi-DC is not supported; see the parity backlog)."
   [system]
   (let [state (.state (cluster system))
         members (seq (.getMembers state))]
     (->> members
-         (sort-by #(.upNumber ^Member %))
+         (sort (fn [^Member a ^Member b]
+                 (cond (.isOlderThan a b) -1
+                       (.isOlderThan b a) 1
+                       :else 0)))
          (map member->map))))
 
 (defn state-snapshot

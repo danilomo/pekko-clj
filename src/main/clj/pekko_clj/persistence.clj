@@ -33,7 +33,7 @@
   (:require [clojure.core.match :refer [match]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.persistence SnapshotSelectionCriteria]
-           [pekko_clj.actor CljPersistentActor]))
+           [pekko_clj.actor CljPersistentActor PersistAll]))
 
 (def ^:dynamic *current-persistent-actor*
   "Bound to the current CljPersistentActor during command handling.
@@ -137,7 +137,8 @@
    reserved anaphors:
    - @this / state   - Current state
    - (reply msg)     - Reply to sender
-   - (persist event) - Return event(s) to persist
+   - (persist event) - Return a single event to persist
+   - (persist-all events) - Return several events to persist, in order
    Do not shadow `this`/`state` in a command pattern — that throws at
    macro-expansion.
 
@@ -265,14 +266,25 @@
 ;; ---------------------------------------------------------------------------
 
 (defn persist
-  "Return an event (or events) to be persisted.
-   Use this in command handlers.
+  "Return a single event to be persisted. Use this in a command handler; the event
+   may be any shape (keyword, vector, map, …) and is stored as one event. For more
+   than one event from a single command, use `persist-all`.
 
-   Examples:
-     (persist [:item-added item])
-     (persist [[:item-added item] [:inventory-updated]])  ; multiple events"
-  [event-or-events]
-  event-or-events)
+   Example:
+     (persist [:item-added item])"
+  [event]
+  event)
+
+(defn persist-all
+  "Return several events to be persisted, in order, from a single command. Takes a
+   collection of events and wraps it in a marker the persistent actor recognizes,
+   so it is unambiguous which vectors are separate events. (A plain collection
+   returned from `persist` is always a single event, whatever its shape.)
+
+   Example:
+     (persist-all [[:item-added item] [:inventory-updated]])"
+  [events]
+  (PersistAll/of events))
 
 (defn reply
   "Reply to the sender of the current command. Call inside a command handler,

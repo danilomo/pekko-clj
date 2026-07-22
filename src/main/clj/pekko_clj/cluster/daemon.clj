@@ -12,6 +12,11 @@
    classic `defactor` actor as its child, forwards messages to it, and stops when it
    stops. This is the only typed shim in pekko-clj; everything you write stays classic.
 
+   Daemon workers are fire-and-forget: forwarded messages carry no sender, so inside
+   a worker `(core/sender)` is dead-letters and it cannot reply to an ask. (Routing
+   replies back through the wrapper would loop, since the wrapper forwards every
+   message to the child.) Have workers pull or push work, not answer requests.
+
    Example:
      (core/defactor partition-worker
        ;; init receives the worker's index: 0, 1, ... n-1

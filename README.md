@@ -236,6 +236,12 @@ Define persistent actors that store events and rebuild state:
   (snapshot-every 100))
 ```
 
+A command persists one event with `(persist event)` — the event may be any shape
+(keyword, vector, map). To emit several events from one command, use
+`(persist-all [event1 event2 …])`; a plain collection returned from `persist` is
+always a single event, so there is no ambiguity between "one compound event" and
+"several events".
+
 ## Reactive Streams
 
 Build reactive stream pipelines with backpressure:
