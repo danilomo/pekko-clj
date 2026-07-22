@@ -43,7 +43,7 @@ commit `7e59e55`.
 | B13 | Snapshot cadence survives recovery | Bugs | DONE | — | low |
 | B14 | Make the sharding envelope Transit-serializable | Bugs | DONE | — | medium |
 | B15 | `defactor-persistent` unmatched commands → `unhandled()` | Bugs | DONE | — | low |
-| B16 | Preserve the stash across restarts | Bugs | TODO | — | medium |
+| B16 | Preserve the stash across restarts | Bugs | DONE | — | medium |
 | B17 | Singleton `termination-message` default is a silent no-op | Bugs | DONE | — | low |
 | B18 | `spawn-pool-with-resizer` `:pressure-threshold` mismatch | Bugs | DONE | — | trivial |
 | H7 | Throw on unknown keywords (kill the silent fallbacks) | Hardening | TODO | — | low |
@@ -69,7 +69,7 @@ commit `7e59e55`.
 
 ---
 
-## Milestone B — Correctness bugs
+## Milestone B — Correctness bugs — **complete** (all eight `DONE`, 2026-07-22)
 
 ### B11 · Fix HTTP route macros: static paths never match — `DONE`
 **Note (2026-07-22):** fixed as scoped — the five macros now compile the pattern
@@ -245,7 +245,24 @@ mirroring `CljActor`'s) unless the user supplied their own catch-all (reuse/port
 **Tests:** unmatched command → actor survives, `UnhandledMessage` observed
 (`event-stream/subscribe-unhandled`); user catch-all still wins.
 
-### B16 · Preserve the stash across restarts — `TODO`
+### B16 · Preserve the stash across restarts — `DONE`
+**Note (2026-07-22):** fixed as scoped — both lifecycle hooks now route the
+stash through one private `drainStashToSelf()` (which `unstashAll` also uses, so
+there is a single re-enqueue path): `preRestart` drains it *after* the
+`:pre-restart` hook (so a hook that deliberately calls `clear-stash` still wins)
+and before `super.preRestart`, putting the messages back in the mailbox a
+restart keeps; `postStop` drains whatever is left to a self that is already
+stopped, which routes it to dead letters. Because preRestart drains first,
+postStop finds an empty stash on the restart path — the messages are re-enqueued
+once, not dead-lettered as well. Ordering is unchanged from the existing
+"unstash appends to tail" contract, now documented for the restart case in
+`core/stash`'s docstring and `CljActor.stash`'s javadoc. Tests:
+`stash-survives-restart` (two stashed messages, `:restart` supervision, fresh
+instance re-stashes then processes both in order) and
+`stash-becomes-dead-letters-on-stop` (poison-pill with a non-empty stash →
+both messages observed via `event-stream/subscribe-dead-letters`, in stash
+order); both verified failing without the fix, with the six existing stash tests
+still green. No `docs/specs/*` or `doc/` guide covers stash.
 **Deps:** none.
 `CljActor`'s stash is a private `LinkedList` on the instance
 (`CljActor.java:42, 289-337`). On a supervised restart the fresh instance starts with

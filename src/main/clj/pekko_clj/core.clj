@@ -489,7 +489,13 @@
 (defn stash
   "Stash the current message for later processing.
    Use this to defer handling of messages until the actor is ready.
-   Returns nil (doesn't affect state)."
+   Returns nil (doesn't affect state).
+
+   Lifecycle: stashed messages survive a supervised restart — they are put back
+   in the mailbox before the old instance is discarded, so the fresh instance
+   receives them (at the tail, see `unstash-all`'s ordering note). When the actor
+   stops for good, whatever is still stashed becomes dead letters, visible via
+   `pekko-clj.event-stream/subscribe-dead-letters`."
   []
   (.stash *current-actor*)
   nil)

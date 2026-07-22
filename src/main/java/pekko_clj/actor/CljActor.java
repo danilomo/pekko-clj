@@ -157,6 +157,11 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
     if (postStop != null) {
       postStop.invoke(this);
     }
+    // Anything still stashed when the actor stops for good has nowhere to go.
+    // Re-sending it to a stopped self routes it to dead letters, so the loss is
+    // observable on the event stream instead of silent. On a *restart* this
+    // finds an empty stash: preRestart drained it back into the mailbox first.
+    drainStashToSelf();
   }
 
   @Override
@@ -170,7 +175,29 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
     if (preRestart != null) {
       preRestart.invoke(this, reason);
     }
+    // Hand the stash to the new instance. Pekko's Stash contract is that a
+    // restart does not swallow stashed messages: they go back to the mailbox,
+    // which a restart keeps. Without this the fresh instance started with an
+    // empty stash and the messages vanished silently. Draining after the
+    // :pre-restart hook lets that hook drop them deliberately (clear-stash).
+    drainStashToSelf();
     super.preRestart(reason, message);
+  }
+
+  /**
+   * Re-send every stashed message to {@code self} with its original sender, in
+   * stash order, emptying the stash.
+   *
+   * <p>From {@link #preRestart} the messages land in the mailbox the restart
+   * keeps, so the fresh instance receives them (at the tail — see
+   * {@link #unstashAll()} for the ordering note). From {@link #postStop} self is
+   * already stopped, so they become dead letters.
+   */
+  private void drainStashToSelf() {
+    while (!stash.isEmpty()) {
+      StashedMessage msg = stash.removeFirst();
+      getSelf().tell(msg.message, msg.sender);
+    }
   }
 
   @Override
@@ -285,6 +312,10 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   /**
    * Stash the current message for later processing.
    * Call this during message handling to defer processing.
+   *
+   * <p>Stashed messages outlive a supervised restart: {@link #preRestart} puts
+   * them back in the mailbox for the fresh instance. When the actor stops for
+   * good they become dead letters (see {@link #postStop}).
    */
   public void stash() {
     if (currentMessage == null) {
@@ -304,11 +335,7 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
    * between and their relative ordering matters.
    */
   public void unstashAll() {
-    // Send messages in FIFO order
-    while (!stash.isEmpty()) {
-      StashedMessage msg = stash.removeFirst();
-      getSelf().tell(msg.message, msg.sender);
-    }
+    drainStashToSelf();
   }
 
   /**

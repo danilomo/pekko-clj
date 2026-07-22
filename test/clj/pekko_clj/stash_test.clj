@@ -1,6 +1,8 @@
 (ns pekko-clj.stash-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
+            [pekko-clj.event-stream :as es]
+            [pekko-clj.supervision :as sup]
             [pekko-clj.test-support :refer [eventually]])
   (:import [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -259,3 +261,75 @@
       ;; Ready - unstash
       (core/! actor :ready)
       (is (eventually (= [:a :b :c] (await-ask actor :get-processed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Stash lifecycle (B16)
+;; ---------------------------------------------------------------------------
+
+(deftest stash-survives-restart
+  ;; The stash lived on the actor *instance*, so a supervised restart — which
+  ;; builds a fresh instance — dropped every stashed message silently. Pekko's
+  ;; Stash contract is the opposite: preRestart hands them back to the mailbox,
+  ;; which the restart keeps, so the new instance still gets them.
+  (let [processed (atom [])
+        instances (atom 0)]
+    (core/defactor restarting-stasher
+      (init [_]
+        (swap! instances inc)
+        {:ready false})
+      (handle :ready
+        (core/unstash-all)
+        {:ready true})
+      (handle :boom
+        (throw (RuntimeException. "boom")))
+      (handle :get-processed
+        (core/reply @processed))
+      (handle msg
+        (if (:ready state)
+          (do (swap! processed conj msg) state)
+          (do (core/stash) state))))
+
+    (core/defactor restarting-parent
+      (supervision (sup/one-for-one {:max-retries 5} (fn [_] :restart)))
+      (init [_] nil)
+      (handle :spawn
+        (core/reply (core/spawn restarting-stasher nil))))
+
+    (let [parent (core/spawn *system* restarting-parent nil)
+          child (await-ask parent :spawn)]
+      (core/! child :a)
+      (core/! child :b)
+      ;; FIFO: both are stashed by the time this ask is answered.
+      (is (= [] (await-ask child :get-processed)))
+      (core/! child :boom)
+      (is (eventually (= 2 @instances)) "the child restarted")
+      ;; :a and :b are back in the mailbox; the fresh instance is not ready yet,
+      ;; so it stashes them again until :ready releases them — in order.
+      (core/! child :ready)
+      (is (eventually (= [:a :b] (await-ask child :get-processed)))
+          "the restart carried the stashed messages over"))))
+
+(deftest stash-becomes-dead-letters-on-stop
+  ;; Messages still stashed when the actor stops for good have nowhere to go.
+  ;; They used to disappear with the instance; now they are dead letters, so the
+  ;; loss shows up on the event stream.
+  (let [dead (atom [])]
+    (es/subscribe-dead-letters *system*
+                               (fn [{:keys [message]}]
+                                 (when (#{:x :y} message)
+                                   (swap! dead conj message))))
+    (core/defactor stopping-stasher
+      (init [_] nil)
+      (handle :ping
+        (core/reply :pong))
+      (handle _msg
+        (core/stash)
+        state))
+
+    (let [actor (core/spawn *system* stopping-stasher nil)]
+      (core/! actor :x)
+      (core/! actor :y)
+      (is (= :pong (await-ask actor :ping)) "both messages are stashed by now")
+      (core/poison-pill actor)
+      (is (eventually (= [:x :y] @dead))
+          "the stash was dead-lettered, in stash order"))))
