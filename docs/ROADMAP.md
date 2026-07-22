@@ -69,6 +69,19 @@ Everything is classic Pekko bridged via the Java classes in `src/main/java/pekko
 `DONE`, including the optional N8/N9. `lein test`: 466 tests / 981 assertions / 0 failures /
 0 errors. Remaining work lives in the Backlog section below.
 
+**Post-epic review pass (2026-07-22)** — a review hackathon over the finished epic found and
+fixed a few residual issues (`lein test` now 469 tests / 988 assertions / 0 failures / 0 errors):
+- `defactor`'s `(on-restart …)` clause was parsed but never emitted, and `CljActor` read
+  `:pre-restart`/`:post-restart` props it never used → the clause was a silent no-op. Wired up:
+  `CljActor` overrides `preRestart`(the javadsl `Optional` overload; the `scala.Option` one is
+  deprecated in 1.6)/`postRestart`; the macro emits `:post-restart`; `state`-shadow guard added.
+- Persistence event-shape ambiguity removed: the old "vector-of-vectors ⇒ multiple events"
+  heuristic could split a single compound event. New `persist-all` + `pekko_clj.actor.PersistAll`
+  marker; `persist` now always means one event. Regression test added.
+- `cluster/members-by-age` now sorts with Pekko's own age ordering (`Member.isOlderThan`) rather
+  than `upNumber` alone; stash docstrings corrected (re-tell appends, not prepends); daemon
+  fire-and-forget (no sender) documented.
+
 **Definition of done for the epic:** all B + H stories `DONE`; N1–N7 `DONE` (N8/N9 optional);
 this file and `docs/specs/*` reflect reality; version pins consistent across
 `README.md`/`CLAUDE.md`/`docs/specs/README.md`; `lein test` green with no reflection warnings
