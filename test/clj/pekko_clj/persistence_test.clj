@@ -189,6 +189,50 @@
   (snapshot-every 2 1)
   (delete-events-on-snapshot))
 
+;; Stress actor: mixes single (persist) and multi-event (persist-all) commands
+;; and records every value in arrival order, so a recovered :log reveals any
+;; reordering, loss or duplication. Aggressive retention (snapshot every 5, keep
+;; 2, delete subsumed events) means recovery must lean on snapshots + a truncated
+;; journal — exactly the interaction to stress against persist-all's sequential,
+;; in-order persistence.
+(p/defactor-persistent stress-actor
+  :persistence-id (fn [args] (str "stress-" (:id args)))
+
+  (init [_] {:log [] :sum 0 :n 0})
+
+  (command [:batch values]
+    (p/persist-all (mapv (fn [v] [:v v]) values)))
+
+  (command [:one v]
+    (p/persist [:v v]))
+
+  (command :get
+    (.reply this state)
+    nil)
+
+  (event [:v v]
+    (-> state
+        (update :log conj v)
+        (update :sum + v)
+        (update :n inc)))
+
+  (snapshot-every 5 2)
+  (delete-events-on-snapshot))
+
+(defn- stress-plan
+  "Build [commands expected-log] for the stress actor: `steps` operations mixing
+   single events (every 3rd op) and persist-all batches of 1–4 events (cycling), with
+   globally increasing values so the expected log is simply (range total) in order."
+  [steps]
+  (loop [i 0, v 0, cmds [], expected []]
+    (if (= i steps)
+      [cmds expected]
+      (if (zero? (mod i 3))
+        (recur (inc i) (inc v) (conj cmds [:one v]) (conj expected v))
+        (let [size (inc (mod i 4))          ; batch of 1..4 events
+              vals (vec (range v (+ v size)))]
+          (recur (inc i) (+ v size) (conj cmds [:batch vals]) (into expected vals)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests
 ;; ---------------------------------------------------------------------------
@@ -318,6 +362,71 @@
       (try
         (let [actor (p/spawn sys multi-event-actor {:id id})]
           (is (eventually (= [:x :y] (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest persist-all-stress-ordering-under-retention
+  ;; Stress persist-all's sequential, in-order persistence against aggressive
+  ;; snapshot retention (every 5, keep 2, delete subsumed events): drive many
+  ;; single + batch commands whose values increase monotonically, then verify the
+  ;; live and RECOVERED logs are exactly (range total) — no reorder, loss or dup —
+  ;; even though most of the journal has been snapshotted and truncated.
+  (let [id (unique-id)
+        [cmds expected] (stress-plan 60)          ; 120 events, ~24 snapshots
+        total (count expected)
+        expected-sum (reduce + expected)]
+    (is (> total 100) "sanity: the plan should produce a large event count")
+    ;; Run 1 — drive every command (tell; FIFO + persist stashing preserve order),
+    ;; then read the live state back.
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys stress-actor {:id id})]
+          (doseq [c cmds] (core/! actor c))
+          (let [st (core/<! actor :get 10000)]
+            (is (= expected (:log st)) "live log is in exact arrival order")
+            (is (= expected-sum (:sum st)))
+            (is (= total (:n st)) "no events lost or duplicated")))
+        (finally
+          (terminate-system sys))))
+    ;; Run 2 — recover in a fresh system. Retention deleted most events, so this
+    ;; reconstructs from the newest snapshot + the surviving tail; the result must
+    ;; still be identical.
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys stress-actor {:id id})
+              st (core/<! actor :get 10000)]
+          (is (= expected (:log st)) "recovered log matches, order preserved")
+          (is (= expected-sum (:sum st)))
+          (is (= total (:n st)) "recovery neither lost nor duplicated events")
+          ;; A further command after recovery appends correctly (sequence continues).
+          (core/! actor [:one total])
+          (is (eventually (= (conj expected total) (:log (core/<! actor :get 5000))))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest persist-all-large-batch-crosses-snapshot-boundaries
+  ;; A single persist-all bigger than snapshot-every (23 events, snapshot every 5)
+  ;; fires several snapshots from WITHIN one command's nested persist callbacks —
+  ;; the hardest case for sequential persistence. State and recovery must be exact
+  ;; and in order.
+  (let [id (unique-id)
+        vals (vec (range 23))]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys stress-actor {:id id})]
+          (core/! actor [:batch vals])
+          (let [st (core/<! actor :get 10000)]
+            (is (= vals (:log st)) "single large batch applied in order")
+            (is (= 23 (:n st)))
+            (is (= (reduce + vals) (:sum st)))))
+        (finally
+          (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys stress-actor {:id id})
+              st (core/<! actor :get 10000)]
+          (is (= vals (:log st)) "recovers the large batch in order after retention")
+          (is (= 23 (:n st))))
         (finally
           (terminate-system sys))))))
 
