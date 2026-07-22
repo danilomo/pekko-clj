@@ -88,19 +88,33 @@
       (let [[_ bindings & body] recovery-clause]
         `(fn ~bindings ~@body)))))
 
+(defn- catch-all-pattern?
+  "True if a core.match `command` pattern already matches every message — a bare
+   local symbol (binds anything, e.g. `cmd` or `_`) or the `:else` keyword — so
+   the user has provided their own catch-all and defactor-persistent must not
+   append one. Mirrors pekko-clj.core's private predicate of the same name."
+  [pattern]
+  (or (= pattern :else)
+      (symbol? pattern)))
+
 (defn- build-command-handler [commands]
-  (let [this-sym (gensym "this")
+  (let [this-sym (with-meta (gensym "this") {:tag 'pekko_clj.actor.CljPersistentActor})
         command-sym (gensym "command")
         match-clauses (mapcat (fn [[_ pattern & body]]
                                 [pattern `(do ~@body)])
-                              commands)]
+                              commands)
+        ;; If the user didn't supply a catch-all, append a default that routes
+        ;; an unmatched command to Pekko's unhandled() instead of silently
+        ;; dropping it. Mirrors the `defactor` catch-all in pekko-clj.core.
+        has-catch-all? (some catch-all-pattern? (map second commands))]
     `(fn [~this-sym ~command-sym]
        (binding [*current-persistent-actor* ~this-sym]
          (let [~'this ~this-sym
                ~'state @~this-sym]
            (match ~command-sym
              ~@match-clauses
-             :else nil))))))
+             ~@(when-not has-catch-all?
+                 [:else `(do (.unhandled ~this-sym ~command-sym) nil)])))))))
 
 (defn- build-event-handler [events]
   (let [state-sym (gensym "state")
@@ -120,7 +134,11 @@
    Clauses:
    - :persistence-id fn  - Function (fn [args] -> string) returning unique ID
    - (init [args] ...)   - Initialize state from args
-   - (command pattern & body) - Handle commands, return events via (persist ...)
+   - (command pattern & body) - Handle commands, return events via (persist ...).
+                                A command matching no clause is sent to Pekko's
+                                unhandled() (published as an UnhandledMessage on
+                                the event stream) rather than silently dropped,
+                                unless you supply your own catch-all.
    - (event pattern & body)   - Apply events to state, return new state
    - (tagger [event] ...)     - Tags (a collection of strings) to index the event
                                 under, queryable via events-by-tag; nil/empty for

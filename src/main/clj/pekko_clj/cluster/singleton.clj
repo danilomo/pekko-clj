@@ -27,7 +27,7 @@
                       :min-backoff-ms 1000
                       :max-backoff-ms 30000}})"
   (:refer-clojure :exclude [proxy])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef ExtendedActorSystem Props]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef ExtendedActorSystem Props PoisonPill]
            [org.apache.pekko.cluster.singleton ClusterSingletonManager ClusterSingletonManagerSettings
             ClusterSingletonProxy ClusterSingletonProxySettings]
            [org.apache.pekko.pattern BackoffSupervisor BackoffOpts]
@@ -88,7 +88,12 @@
      - :name - Name for the singleton manager (required)
      - :role - Role constraint (only nodes with this role can host)
      - :args - Arguments passed to actor's init
-     - :termination-message - Message sent to stop gracefully (default: :stop)
+     - :termination-message - Message sent to the singleton at hand-over; the
+       manager waits for the actor to terminate before completing hand-over
+       (default: PoisonPill, which stops the actor with no cooperation
+       needed). A custom message is NOT self-terminating — the actor must
+       handle it by stopping itself (e.g. `(core/stop (core/self))`), or
+       hand-over stalls until the manager's retries are exhausted.
      - :hand-over-retry-interval - Retry interval during hand-over (ms)
      - :supervision - Supervision options map
        - :strategy - :restart-with-backoff or :restart-with-stop
@@ -108,7 +113,7 @@
                       :max-backoff-ms 30000}})"
   [^ActorSystem system actor-def opts]
   (let [{:keys [name role args termination-message hand-over-retry-interval supervision]
-         :or {termination-message :stop}} opts
+         :or {termination-message (PoisonPill/getInstance)}} opts
         base-props (CljActor/create ((:make-props actor-def) args))
         props (wrap-with-supervision base-props supervision)
         ^ClusterSingletonManagerSettings settings

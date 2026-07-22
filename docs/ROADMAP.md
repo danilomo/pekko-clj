@@ -1,5 +1,9 @@
 # pekko-clj Roadmap & Epic Tracker
 
+> **This epic is COMPLETE.** The follow-up epic — bugs and gaps found in the
+> 2026-07-22 full-codebase audit — lives in [`ROADMAP-2.md`](ROADMAP-2.md); pick up
+> new work there.
+
 This is the **living tracker** for the "Parity, Hardening & Ergonomics" epic. It is designed
 so that **isolated sessions can pick up one story at a time**. It is the source of truth for
 what's done and what's next — keep it accurate.

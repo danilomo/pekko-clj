@@ -282,6 +282,21 @@
     (let [routees (deref (routing/get-routees pool) 10000 nil)]
       (is (>= (.size (.getRoutees routees)) 2)))))
 
+(deftest pool-with-resizer-accepts-docstring-example
+  ;; The docstring's example value must actually be valid: an int, not a %.
+  (let [pool (routing/spawn-pool-with-resizer *system* echo-worker
+                                              {:min-size 2
+                                               :max-size 10
+                                               :pressure-threshold 1})]
+    (is (= :pong (await-ask pool :ping)))))
+
+(deftest pool-with-resizer-rejects-percentage-pressure-threshold
+  (is (thrown? IllegalArgumentException
+        (routing/spawn-pool-with-resizer *system* echo-worker
+                                         {:min-size 2
+                                          :max-size 10
+                                          :pressure-threshold 0.8}))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: Dynamic Routee Management
 ;; ---------------------------------------------------------------------------

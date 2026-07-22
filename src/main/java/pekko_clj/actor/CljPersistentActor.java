@@ -91,6 +91,10 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
     return receiveBuilder()
       .match(SnapshotOffer.class, offer -> {
         this.state = offer.snapshot();
+        // The offered snapshot subsumes every event up to its sequence number,
+        // so cadence restarts from here rather than from 0 (which would forget
+        // however many events preceded this recovery's most recent restart).
+        eventsSinceSnapshot = 0;
       })
       .match(RecoveryCompleted.class, msg -> {
         recovering = false;
@@ -101,6 +105,7 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
       .matchAny(event -> {
         // It's an event - apply it to state
         applyEvent(event);
+        eventsSinceSnapshot++;
       })
       .build();
   }
@@ -256,6 +261,17 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
 
   public void tell(ActorRef ref, Object msg) {
     ref.tell(msg, getSelf());
+  }
+
+  /**
+   * Mark a command as unhandled. Delegates to Pekko's default handling, which
+   * publishes an {@link org.apache.pekko.actor.UnhandledMessage} to the actor
+   * system's event stream. Used by the {@code defactor-persistent} catch-all so
+   * an unmatched command does not vanish silently. Mirrors {@link CljActor}'s.
+   */
+  @Override
+  public void unhandled(Object message) {
+    super.unhandled(message);
   }
 
   public boolean isRecovering() {

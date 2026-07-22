@@ -1,7 +1,10 @@
 (ns pekko-clj.persistence-test
   (:require [clojure.test :refer [deftest is]]
             [pekko-clj.persistence :as p]
+            [pekko-clj.persistence.query :as q]
+            [pekko-clj.stream :as s]
             [pekko-clj.core :as core]
+            [pekko-clj.event-stream :as es]
             [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem]
            [com.typesafe.config ConfigFactory]
@@ -67,6 +70,44 @@
     (update state :count inc))
 
   (snapshot-every 5))
+
+;; B15: handles only :known — anything else must route to unhandled() rather
+;; than being silently dropped.
+(p/defactor-persistent picky-persistent
+  :persistence-id (fn [args] (str "picky-" (:id args)))
+
+  (init [_] {:count 0})
+
+  (command :known
+    (p/persist [:incremented]))
+
+  (command :get
+    (p/reply (:count state)))
+
+  (event [:incremented]
+    (update state :count inc)))
+
+;; B15: a user-supplied catch-all (`other`) must still win over the default
+;; unhandled() fallback.
+(p/defactor-persistent catch-all-persistent
+  :persistence-id (fn [args] (str "catchall-" (:id args)))
+
+  (init [_] {:log []})
+
+  (command :known
+    (p/persist [:known-hit]))
+
+  (command :get
+    (p/reply (:log state)))
+
+  (command other
+    (p/persist [:caught other]))
+
+  (event [:known-hit]
+    (update state :log conj :known))
+
+  (event [:caught other]
+    (update state :log conj other)))
 
 (p/defactor-persistent multi-event-actor
   :persistence-id (fn [args] (str "multi-" (:id args)))
@@ -165,6 +206,26 @@
   "snapshot-every with retention AND delete-events-on-snapshot: events the kept
    snapshot subsumes are deleted from the journal."
   :persistence-id (fn [args] (str "retained-del-" (:id args)))
+
+  (init [_] {:count 0})
+
+  (command :increment
+    (p/persist [:incremented]))
+
+  (command :get
+    (p/reply (:count state)))
+
+  (event [:incremented]
+    (update state :count inc))
+
+  (snapshot-every 2 1)
+  (delete-events-on-snapshot))
+
+;; B13: snapshot-every 2, keep 1, delete subsumed events — used to make the
+;; snapshot cadence observable across a restart via the resulting journal
+;; truncation point (see snapshot-cadence-survives-recovery below).
+(p/defactor-persistent cadence-counter
+  :persistence-id (fn [args] (str "cadence-" (:id args)))
 
   (init [_] {:count 0})
 
@@ -299,6 +360,36 @@
           (is (eventually (= 7 (core/<! actor :get 3000)))))
         (finally
           (terminate-system sys))))))
+
+(deftest persistent-actor-unmatched-command-goes-unhandled
+  ;; B15: an unmatched command must not be silently dropped — it routes to
+  ;; Pekko's unhandled() and shows up as an UnhandledMessage, mirroring
+  ;; defactor's B3 fix. The actor survives and keeps handling known commands.
+  (let [sys (create-test-system "persistence-test")
+        id (unique-id)
+        actor (p/spawn sys picky-persistent {:id id})
+        received (atom [])]
+    (try
+      (es/subscribe-unhandled sys (fn [m] (swap! received conj m)))
+      (is (eventually (do (core/! actor :mystery)
+                          (some (fn [m] (= :mystery (:message m))) @received))))
+      (core/! actor :known)
+      (is (eventually (= 1 (core/<! actor :get 3000))))
+      (finally
+        (terminate-system sys)))))
+
+(deftest persistent-actor-user-catch-all-wins
+  ;; A user-supplied catch-all command clause still wins over the default
+  ;; unhandled() fallback — unmatched commands reach it instead.
+  (let [sys (create-test-system "persistence-test")
+        id (unique-id)
+        actor (p/spawn sys catch-all-persistent {:id id})]
+    (try
+      (core/! actor :known)
+      (core/! actor :anything-else)
+      (is (eventually (= [:known :anything-else] (core/<! actor :get 3000))))
+      (finally
+        (terminate-system sys)))))
 
 (deftest persistent-actor-multiple-events
   (let [sys (create-test-system "persistence-test")
@@ -549,6 +640,44 @@
       (try
         (let [actor (p/spawn sys retained-deleting-counter {:id id})]
           (is (eventually (= 6 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))))
+
+(deftest snapshot-cadence-survives-recovery
+  ;; B13: eventsSinceSnapshot must not reset to 0 on restart. With
+  ;; snapshot-every 2, persist 1 event, restart (recovery replays that 1 event
+  ;; with no snapshot offer yet), then persist 3 more. If cadence carries over
+  ;; correctly, the two snapshot boundaries land at seq 2 and seq 4; a counter
+  ;; that forgot the pre-restart event would instead fire at seq 3.
+  ;; (snapshot-every 2 1) + delete-events-on-snapshot makes the boundary
+  ;; observable: querying the journal afterwards reveals which events survived
+  ;; truncation — [3 4] proves the correct boundary, [2 3 4] the buggy one.
+  (let [id (unique-id)
+        pid (str "cadence-" id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys cadence-counter {:id id})]
+          (core/! actor :increment)
+          (is (eventually (= 1 (core/<! actor :get 3000)))))
+        (finally
+          (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys cadence-counter {:id id})]
+          (core/! actor :increment)
+          (core/! actor :increment)
+          (core/! actor :increment)
+          (is (eventually (= 4 (core/<! actor :get 3000)))))
+        (let [j (q/read-journal sys)
+              mat (s/materializer sys)
+              remaining (eventually
+                         (let [es (vec (s/await-completion
+                                        (s/run-to-seq
+                                         (q/current-events-by-persistence-id j pid) mat)
+                                        5000))]
+                           (when (= 2 (count es)) es)))]
+          (is (= [3 4] (mapv :sequence-nr remaining))
+              "snapshot cadence carried the pre-restart event forward: boundaries at seq 2 and 4, not 3"))
         (finally
           (terminate-system sys))))))
 

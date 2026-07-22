@@ -291,7 +291,8 @@ pekko {
 | `src/main/java/pekko_clj/actor/CljActor.java` | Java actor implementation |
 | `test/resources/cluster-test.conf` | Cluster test Pekko configuration |
 | `test/resources/persistence-test.conf` | Persistence test Pekko configuration |
-| `docs/ROADMAP.md` | Epic tracker (parity/hardening/bug work, per-story status) |
+| `docs/ROADMAP.md` | Epic 1 tracker (complete — parity/hardening/bug work) |
+| `docs/ROADMAP-2.md` | Epic 2 tracker (ACTIVE — final review audit, per-story status) |
 | `docs/specs/README.md` | Feature parity overview |
 
 ## Version Information

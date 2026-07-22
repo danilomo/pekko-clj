@@ -311,8 +311,13 @@
      - :strategy - Routing strategy (default: :round-robin)
      - :min-size - Minimum pool size (default: 1)
      - :max-size - Maximum pool size (default: 10)
-     - :pressure-threshold - % busy routees to scale up (default: 1)
+     - :pressure-threshold - mailbox-depth threshold (non-negative int, NOT a
+       percentage) used to decide whether a routee counts as \"busy\" for
+       scale-up purposes (default: 1). 0 = a routee is busy whenever it is
+       processing a message; 1 = busy only once a message is also queued
+       behind it; N>1 = busy once more than N messages are queued.
      - :rampup-rate - Rate to add routees (default: 0.2)
+     - :backoff-threshold - capacity fraction below which to scale down (default: 0.3)
      - :backoff-rate - Rate to remove routees (default: 0.1)
      - :messages-per-resize - Messages between resize checks (default: 10)
      - :args - Arguments for actor init
@@ -321,23 +326,30 @@
      (spawn-pool-with-resizer sys worker-actor
        {:min-size 2
         :max-size 10
-        :pressure-threshold 0.8})"
+        :pressure-threshold 1})"
   [system actor-def {:keys [strategy min-size max-size pressure-threshold
-                            rampup-rate backoff-rate messages-per-resize args]
+                            rampup-rate backoff-threshold backoff-rate
+                            messages-per-resize args]
                      :or {strategy :round-robin
                           min-size 1
                           max-size 10
                           pressure-threshold 1
                           rampup-rate 0.2
+                          backoff-threshold 0.3
                           backoff-rate 0.1
                           messages-per-resize 10}}]
+  (when-not (and (integer? pressure-threshold) (not (neg? pressure-threshold)))
+    (throw (IllegalArgumentException.
+            (str "spawn-pool-with-resizer :pressure-threshold must be a "
+                 "non-negative integer (mailbox-depth threshold), got "
+                 (pr-str pressure-threshold)))))
   (let [props (make-props actor-def args)
         resizer (DefaultResizer. (int min-size) (int max-size)
                                  (int pressure-threshold)
                                  (double rampup-rate)
+                                 (double backoff-threshold)
                                  (double backoff-rate)
-                                 (int messages-per-resize)
-                                 (int 3))  ; backoff-threshold
+                                 (int messages-per-resize))
         pool (pool-with-resizer strategy min-size resizer)
         router-props (.props pool props)]
     (.actorOf ^ActorSystem system router-props)))

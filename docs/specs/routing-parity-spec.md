@@ -185,8 +185,10 @@
      - :strategy - Routing strategy (default: :round-robin)
      - :min-size - Minimum pool size (default: 1)
      - :max-size - Maximum pool size (default: 10)
-     - :pressure-threshold - % busy routees to scale up (default: 1)
+     - :pressure-threshold - mailbox-depth threshold (non-negative int, NOT a
+       percentage) used to decide whether a routee counts as busy (default: 1)
      - :rampup-rate - Rate to add routees (default: 0.2)
+     - :backoff-threshold - capacity fraction below which to scale down (default: 0.3)
      - :backoff-rate - Rate to remove routees (default: 0.1)
      - :messages-per-resize - Messages between resize checks (default: 10)
 
@@ -194,7 +196,7 @@
      (spawn-pool-with-resizer sys worker-actor
        {:min-size 2
         :max-size 10
-        :pressure-threshold 0.8})"
+        :pressure-threshold 1})"
   [system actor-def opts]
   ...)
 ```

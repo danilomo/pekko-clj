@@ -27,6 +27,15 @@
   (handle :stop
     :stop))
 
+;; B17: no :stop (or any) handling at all — proves the default
+;; termination-message stops the singleton with no cooperation from the actor.
+(core/defactor vanilla-singleton
+  "Singleton with no lifecycle handling — relies entirely on the default
+   termination-message to be stoppable."
+  (init [args] {:value (or (:initial args) 0)})
+  (handle :get
+    (core/reply (:value state))))
+
 (def singleton-events (atom []))
 
 (core/defactor logging-singleton
@@ -130,6 +139,27 @@
                                      {:name "handover-singleton"
                                       :hand-over-retry-interval 2000})]
         (is (some? manager)))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest singleton-default-termination-message-stops-without-cooperation
+  ;; B17: :termination-message defaults to PoisonPill (not the old :stop
+  ;; keyword, which a defactor that doesn't explicitly handle it just leaves
+  ;; unhandled — hand-over would stall until retries are exhausted). Leaving a
+  ;; 1-node cluster triggers hand-over with nowhere to go: the manager sends
+  ;; the termination-message and waits for the child to stop. A short
+  ;; hand-over-retry-interval bounds the test if this regresses.
+  (let [sys (ts/create-cluster-system "singleton-b17-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (singleton/start sys vanilla-singleton
+                       {:name "b17-singleton"
+                        :hand-over-retry-interval 200})
+      (is (ts/poll-until #(singleton/singleton-running-here? sys "/user/b17-singleton") 10000)
+          "singleton should be running before we test its shutdown")
+      (cluster/leave sys)
+      (is (ts/poll-until #(not (singleton/singleton-running-here? sys "/user/b17-singleton")) 5000)
+          "singleton should stop promptly under the PoisonPill default even though the actor defines no :stop handler")
       (finally
         (ts/terminate-system sys)))))
 
