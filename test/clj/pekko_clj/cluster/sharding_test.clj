@@ -1,7 +1,9 @@
 (ns pekko-clj.cluster.sharding-test
   (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
+            [pekko-clj.cluster :as cluster]
             [pekko-clj.cluster.sharding :as sharding]
+            [pekko-clj.serialization :as serialization]
             [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.cluster.sharding ClusterShardingSettings
             ClusterShardingSettings$PassivationStrategySettings]))
@@ -359,5 +361,57 @@
                      #(await-result (sharding/cluster-sharding-stats sys "StatsEntity" 5000)))]
           (is (some? stats))
           (is (contains? (sharding/stats->map stats) :regions))))
+      (finally
+        (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Envelope serialization (B14)
+;; ---------------------------------------------------------------------------
+
+;; Replies with a map: `serialize-messages = on` plus Transit (which turns Java
+;; serialization off) means every message needs a real serializer, and the
+;; Transit bindings cover Clojure data — a bare Long reply would not be covered.
+(core/defactor transit-entity
+  "Entity used to drive the envelope through a real serializer."
+  (init [_] {:count 0})
+  (handle [:inc n]
+    (update state :count + n))
+  (handle [:get]
+    (core/reply {:id (sharding/entity-id) :count (:count state)})))
+
+(deftest entity-message-envelope-is-plain-data-test
+  ;; B14: the envelope used to be a defrecord. Records are bound to the Transit
+  ;; serializer (they are IPersistentCollections) but Transit has no record
+  ;; handlers, so the library's own envelope could not cross the wire under the
+  ;; library's own serializer. It is plain data now, and round trips.
+  (let [envelope (sharding/entity-message "order-7" [:add-item {:sku "ABC"}])]
+    (is (sharding/entity-message? envelope))
+    (is (= envelope (serialization/read-bytes (serialization/write-bytes envelope)))
+        "the envelope survives a Transit round trip")
+    (is (not (sharding/entity-message? {:entity-id "order-7" :message [:x]}))
+        "a user map with similar unqualified keys is not an envelope")))
+
+(deftest sharding-under-transit-serialization-test
+  ;; End-to-end: `serialize-messages = on` makes Pekko serialize and deserialize
+  ;; every user message even for local sends, so each tell/ask below really goes
+  ;; through the Transit serializer — the path that failed for every cross-node
+  ;; message while the envelope was a record.
+  (let [sys (cluster/create-system "sharding-transit-test"
+                                   {:port 0
+                                    :transit-serialization true
+                                    :extra-config "pekko.actor.serialize-messages = on"})]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys transit-entity
+                                   {:type-name "TransitCounter"
+                                    :num-shards 10})]
+        (sharding/tell region "e-1" [:inc 2])
+        (sharding/tell region "e-1" [:inc 3])
+        (sharding/tell region "e-2" [:inc 7])
+        (is (eventually (= {:id "e-1" :count 5}
+                           (await-result (sharding/ask region "e-1" [:get] 10000)))))
+        (is (= {:id "e-2" :count 7}
+               (await-result (sharding/ask region "e-2" [:get] 10000)))
+            "entities stay isolated across the serialized envelope"))
       (finally
         (ts/terminate-system sys)))))

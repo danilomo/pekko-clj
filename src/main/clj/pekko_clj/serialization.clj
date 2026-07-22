@@ -30,7 +30,9 @@
    Notes:
    - Transit is self-describing, so every payload carries one constant manifest.
    - Records are NOT handled out of the box (Transit needs a per-type handler);
-     use plain maps in messages and persisted events.
+     use plain maps in messages and persisted events. pekko-clj's own wire types
+     follow that rule — the sharding envelope (`sharding/entity-message`) is a
+     map with namespaced keys, not a record, so it crosses the wire here.
    - The default Transit format is `:json`; `:msgpack` is more compact,
      `:json-verbose` is human-readable."
   (:require [cognitect.transit :as transit]

@@ -14,7 +14,7 @@
 | `ask` | Ask via envelope | ✅ Complete |
 | `get-shard-region` | `shardRegion(typeName)` | ✅ Complete |
 | `shard-region-state` | `GetShardRegionState` | ✅ Complete |
-| `entity-message` | Envelope record | ✅ Complete |
+| `entity-message` | Envelope (plain map, `::entity-id`/`::message`) | ✅ Complete |
 
 ### Implemented Options
 
@@ -352,7 +352,7 @@ dependency; nothing user-facing becomes typed.
 User Code                    Shard Region              Entity Actor
     |                             |                         |
     |-- tell(region, id, msg) --> |                         |
-    |   (EntityMessage envelope)  |                         |
+    |   (entity-message envelope) |                         |
     |                             |-- route to shard -----> |
     |                             |                         |
     |                             |-- msg (unwrapped) ----->|
@@ -366,7 +366,7 @@ User Code                    Shard Region              Entity Actor
 User Code                    EntityRef              Shard Region        Entity
     |                           |                       |                 |
     |-- (tell-entity ref msg)-->|                       |                 |
-    |                           |-- EntityMessage ----->|                 |
+    |                           |-- entity-message ---->|                 |
     |                           |   (wraps internally)  |-- route ------->|
     |                           |                       |                 |
 ```

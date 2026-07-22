@@ -59,12 +59,28 @@
 ;; Message Envelope
 ;; ---------------------------------------------------------------------------
 
-(defrecord EntityMessage [entity-id message])
+;; The envelope is plain Clojure data — a map with namespaced keys — and not a
+;; record. Records are ordinary Clojure collections to a serializer *binding*
+;; (they implement IPersistentCollection) but Transit has no record handlers, so
+;; a record envelope could not cross the wire under the library's own serializer:
+;; every cross-node tell/ask failed at serialization time. Namespaced keys keep
+;; the envelope distinguishable from a user message that happens to be a map,
+;; without needing a type — and any serializer that can carry Clojure data can
+;; now carry the envelope, Transit and Java serialization included.
 
 (defn entity-message
-  "Create a message envelope for a specific entity."
+  "Create a message envelope addressing `message` to a specific entity.
+
+   The envelope is a plain map, `{::entity-id id ::message message}`; the
+   message extractor unwraps it, so entity actors never see it."
   [entity-id message]
-  (->EntityMessage entity-id message))
+  {::entity-id entity-id
+   ::message message})
+
+(defn entity-message?
+  "True for an envelope produced by `entity-message`."
+  [msg]
+  (and (map? msg) (contains? msg ::entity-id)))
 
 ;; ---------------------------------------------------------------------------
 ;; Message Extractor
@@ -78,16 +94,16 @@
    - shard-id: Which shard the entity belongs to"
   [num-shards]
   (proxy [ShardRegion$HashCodeMessageExtractor] [(int num-shards)]
-    ;; Only EntityMessage envelopes (produced by tell/ask/entity-ref) carry an
-    ;; entity id and are routed; anything else has no id and is dropped by Pekko.
+    ;; Only envelopes (produced by tell/ask/entity-ref) carry an entity id and
+    ;; are routed; anything else has no id and is dropped by Pekko.
     (entityId [message]
-      (when (instance? EntityMessage message)
-        (:entity-id message)))
+      (when (entity-message? message)
+        (::entity-id message)))
     ;; Deliver the *unwrapped* payload so the entity actor matches the raw
     ;; message pattern it was written for; it reads its own id via (entity-id).
     (entityMessage [message]
-      (if (instance? EntityMessage message)
-        (:message message)
+      (if (entity-message? message)
+        (::message message)
         message))))
 
 (defn entity-id

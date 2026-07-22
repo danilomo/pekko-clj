@@ -41,7 +41,7 @@ commit `7e59e55`.
 | B11 | Fix HTTP route macros: static paths never match | Bugs | DONE | — | medium |
 | B12 | Make `persist-all` atomic (journal `persistAll`) | Bugs | DONE | — | medium |
 | B13 | Snapshot cadence survives recovery | Bugs | DONE | — | low |
-| B14 | Make the sharding envelope Transit-serializable | Bugs | TODO | — | medium |
+| B14 | Make the sharding envelope Transit-serializable | Bugs | DONE | — | medium |
 | B15 | `defactor-persistent` unmatched commands → `unhandled()` | Bugs | DONE | — | low |
 | B16 | Preserve the stash across restarts | Bugs | TODO | — | medium |
 | B17 | Singleton `termination-message` default is a silent no-op | Bugs | DONE | — | low |
@@ -59,7 +59,7 @@ commit `7e59e55`.
 | N14 | Streams FileIO + StreamConverters | New | TODO | N13 | low |
 | N15 | HTTP routing completion: segment capture, static content, auth | New | TODO | B11 | medium |
 | N16 | HTTPS + compression + request timeouts | New | TODO | N15 | medium |
-| N17 | Transit record support | New | TODO | B14 | low |
+| N17 | Transit record support | New | TODO | — | low |
 | N18 | Router parity leftovers | New | TODO | H7 | low |
 | N19 | Small parity odds and ends | New | TODO | — | low |
 
@@ -175,7 +175,35 @@ the modulo.)
 **Tests:** persist `n-1` events with `snapshot-every n`, restart, persist 1 more →
 snapshot fires (probe `SaveSnapshotSuccess` via state or a journal query).
 
-### B14 · Make the sharding envelope Transit-serializable — `TODO`
+### B14 · Make the sharding envelope Transit-serializable — `DONE`
+**Note (2026-07-22): decision = (b), plain data.** The envelope is now
+`{::entity-id id ::message msg}` — a map with keys namespaced to
+`pekko-clj.cluster.sharding` — and the `EntityMessage` record is gone;
+`entity-message` still builds it and a new `entity-message?` predicate replaces
+the `instance?` check in the extractor (2 lines). Chose (b) over the tracker's
+leaning to (a) for two reasons: (a) fixes the envelope for *Transit only* — a
+user on any other serializer would hit the same wall — whereas plain data crosses
+under every serializer that can carry Clojure data, Java serialization included;
+and registering the handler in `pekko-clj.serialization` would have made a
+low-level namespace depend on `pekko-clj.cluster.sharding` (no cycle today, but
+`cluster` → `serialization` already exists, so the next `serialization` require
+added to sharding would create one). Namespaced keys keep the envelope
+distinguishable from a user message that happens to be a map. **Breaking:** the
+`EntityMessage` record and its `->EntityMessage`/`map->EntityMessage`
+constructors are removed; the envelope is internal (built by `tell`/`ask`,
+unwrapped by the extractor before delivery), so nothing else in the tree used it.
+The real symptom was worse than a serialization exception: Transit *writes* a
+record as a plain map, so the payload arrived with its type erased and the
+extractor's `instance?` check silently returned no entity id — the message was
+dropped rather than failing loudly (measured while verifying the tests).
+Tests: `entity-message-envelope-is-plain-data-test` (round trip through
+`write-bytes`/`read-bytes`, plus "an unqualified-key user map is not an
+envelope") and `sharding-under-transit-serialization-test` (single-node region
+under `:transit-serialization` + `pekko.actor.serialize-messages = on`, the N4
+technique — tell/ask by id, two ids stay isolated); both verified failing
+against a restored record envelope. `docs/specs/sharding-parity-spec.md` updated
+(envelope row + the two flow diagrams); `serialization.clj`'s "records are not
+handled" note now points at the envelope as the worked example.
 **Deps:** none.
 `EntityMessage` is a **defrecord** (`sharding.clj:62`). The Transit serializer binds
 `clojure.lang.IPersistentCollection` (`serialization.clj:56-62`) — which records
@@ -510,7 +538,9 @@ content type; the json-string decision's behavior pinned.
 timeout returns 503.
 
 ### N17 · Transit record support — `TODO`
-**Deps:** B14 (which handles the built-in record; this generalizes).
+**Deps:** none — B14 removed the library's own record from the wire (plain-data
+envelope) instead of teaching Transit to read records, so this story is now the
+*only* place record support would land, not a generalization of it.
 User records in messages/events currently fail serialization (documented limitation,
 `serialization.clj:33-34`). Add opt-in support: `transit-config {:records [my.ns.Foo …]}`
 generating a tagged write handler (record → map + tag from class name) and read
@@ -567,7 +597,7 @@ generation via a proper Config builder instead of string concat (`create-system`
 B11 ─► H11, N15 ─► N16
 B12 ─┬► N11 ─► N12
 B15 ─┘
-B14 ─► N10, N17
+B14 ─► N10
 B13, B16, B17, B18   (independent)
 H7 ─► N18
 H8, H9, H10, H12     (independent)
