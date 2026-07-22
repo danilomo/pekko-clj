@@ -39,7 +39,7 @@ commit `7e59e55`.
 | ID | Title | Milestone | Status | Deps | Risk |
 |----|-------|-----------|--------|------|------|
 | B11 | Fix HTTP route macros: static paths never match | Bugs | DONE | — | medium |
-| B12 | Make `persist-all` atomic (journal `persistAll`) | Bugs | TODO | — | medium |
+| B12 | Make `persist-all` atomic (journal `persistAll`) | Bugs | DONE | — | medium |
 | B13 | Snapshot cadence survives recovery | Bugs | DONE | — | low |
 | B14 | Make the sharding envelope Transit-serializable | Bugs | TODO | — | medium |
 | B15 | `defactor-persistent` unmatched commands → `unhandled()` | Bugs | DONE | — | low |
@@ -116,7 +116,26 @@ path, multi-param, nested under `path-prefix`, trailing-segment mismatch → 404
 regression that `(GET "users" …)` (no slash) also works. Update `doc/06-http.md`
 (also H11).
 
-### B12 · Make `persist-all` atomic — `TODO`
+### B12 · Make `persist-all` atomic — `DONE`
+**Note (2026-07-22):** fixed as scoped — `persistAllEvents` now tag-wraps the
+whole batch into a `List` and makes one `persistAll(Iterable, Procedure)` call
+instead of recursing through nested single `persist`s; the callback still runs
+per event, in order, so event application and snapshot cadence are unchanged.
+Empty/nil batches stay a no-op. Test: `persist-all-batch-is-atomic`
+(`persistence_test.clj`) — a batch with an unserializable event in the middle is
+rejected by the journal; with one atomic write no event of the batch is applied,
+where the nested form had already applied everything before the bad event
+(verified failing without the fix). **Atomicity is only partly observable under
+LevelDB**, so the assertion is on actor state, not journal contents: the
+`LeveldbStore` serializes an AtomicWrite's events into a *shared* LevelDB write
+batch and commits it even when a later event of that same atomic write fails to
+serialize, so a rejected batch can still leave bytes on disk there — measured,
+not assumed (the first draft of this test asserted an untouched journal and
+failed). The contract is documented in `persist-all`'s docstring and in
+`README.md`; ordering + recovery stay covered by
+`persist-all-stress-ordering-under-retention` and
+`persist-all-large-batch-crosses-snapshot-boundaries`. No `docs/specs/*`
+checklist covers persistence.
 **Deps:** none.
 `CljPersistentActor.persistAllEvents` (`CljPersistentActor.java:156-166`) persists a
 `persist-all` batch as **nested single `persist` calls** — one journal write per

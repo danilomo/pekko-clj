@@ -299,6 +299,14 @@
    so it is unambiguous which vectors are separate events. (A plain collection
    returned from `persist` is always a single event, whatever its shape.)
 
+   The batch is written **atomically**: it reaches the journal as a single write,
+   so either every event of the batch is stored or none is. A crash mid-command
+   can therefore never leave a half-applied command behind — that guarantee is
+   the reason to prefer one `persist-all` over several `persist` calls. The
+   event handler still sees the events one at a time, in order, after the write.
+
+   An empty collection persists nothing.
+
    Example:
      (persist-all [[:item-added item] [:inventory-updated]])"
   [events]

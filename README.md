@@ -240,7 +240,9 @@ A command persists one event with `(persist event)` — the event may be any sha
 (keyword, vector, map). To emit several events from one command, use
 `(persist-all [event1 event2 …])`; a plain collection returned from `persist` is
 always a single event, so there is no ambiguity between "one compound event" and
-"several events".
+"several events". A `persist-all` batch is written atomically — one journal
+write, all events or none — so a crash mid-command cannot leave a half-applied
+command behind.
 
 ## Reactive Streams
 

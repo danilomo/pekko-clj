@@ -12,7 +12,9 @@ import clojure.lang.IFn;
 import clojure.lang.Keyword;
 import clojure.lang.ILookup;
 import clojure.lang.ISeq;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -141,11 +143,8 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
         }
 
         if (result instanceof PersistAll) {
-          // Multiple events (from persist-all) - persist sequentially, in order.
-          ISeq events = ((PersistAll) result).events;
-          if (events != null) {
-            persistAllEvents(events);
-          }
+          // Multiple events (from persist-all) - one atomic journal write, applied in order.
+          persistAllEvents(((PersistAll) result).events);
         } else {
           // Any other value is a single event, whatever its shape.
           persistEvent(result);
@@ -158,16 +157,24 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
     persist(withTags(event), (Object e) -> handlePersistedEvent(e));
   }
 
+  /**
+   * Persist a batch of events atomically.
+   *
+   * <p>{@code persistAll} hands the journal the whole batch as one write: either every event of
+   * the batch is stored or none is. Persisting them as nested single {@code persist} calls — one
+   * journal write each — would let a crash mid-batch leave a partial event sequence behind, which
+   * is exactly the half-applied command {@code persist-all} exists to prevent.
+   *
+   * <p>The callback still runs once per event, in order, after the write, so event application and
+   * snapshot cadence are unchanged.
+   */
   private void persistAllEvents(ISeq events) {
-    if (events == null) return;
-    Object event = events.first();
-    ISeq rest = events.next();
-    persist(withTags(event), (Object e) -> {
-      handlePersistedEvent(e);
-      if (rest != null) {
-        persistAllEvents(rest);
-      }
-    });
+    List<Object> batch = new ArrayList<>();
+    for (ISeq s = events; s != null; s = s.next()) {
+      batch.add(withTags(s.first()));
+    }
+    if (batch.isEmpty()) return;
+    persistAll(batch, (Object e) -> handlePersistedEvent(e));
   }
 
   /**

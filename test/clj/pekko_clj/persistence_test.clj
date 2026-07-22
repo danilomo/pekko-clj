@@ -124,6 +124,25 @@
   (event [:added item]
     (update state :items conj item)))
 
+;; B12: a persist-all batch must reach the journal as ONE atomic write. The
+;; batches here carry an event the journal cannot store (a bare Object is not
+;; java.io.Serializable), so the write is rejected — with an atomic write the
+;; whole batch is rejected together, leaving nothing behind.
+(p/defactor-persistent atomic-batch-actor
+  :persistence-id (fn [args] (str "atomic-" (:id args)))
+
+  (init [_] {:log []})
+
+  (command [:batch values]
+    (p/persist-all (mapv (fn [v] [:v v]) values)))
+
+  (command :get
+    (.reply this (:log state))
+    nil)
+
+  (event [:v v]
+    (update state :log conj v)))
+
 ;; Regression: a single event whose value is itself a vector-of-vectors must be
 ;; stored as ONE event (the old shape-inspection heuristic would have split it).
 (p/defactor-persistent vector-event-actor
@@ -485,6 +504,38 @@
           (is (eventually (= (conj expected total) (:log (core/<! actor :get 5000))))))
         (finally
           (terminate-system sys))))))
+
+(deftest persist-all-batch-is-atomic
+  ;; B12: persist-all must hand the journal ONE atomic write covering the whole
+  ;; batch, not one write per event. The batch below carries an event the journal
+  ;; cannot store (a bare Object is not java.io.Serializable), so the write is
+  ;; rejected — and being one write, it is rejected as a unit: not one event of
+  ;; the batch is applied. Persisting the batch as nested single `persist` calls
+  ;; instead wrote and applied every event *before* the bad one, leaving the
+  ;; half-applied command persist-all exists to prevent.
+  ;;
+  ;; The assertion is on actor state, not on journal contents: the LevelDB plugin
+  ;; serializes an AtomicWrite's events straight into a shared LevelDB write batch
+  ;; that it commits even when a later event of that same atomic write fails to
+  ;; serialize, so the on-disk effect of a *rejected* write is plugin-specific and
+  ;; not a fair probe of our contract. What the batching does control — and what
+  ;; the actor and every recovery from a well-behaved journal see — is whether the
+  ;; command was applied in part.
+  (let [id (unique-id)
+        sys (create-test-system "persistence-test")]
+    (try
+      (let [actor (p/spawn sys atomic-batch-actor {:id id})]
+        ;; Control: a storable batch lands whole.
+        (core/! actor [:batch [1 2]])
+        (is (eventually (= [1 2] (core/<! actor :get 3000))))
+        ;; The rejected batch, then a good one to prove the actor is still alive
+        ;; and that we are not just reading a stale reply.
+        (core/! actor [:batch [3 (Object.) 4]])
+        (core/! actor [:batch [5 6]])
+        (is (eventually (= [1 2 5 6] (core/<! actor :get 3000)))
+            "no event of the rejected batch was applied — all or nothing"))
+      (finally
+        (terminate-system sys)))))
 
 (deftest persist-all-large-batch-crosses-snapshot-boundaries
   ;; A single persist-all bigger than snapshot-every (23 events, snapshot every 5)
