@@ -26,7 +26,7 @@
             [clojure.string :as str])
   (:import [org.apache.pekko.http.javadsl.server Route AllDirectives
             ExceptionHandler RejectionHandler RejectionHandlerBuilder
-            Rejection]
+            PathMatchers Rejection]
            [org.apache.pekko.http.javadsl.model HttpResponse HttpEntity$Strict
             HttpRequest ResponseEntity Uri
             StatusCodes]
@@ -134,28 +134,83 @@
 ;; Path Directives
 ;; ---------------------------------------------------------------------------
 
-(defn path
-  "Match an exact path.
+(defn- segment-prefix
+  "Match one static segment of the *unmatched* path, then continue."
+  [^String segment inner-route]
+  (.pathPrefix directives
+               segment
+               (reify Supplier
+                 (get [_] inner-route))))
 
-   (path \"/users\" inner-route)"
-  [path-str inner-route]
+(defn- segment-exact
+  "Match one static segment and require the path to end there."
+  [^String segment inner-route]
   (.path directives
-         ^String path-str
+         segment
          (reify Supplier
            (get [_] inner-route))))
 
-(defn path-prefix
-  "Match a path prefix.
+(defn- pattern->segments
+  "Split a path pattern into segments, tolerating leading/trailing/duplicate
+   slashes: \"/api/v1/\" and \"api/v1\" both give [\"api\" \"v1\"]."
+  [pattern]
+  (vec (remove str/blank? (str/split (str pattern) #"/"))))
 
-   (path-prefix \"/api\"
+(defn path
+  "Match a path exactly (the whole remaining, unmatched path).
+
+   The pattern may be a single segment or several; a leading slash is optional,
+   so all three of these are the same route:
+
+   (path \"users\" inner-route)
+   (path \"/users\" inner-route)
+   (path \"api/users\" inner-route)
+
+   Composes under `path-prefix` — it only ever looks at the unmatched path."
+  [path-str inner-route]
+  (let [segments (pattern->segments path-str)]
+    (if (empty? segments)
+      (.pathEnd directives (reify Supplier (get [_] inner-route)))
+      (reduce (fn [route segment] (segment-prefix segment route))
+              (segment-exact (peek segments) inner-route)
+              (rseq (pop segments))))))
+
+(defn path-prefix
+  "Match a path prefix, leaving the rest of the path for inner routes.
+
+   Like `path`, the pattern may span several segments and the leading slash is
+   optional.
+
+   (path-prefix \"api\"
      (routes
        user-routes
        post-routes))"
   [prefix inner-route]
+  (reduce (fn [route segment] (segment-prefix segment route))
+          inner-route
+          (rseq (pattern->segments prefix))))
+
+(defn path-var
+  "Match one path segment, bind it as a string, and require the path to end
+   there. inner-fn returns the Route for that value.
+
+   (path-var (fn [id] (complete (str \"user \" id))))"
+  [inner-fn]
+  (.path directives
+         (PathMatchers/segment)
+         (reify Function
+           (apply [_ value] (inner-fn value)))))
+
+(defn path-prefix-var
+  "Match one path segment, bind it as a string, and continue matching the rest
+   of the path inside inner-fn's Route.
+
+   (path-prefix-var (fn [id] (path \"posts\" (complete (str id \"'s posts\")))))"
+  [inner-fn]
   (.pathPrefix directives
-               ^String prefix
-               (reify Supplier
-                 (get [_] inner-route))))
+               (PathMatchers/segment)
+               (reify Function
+                 (apply [_ value] (inner-fn value)))))
 
 (defn path-end
   "Match only if at the end of the path."
@@ -385,106 +440,86 @@
 ;; Compojure-style Macros
 ;; ---------------------------------------------------------------------------
 
+(defn- path-pattern-form
+  "Expand a Compojure-style path pattern (\"/users/:id\") into a nested chain of
+   path directives ending in `terminal`.
+
+   Every segment consumes from the *unmatched* path — static segments through
+   `path-prefix`/`path`, `:param` segments through `path-prefix-var`/`path-var`
+   — so a macro route composes under an enclosing `path-prefix` and requires the
+   path to end where the pattern does. `terminal` is called with the collected
+   [param-keyword binding-symbol] pairs and returns the innermost form."
+  [pattern terminal]
+  (let [segments (pattern->segments pattern)
+        last-idx (dec (count segments))]
+    (letfn [(step [i params]
+              (let [segment (nth segments i)
+                    last? (= i last-idx)]
+                (if (str/starts-with? segment ":")
+                  (let [sym (gensym "path-segment-")
+                        params (conj params [(keyword (subs segment 1)) sym])]
+                    `(~(if last? `path-var `path-prefix-var)
+                      (fn [~sym]
+                        ~(if last? (terminal params) (step (inc i) params)))))
+                  `(~(if last? `path `path-prefix)
+                    ~segment
+                    ~(if last? (terminal params) (step (inc i) params))))))]
+      (if (empty? segments)
+        `(path-end ~(terminal []))
+        (step 0 [])))))
+
+(defn- method-route-form
+  "The body of a Compojure-style macro: match the pattern, then the method, then
+   run `body` with the pattern's `:param` segments bound via `bindings`."
+  [method-fn pattern bindings body]
+  (path-pattern-form
+   pattern
+   (fn [params]
+     `(~method-fn
+       (let [{:keys ~bindings} ~(into {} params)]
+         ~@body)))))
+
 (defmacro GET
   "Define a GET route with path matching.
 
+   The pattern is split on \"/\" (a leading slash is optional); `:name` segments
+   are captured and bound by name through `bindings`, which destructures like
+   `{:keys …}`:
+
    (GET \"/users\" []
-     (complete :ok (json users)))
+     (complete-json users))
 
    (GET \"/users/:id\" [id]
-     (complete :ok (json (get-user id))))"
+     (complete-json (get-user id)))
+
+   Only the pattern's own segments are consumed, so the route nests:
+
+   (path-prefix \"api\" (GET \"users/:id\" [id] …))   ;; GET /api/users/42"
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
-    ;; Path with parameters - use extract-request
-    `(method-get
-       (extract-request
-        (fn [req#]
-          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-            (if params#
-              (let [{:keys ~bindings} params#]
-                ~@body)
-              (reject))))))
-    ;; Simple path
-    `(path ~path-pattern
-       (method-get
-         (path-end
-           (let ~bindings
-             ~@body))))))
+  (method-route-form `method-get path-pattern bindings body))
 
 (defmacro POST
-  "Define a POST route with path matching.
+  "Define a POST route with path matching (see `GET` for the pattern rules).
 
    (POST \"/users\" []
-     (complete :created (json new-user)))"
+     (with-json-body #(complete-json :created (create! %))))"
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
-    `(method-post
-       (extract-request
-        (fn [req#]
-          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-            (if params#
-              (let [{:keys ~bindings} params#]
-                ~@body)
-              (reject))))))
-    `(path ~path-pattern
-       (method-post
-         (path-end
-           (let ~bindings
-             ~@body))))))
+  (method-route-form `method-post path-pattern bindings body))
 
 (defmacro PUT
-  "Define a PUT route with path matching."
+  "Define a PUT route with path matching (see `GET` for the pattern rules)."
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
-    `(method-put
-       (extract-request
-        (fn [req#]
-          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-            (if params#
-              (let [{:keys ~bindings} params#]
-                ~@body)
-              (reject))))))
-    `(path ~path-pattern
-       (method-put
-         (path-end
-           (let ~bindings
-             ~@body))))))
+  (method-route-form `method-put path-pattern bindings body))
 
 (defmacro DELETE
-  "Define a DELETE route with path matching."
+  "Define a DELETE route with path matching (see `GET` for the pattern rules)."
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
-    `(method-delete
-       (extract-request
-        (fn [req#]
-          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-            (if params#
-              (let [{:keys ~bindings} params#]
-                ~@body)
-              (reject))))))
-    `(path ~path-pattern
-       (method-delete
-         (path-end
-           (let ~bindings
-             ~@body))))))
+  (method-route-form `method-delete path-pattern bindings body))
 
 (defmacro PATCH
-  "Define a PATCH route with path matching."
+  "Define a PATCH route with path matching (see `GET` for the pattern rules)."
   [path-pattern bindings & body]
-  (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
-    `(method-patch
-       (extract-request
-        (fn [req#]
-          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-            (if params#
-              (let [{:keys ~bindings} params#]
-                ~@body)
-              (reject))))))
-    `(path ~path-pattern
-       (method-patch
-         (path-end
-           (let ~bindings
-             ~@body))))))
+  (method-route-form `method-patch path-pattern bindings body))
 
 ;; ---------------------------------------------------------------------------
 ;; Utility Functions

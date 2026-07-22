@@ -38,7 +38,7 @@ commit `7e59e55`.
 
 | ID | Title | Milestone | Status | Deps | Risk |
 |----|-------|-----------|--------|------|------|
-| B11 | Fix HTTP route macros: static paths never match | Bugs | TODO | — | medium |
+| B11 | Fix HTTP route macros: static paths never match | Bugs | DONE | — | medium |
 | B12 | Make `persist-all` atomic (journal `persistAll`) | Bugs | TODO | — | medium |
 | B13 | Snapshot cadence survives recovery | Bugs | DONE | — | low |
 | B14 | Make the sharding envelope Transit-serializable | Bugs | TODO | — | medium |
@@ -71,7 +71,27 @@ commit `7e59e55`.
 
 ## Milestone B — Correctness bugs
 
-### B11 · Fix HTTP route macros: static paths never match — `TODO`
+### B11 · Fix HTTP route macros: static paths never match — `DONE`
+**Note (2026-07-22):** fixed as scoped — the five macros now compile the pattern
+into a chain of path directives (static segment → `path-prefix`, `:param` →
+`path-prefix-var`, last segment → `path`/`path-var`), all of which consume from
+the *unmatched* path, so static paths match, params bind by name, and both nest
+under `path-prefix`. The method directive moved inside the path chain, so a
+matching path with the wrong method is now a 405 instead of a 404. `path` /
+`path-prefix` themselves were rewritten to split on `/` and tolerate a leading
+slash (`"/api/v1"`, `"api/v1"`, `"users"` all work) — that is what made the
+documented `(path "/users" …)` form dead. Pre-empted N15's first bullet: the
+segment capture is public as **`path-var` / `path-prefix-var`** (see N15).
+Added a clj-kondo hook (`hooks/pekko_clj/routing.clj`, wired in the export's
+`config.edn`) so `[id]` bindings resolve in user code, plus cljfmt indents for
+the two new directives. Tests (`http/integration_test.clj`, real server):
+`macro-static-path-test`, `macro-param-path-test`,
+`macro-nests-under-path-prefix-test`, `macro-path-must-end-test`,
+`path-var-directives-test`, `multi-segment-path-directive-test` — verified 4
+assertions across the static/nested tests fail against the old macros before the
+fix. `doc/06-http.md` updated (path-pattern rules, nesting, `path-var`, and the
+`Await/result` → `stream/await-completion` note); no `docs/specs/*` checklist
+covers HTTP routing (`routing-parity-spec.md` is about *router* strategies).
 **Deps:** none. **VERIFIED live** (2026-07-22): a real server bound with
 `(routing/GET "/users" [] (routing/complete "users list"))` answers **404** for
 `GET /users`; the `:param` form (`(GET "/user/:id" [id] …)` → 200) works; neither
@@ -442,10 +462,10 @@ input-stream source.
 
 ### N15 · HTTP routing completion: segment capture, static content, auth — `TODO`
 **Deps:** B11.
-- **`path-var`** — the idiomatic directive B11's macros will want: extract one path
-  segment as a value (`(path-var (fn [id] …))`, javadsl
-  `path(segment(), fn)`-equivalent), plus `path-prefix-var`. Today the only capture
-  mechanism is the macro pattern-match hack.
+- ~~**`path-var`** — extract one path segment as a value, plus
+  `path-prefix-var`.~~ **Done in B11** (2026-07-22): both are public in
+  `pekko-clj.http.routing`, built on `PathMatchers/segment`, and are what the
+  route macros expand to.
 - **Static content:** `getFromResource`/`getFromDirectory` wrappers
   (`from-resource`, `from-directory`) with content-type detection.
 - **Auth:** `authenticateBasic` wrapper (`basic-auth` taking a

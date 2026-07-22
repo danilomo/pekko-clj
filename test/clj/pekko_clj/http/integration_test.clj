@@ -238,6 +238,138 @@
   (-> (client/response-body response *system*)
       (client/await-response 5000)))
 
+;; ---------------------------------------------------------------------------
+;; Compojure-style macros (B11)
+;;
+;; The static-path branch used to expand to (path "/users" …), but javadsl's
+;; path(String) matches a *single segment* — a string with a leading slash can
+;; never match, so every static macro route answered 404. The :param branch
+;; matched the *full* request path, so it ignored any enclosing path-prefix.
+;; Both are end-to-end failures the old "the route object is non-nil" unit
+;; tests could not see.
+;; ---------------------------------------------------------------------------
+
+(deftest macro-static-path-test
+  (testing "a static macro path matches, with or without the leading slash"
+    (let [routes (routing/routes
+                   (routing/GET "/users" []
+                     (routing/complete "users list"))
+                   (routing/GET "posts" []
+                     (routing/complete "posts list")))]
+      (with-test-server routes
+        (fn []
+          (let [response (-> (client/GET *system* (url "/users")) (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (= "users list" (get-body response))))
+          (let [response (-> (client/GET *system* (url "/posts")) (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (= "posts list" (get-body response)))))))))
+
+(deftest macro-param-path-test
+  (testing "a :param segment binds by name; multiple params bind in order"
+    (let [routes (routing/routes
+                   (routing/GET "/users/:id" [id]
+                     (routing/complete (str "user " id)))
+                   (routing/GET "/users/:id/posts/:post-id" [id post-id]
+                     (routing/complete (str "user " id " post " post-id)))
+                   (routing/POST "/users/:id" [id]
+                     (routing/complete :created (str "created " id))))]
+      (with-test-server routes
+        (fn []
+          (is (= "user 42" (-> (client/GET *system* (url "/users/42"))
+                               (client/await-response 5000)
+                               get-body)))
+          (is (= "user 42 post 7" (-> (client/GET *system* (url "/users/42/posts/7"))
+                                      (client/await-response 5000)
+                                      get-body)))
+          (let [response (-> (client/POST *system* (url "/users/9")) (client/await-response 5000))]
+            (is (= 201 (client/response-status response)))
+            (is (= "created 9" (get-body response)))))))))
+
+(deftest macro-nests-under-path-prefix-test
+  (testing "macro routes consume only their own segments, so they nest"
+    (let [routes (routing/path-prefix "api"
+                   (routing/path-prefix "v1"
+                     (routing/routes
+                       (routing/GET "/users" []
+                         (routing/complete "v1 users"))
+                       (routing/GET "/users/:id" [id]
+                         (routing/complete (str "v1 user " id))))))]
+      (with-test-server routes
+        (fn []
+          (is (= "v1 users" (-> (client/GET *system* (url "/api/v1/users"))
+                                (client/await-response 5000)
+                                get-body)))
+          (is (= "v1 user 3" (-> (client/GET *system* (url "/api/v1/users/3"))
+                                 (client/await-response 5000)
+                                 get-body)))
+          ;; The prefix is not optional, and the pattern is not a prefix match
+          (is (= 404 (-> (client/GET *system* (url "/users"))
+                         (client/await-response 5000)
+                         client/response-status))))))))
+
+(deftest path-var-directives-test
+  (testing "path-var / path-prefix-var capture a segment for hand-built routes"
+    (let [routes (routing/path-prefix "users"
+                   (routing/routes
+                     (routing/path-prefix-var
+                       (fn [id]
+                         (routing/path "posts"
+                           (routing/method-get
+                             (routing/complete (str "posts of " id))))))
+                     (routing/path-var
+                       (fn [id]
+                         (routing/method-get
+                           (routing/complete (str "user " id)))))))]
+      (with-test-server routes
+        (fn []
+          (is (= "user 5" (-> (client/GET *system* (url "/users/5"))
+                              (client/await-response 5000)
+                              get-body)))
+          (is (= "posts of 5" (-> (client/GET *system* (url "/users/5/posts"))
+                                  (client/await-response 5000)
+                                  get-body))))))))
+
+(deftest multi-segment-path-directive-test
+  (testing "path / path-prefix take several segments and tolerate a leading slash"
+    (let [routes (routing/routes
+                   (routing/path "/api/health"
+                     (routing/method-get (routing/complete "ok")))
+                   (routing/path-prefix "/api/v2"
+                     (routing/path "users"
+                       (routing/method-get (routing/complete "v2 users")))))]
+      (with-test-server routes
+        (fn []
+          (is (= "ok" (-> (client/GET *system* (url "/api/health"))
+                          (client/await-response 5000)
+                          get-body)))
+          (is (= "v2 users" (-> (client/GET *system* (url "/api/v2/users"))
+                                (client/await-response 5000)
+                                get-body))))))))
+
+(deftest macro-path-must-end-test
+  (testing "a longer path than the pattern is a miss, not a prefix match"
+    (let [routes (routing/routes
+                   (routing/GET "/users" []
+                     (routing/complete "users list"))
+                   (routing/GET "/users/:id" [id]
+                     (routing/complete (str "user " id))))]
+      (with-test-server routes
+        (fn []
+          (is (= 404 (-> (client/GET *system* (url "/users/42/extra"))
+                         (client/await-response 5000)
+                         client/response-status))
+              "trailing segments beyond the pattern do not match")
+          (is (= 404 (-> (client/GET *system* (url "/usersx"))
+                         (client/await-response 5000)
+                         client/response-status))
+              "segments match whole, not by prefix")
+          ;; A matching path with the wrong method is a MethodRejection (405),
+          ;; which only works because the path directive is the outer one.
+          (is (= 405 (-> (client/DELETE *system* (url "/users"))
+                         (client/await-response 5000)
+                         client/response-status))))))))
+
 (deftest json-body-round-trip-test
   (testing "with-json-body parses the request, complete-json encodes the response"
     (let [received (atom nil)

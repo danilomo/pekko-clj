@@ -77,7 +77,10 @@ them. Those hooks live in `resources/clj-kondo.exports/pekko-clj/pekko-clj/` (no
 `.clj-kondo/`) so they ship in the jar and downstream projects using `defactor` lint
 cleanly too; `.clj-kondo/config.edn` consumes that same export via `:config-paths`.
 **If you add or rename a clause in either macro, update the hook alongside it** —
-otherwise every use of the new clause reports as an unresolved symbol.
+otherwise every use of the new clause reports as an unresolved symbol. The same
+directory holds `hooks/pekko_clj/routing.clj`, which scopes the `[id]` binding
+vector of the HTTP route macros (`GET`/`POST`/`PUT`/`DELETE`/`PATCH`) over their
+bodies.
 
 Likewise, the `defactor` clauses and the routing DSL are body forms, not function
 calls; `:cljfmt {:extra-indents ...}` in `project.clj` encodes that. New DSL forms

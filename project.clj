@@ -88,6 +88,8 @@
                            pekko-clj.http.routing/routes             [[:block 0]]
                            pekko-clj.http.routing/path               [[:block 1]]
                            pekko-clj.http.routing/path-prefix        [[:block 1]]
+                           pekko-clj.http.routing/path-var           [[:block 0]]
+                           pekko-clj.http.routing/path-prefix-var    [[:block 0]]
                            pekko-clj.http.routing/path-end           [[:block 0]]
                            pekko-clj.http.routing/method-get         [[:block 0]]
                            pekko-clj.http.routing/method-post        [[:block 0]]

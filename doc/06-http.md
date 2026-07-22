@@ -36,9 +36,42 @@ To launch a server, we define a route and then bind a server port using `pekko-c
 ;; 2. Bind the server async
 (def binding-future (http/bind-server sys "localhost" 8080 my-routes))
 
-;; Note: You can retrieve port/address info
-;; (let [binding (Await/result binding-future ...)]
+;; Note: bind-server returns a java.util.concurrent.CompletionStage<ServerBinding>;
+;; `stream/await-completion` blocks for it with a millisecond timeout.
+;; (let [binding (stream/await-completion binding-future 5000)]
 ;;   (println "Server online at:" (http/local-address binding)))
+```
+
+### Path patterns
+
+The pattern is split on `/` — the leading slash is optional, so `"/users"` and
+`"users"` are the same route. Each segment is matched against the *unmatched*
+part of the request path and the route only matches if the path ends where the
+pattern does (`/users/42/extra` does not match `"/users/:id"`). Because the
+macros consume only their own segments, they nest inside `path-prefix`:
+
+```clojure
+(r/path-prefix "api"
+  (r/path-prefix "v1"
+    (routes
+      (GET "users" []          (complete :ok "all users"))
+      (GET "users/:id" [id]    (complete :ok (str "user " id)))
+      ;; several params bind by name, in any order in the vector
+      (GET "users/:id/posts/:post-id" [post-id id]
+        (complete :ok (str "user " id ", post " post-id))))))
+```
+
+A request with a matching path but the wrong method gets a `405`, not a `404`.
+
+For hand-built routes, the same capture is available as a directive —
+`path-var` (last segment) and `path-prefix-var` (keep matching afterwards):
+
+```clojure
+(r/path-prefix "users"
+  (r/path-prefix-var
+    (fn [id]
+      (r/path "posts"
+        (r/method-get (complete :ok (str "posts of " id)))))))
 ```
 
 ## Extracting Request Information
