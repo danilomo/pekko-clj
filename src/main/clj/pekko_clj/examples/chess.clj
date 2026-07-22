@@ -1,5 +1,5 @@
 (ns pekko-clj.examples.chess
-  (:require [pekko-clj.core :refer :all]))
+  (:require [pekko-clj.core :refer [! actor-system defactor parent sender spawn]]))
 
 ;; --- Player actor ---
 

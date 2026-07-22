@@ -1,12 +1,12 @@
 (ns pekko-clj.stream-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
+            [clojure.string :as str]
             [pekko-clj.core :as core]
             [pekko-clj.stream :as s]
             [pekko-clj.test-support :refer [eventually]])
-  (:import [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.stream Materializer Attributes RestartSettings UniqueKillSwitch]
+  (:import [org.apache.pekko.stream Attributes RestartSettings UniqueKillSwitch]
            [org.apache.pekko.stream.javadsl RunnableGraph SinkQueueWithCancel
-                                            SourceQueueWithComplete]
+            SourceQueueWithComplete]
            [org.apache.pekko.pattern StatusReply]
            [org.apache.pekko Done NotUsed]
            [scala.concurrent Await]
@@ -72,8 +72,8 @@
 
 (deftest source-unfold-generates-sequence
   (let [result (-> (s/source-unfold 0 (fn [n]
-                                         (when (< n 5)
-                                           [(inc n) n])))
+                                        (when (< n 5)
+                                          [(inc n) n])))
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= [0 1 2 3 4] (vec result)))))
@@ -232,7 +232,7 @@
 (deftest chained-transformations
   (let [result (-> (s/source ["hello" "world" "foo" "bar"])
                    (s/sfilter #(> (count %) 3))
-                   (s/smap clojure.string/upper-case)
+                   (s/smap str/upper-case)
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= ["HELLO" "WORLD"] (vec result)))))
@@ -245,7 +245,7 @@
   (let [received (atom [])
         actor (core/new-actor
                *system*
-               {:function (fn [this msg]
+               {:function (fn [_this msg]
                             (when (not= msg :done)
                               (swap! received conj msg))
                             nil)
@@ -281,8 +281,8 @@
 
 (deftest await-completion-timeout
   (let [slow-stream (-> (s/source-tick (java.time.Duration/ofSeconds 10)
-                                        (java.time.Duration/ofSeconds 10)
-                                        :tick)
+                                       (java.time.Duration/ofSeconds 10)
+                                       :tick)
                         (s/take 1))]
     ;; H5: await-completion returns nil on the block timeout (matches core/<!).
     (is (nil? (-> slow-stream
@@ -416,8 +416,8 @@
 
 (deftest take-within-limits-by-time
   (let [result (-> (s/source-tick (java.time.Duration/ofMillis 10)
-                                   (java.time.Duration/ofMillis 50)
-                                   :tick)
+                                  (java.time.Duration/ofMillis 50)
+                                  :tick)
                    (s/take-within (java.time.Duration/ofMillis 200))
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
@@ -435,8 +435,8 @@
 
 (deftest keep-alive-injects-elements
   (let [result (-> (s/source-tick (java.time.Duration/ofMillis 200)
-                                   (java.time.Duration/ofMillis 200)
-                                   :data)
+                                  (java.time.Duration/ofMillis 200)
+                                  :data)
                    (s/keep-alive (java.time.Duration/ofMillis 50)
                                  (fn [] :heartbeat))
                    (s/take 3)
@@ -672,7 +672,7 @@
   (is (every? some? [(s/keep-mat :left) (s/keep-mat :right)
                      (s/keep-mat :both) (s/keep-mat :none)]))
   (is (thrown-with-msg? IllegalArgumentException #"Unknown Keep combiner"
-                        (s/keep-mat :sideways))))
+        (s/keep-mat :sideways))))
 
 (deftest to-mat-builds-runnable-graph
   (let [graph (-> (s/source [1 2 3])
@@ -757,18 +757,18 @@
 
 (deftest with-supervision-stop-fails-stream
   (is (thrown? ArithmeticException
-               (-> (s/source [1 0 2])
-                   (s/smap #(/ 10 %))
-                   (s/with-supervision (fn [_] :stop))
-                   (s/run-to-seq *mat*)
-                   (s/await-completion 3000))))
+        (-> (s/source [1 0 2])
+            (s/smap #(/ 10 %))
+            (s/with-supervision (fn [_] :stop))
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000))))
   ;; nil from the decider means :stop, matching Pekko's default.
   (is (thrown? ArithmeticException
-               (-> (s/source [1 0 2])
-                   (s/smap #(/ 10 %))
-                   (s/with-supervision (fn [_] nil))
-                   (s/run-to-seq *mat*)
-                   (s/await-completion 3000)))))
+        (-> (s/source [1 0 2])
+            (s/smap #(/ 10 %))
+            (s/with-supervision (fn [_] nil))
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000)))))
 
 (deftest with-supervision-restart-resets-stage-state
   ;; scan carries state across elements, so it distinguishes :resume from :restart:
@@ -792,11 +792,11 @@
 
 (deftest supervision-rejects-unknown-directive
   (is (thrown-with-msg? IllegalArgumentException #"Unknown supervision directive"
-                        (-> (s/source [0])
-                            (s/smap #(/ 10 %))
-                            (s/with-supervision (fn [_] :sideways))
-                            (s/run-to-seq *mat*)
-                            (s/await-completion 3000)))))
+        (-> (s/source [0])
+            (s/smap #(/ 10 %))
+            (s/with-supervision (fn [_] :sideways))
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000)))))
 
 ;; ---------------------------------------------------------------------------
 ;; N1: Restart / retry with backoff
@@ -840,22 +840,22 @@
 (deftest restart-source-on-failures-gives-up-after-max-restarts
   (let [attempts (atom 0)]
     (is (thrown? Exception
-                 (-> (s/restart-source-on-failures
-                      {:min-backoff 10 :max-backoff 20 :max-restarts 2 :max-restarts-within 5000}
-                      (fn [] (swap! attempts inc) (s/source-failed (RuntimeException. "always"))))
-                     (s/run-to-seq *mat*)
-                     (s/await-completion 10000))))
+          (-> (s/restart-source-on-failures
+               {:min-backoff 10 :max-backoff 20 :max-restarts 2 :max-restarts-within 5000}
+               (fn [] (swap! attempts inc) (s/source-failed (RuntimeException. "always"))))
+              (s/run-to-seq *mat*)
+              (s/await-completion 10000))))
     (is (= 3 @attempts) "the initial attempt plus :max-restarts restarts")))
 
 (deftest restart-settings-restart-on-predicate
   ;; :restart-on false => the failure is not restarted, it fails the stream.
   (let [attempts (atom 0)]
     (is (thrown? Exception
-                 (-> (s/restart-source-on-failures
-                      {:min-backoff 10 :max-backoff 20 :restart-on (fn [_] false)}
-                      (fn [] (swap! attempts inc) (s/source-failed (RuntimeException. "nope"))))
-                     (s/run-to-seq *mat*)
-                     (s/await-completion 5000))))
+          (-> (s/restart-source-on-failures
+               {:min-backoff 10 :max-backoff 20 :restart-on (fn [_] false)}
+               (fn [] (swap! attempts inc) (s/source-failed (RuntimeException. "nope"))))
+              (s/run-to-seq *mat*)
+              (s/await-completion 5000))))
     (is (= 1 @attempts) "never restarted")))
 
 (deftest restart-flow-passes-elements-through
@@ -980,10 +980,10 @@
 (deftest ask-with-status-error-fails-stream
   (let [a (core/spawn *system* n1-status-worker nil)]
     (is (thrown-with-msg? Throwable #"nope"
-                          (-> (s/source [[:err 1]])
-                              (s/ask-with-status a 3000)
-                              (s/run-to-seq *mat*)
-                              (s/await-completion 5000))))))
+          (-> (s/source [[:err 1]])
+              (s/ask-with-status a 3000)
+              (s/run-to-seq *mat*)
+              (s/await-completion 5000))))))
 
 (deftest ask-with-status-parallelism-arity
   (let [a (core/spawn *system* n1-status-worker nil)

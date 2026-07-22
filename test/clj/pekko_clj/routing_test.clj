@@ -1,9 +1,9 @@
 (ns pekko-clj.routing-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.routing :as routing]
             [pekko-clj.test-support :refer [eventually]])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
+  (:import [org.apache.pekko.actor ActorRef]
            [org.apache.pekko.routing Routees]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -109,7 +109,7 @@
 (deftest pool-with-args
   (reset! process-log [])
   (let [pool (routing/spawn-pool *system* logging-worker 2
-                                  {:strategy :round-robin :args {:id 999}})]
+                                 {:strategy :round-robin :args {:id 999}})]
     ;; All workers should have the same ID from args
     (core/! pool [:process :test])
     (core/! pool [:process :test])
@@ -204,7 +204,7 @@
 (deftest consistent-hashing-pool-routes-same-key-to-same-routee
   (reset! hash-log {})
   (let [pool (routing/spawn-consistent-hash-pool *system* hash-tracking-worker 5
-               {:hash-fn (fn [[_ key _]] (str key))})]  ; Convert to string for serialization
+                                                 {:hash-fn (fn [[_ key _]] (str key))})]  ; Convert to string for serialization
     ;; Send messages with same key - should go to same routee
     (dotimes [i 5]
       (core/! pool [:hash-msg "user-123" i]))
@@ -227,7 +227,7 @@
         w3 (core/spawn *system* hash-tracking-worker {:id 3})
         paths [(str (.path w1)) (str (.path w2)) (str (.path w3))]
         group (routing/spawn-consistent-hash-group *system* paths
-                {:hash-fn (fn [[_ key _]] (str key))})]  ; Convert to string for serialization
+                                                   {:hash-fn (fn [[_ key _]] (str key))})]  ; Convert to string for serialization
     ;; Send messages with same key
     (dotimes [i 5]
       (core/! group [:hash-msg "session-abc" i]))
@@ -250,11 +250,11 @@
 
 (deftest scatter-gather-pool-returns-first-response
   (let [pool (routing/spawn-scatter-gather-pool *system* delayed-echo-worker 3
-               {:timeout-ms 5000
-                :args {:delay-ms 0}})]
-    ;; Should get response from first responder
-    (let [result (await-ask pool [:delayed-echo :test-msg])]
-      (is (= :test-msg result)))))
+                                                {:timeout-ms 5000
+                                                 :args {:delay-ms 0}})
+        ;; Should get response from first responder
+        result (await-ask pool [:delayed-echo :test-msg])]
+    (is (= :test-msg result))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Tail-Chopping Pool
@@ -262,8 +262,8 @@
 
 (deftest tail-chopping-pool-returns-response
   (let [pool (routing/spawn-tail-chopping-pool *system* echo-worker 3
-               {:timeout-ms 5000
-                :interval-ms 100})]
+                                               {:timeout-ms 5000
+                                                :interval-ms 100})]
     ;; Should get response
     (is (= :pong (await-ask pool :ping)))))
 
@@ -273,9 +273,9 @@
 
 (deftest pool-with-resizer-starts
   (let [pool (routing/spawn-pool-with-resizer *system* echo-worker
-               {:min-size 2
-                :max-size 5
-                :strategy :round-robin})]
+                                              {:min-size 2
+                                               :max-size 5
+                                               :strategy :round-robin})]
     ;; Pool should respond
     (is (= :pong (await-ask pool :ping)))
     ;; Should have at least min-size routees

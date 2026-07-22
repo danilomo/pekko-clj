@@ -1,5 +1,5 @@
 (ns pekko-clj.circuit-breaker-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.circuit-breaker :as cb]
             [pekko-clj.test-support :as ts :refer [eventually]])
@@ -30,7 +30,7 @@
         ;; Having hit max-failures, the breaker trips open and fails fast.
         (is (eventually (cb/open? b)))
         (is (thrown? CircuitBreakerOpenException
-                     (cb/call b (fn [] :never-runs)))))
+              (cb/call b (fn [] :never-runs)))))
       (finally (core/shutdown-system sys)))))
 
 (deftest circuit-breaker-async-test

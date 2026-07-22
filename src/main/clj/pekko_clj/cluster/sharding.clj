@@ -38,17 +38,17 @@
    `passivation-settings`) or on request (`passivate`). For always-on workers that
    are not addressed by entity id, see `pekko-clj.cluster.daemon`."
   (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef Props]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.cluster.sharding ClusterSharding ClusterShardingSettings
-                                              ClusterShardingSettings$PassivationStrategySettings
-                                              ClusterShardingSettings$PassivationStrategySettings$LeastRecentlyUsedSettings
-                                              ClusterShardingSettings$PassivationStrategySettings$LeastFrequentlyUsedSettings
-                                              ShardRegion$MessageExtractor
-                                              ShardRegion$HashCodeMessageExtractor
-                                              ShardRegion$Passivate
-                                              ShardRegion$GetClusterShardingStats
-                                              ShardRegion$ClusterShardingStats
-                                              ShardRegion$ShardRegionStats]
+            ClusterShardingSettings$PassivationStrategySettings
+            ClusterShardingSettings$PassivationStrategySettings$LeastRecentlyUsedSettings
+            ClusterShardingSettings$PassivationStrategySettings$LeastFrequentlyUsedSettings
+            ShardRegion$MessageExtractor
+            ShardRegion$HashCodeMessageExtractor
+            ShardRegion$Passivate
+            ShardRegion$GetClusterShardingStats
+            ShardRegion$ClusterShardingStats
+            ShardRegion$ShardRegionStats]
            [pekko_clj.actor CljActor]
            [com.typesafe.config Config ConfigFactory]
            [java.time Duration]
@@ -114,7 +114,7 @@
       (nil? segmented) base
       (number? segmented) (.withSegmented base (int segmented))
       (sequential? segmented) (.withSegmentedProportions base (java.util.ArrayList. ^java.util.Collection
-                                                                                    (mapv double segmented)))
+                                                               (mapv double segmented)))
       :else (throw (IllegalArgumentException.
                     (str ":segmented must be a number of levels or a sequence of "
                          "proportions, got " (class segmented)))))))
@@ -259,15 +259,15 @@
         ;; and passed via the message extractor
         props (CljActor/create ((:make-props actor-def) nil))
         settings (sharding-settings system opts)
-        extractor (create-message-extractor num-shards)
+        ^ShardRegion$MessageExtractor extractor (create-message-extractor num-shards)
         sharding (ClusterSharding/get system)]
     ;; Start the shard region with Props and MessageExtractor. A hand-off stop
     ;; message requires the overload that also takes an allocation strategy.
     (if (some? stop-message)
-      (.start sharding type-name props settings extractor
+      (.start sharding ^String type-name props settings extractor
               (.defaultShardAllocationStrategy sharding settings)
               stop-message)
-      (.start sharding type-name props settings extractor))))
+      (.start sharding ^String type-name props settings extractor))))
 
 (defn start-proxy
   "Start a proxy-only shard region.
@@ -415,7 +415,7 @@
    (cluster-sharding-stats system type-name core/*timeout*))
   ([system type-name timeout-ms]
    (let [shard-region (get-shard-region system type-name)
-         timeout (FiniteDuration/create timeout-ms TimeUnit/MILLISECONDS)
+         timeout (FiniteDuration/create (long timeout-ms) TimeUnit/MILLISECONDS)
          msg (ShardRegion$GetClusterShardingStats. timeout)]
      (core/<?> shard-region msg timeout-ms))))
 
@@ -429,12 +429,12 @@
   (let [regions (.getRegions stats)]
     {:regions
      (into {}
-       (for [entry (seq regions)]
-         (let [addr (key entry)
-               shard-stats ^ShardRegion$ShardRegionStats (val entry)]
-           [addr (into {}
-                   (for [shard-entry (seq (.getStats shard-stats))]
-                     [(key shard-entry) (val shard-entry)]))])))}))
+           (for [entry (seq regions)]
+             (let [addr (key entry)
+                   shard-stats ^ShardRegion$ShardRegionStats (val entry)]
+               [addr (into {}
+                           (for [shard-entry (seq (.getStats shard-stats))]
+                             [(key shard-entry) (val shard-entry)]))])))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Entity Passivation

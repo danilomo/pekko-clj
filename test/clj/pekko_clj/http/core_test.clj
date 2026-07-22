@@ -1,7 +1,7 @@
 (ns pekko-clj.http.core-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [pekko-clj.http.core :as http])
-  (:import [org.apache.pekko.http.javadsl.model HttpRequest HttpMethods]))
+  (:import [org.apache.pekko.http.javadsl.model HttpRequest]))
 
 ;; ---------------------------------------------------------------------------
 ;; Path Matching Tests

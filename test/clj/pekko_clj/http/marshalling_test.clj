@@ -1,6 +1,6 @@
 (ns pekko-clj.http.marshalling-test
   "Tests for N7's JSON/EDN marshalling layer and the entity builders on top of it."
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.http.marshalling :as marshal]
             [pekko-clj.http.response :as resp])
   (:import [org.apache.pekko.http.javadsl.model ContentType ContentTypes]))

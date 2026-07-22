@@ -27,10 +27,9 @@
                       :min-backoff-ms 1000
                       :max-backoff-ms 30000}})"
   (:refer-clojure :exclude [proxy])
-  (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef ExtendedActorSystem]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef ExtendedActorSystem Props]
            [org.apache.pekko.cluster.singleton ClusterSingletonManager ClusterSingletonManagerSettings
-                                               ClusterSingletonProxy ClusterSingletonProxySettings]
+            ClusterSingletonProxy ClusterSingletonProxySettings]
            [org.apache.pekko.pattern BackoffSupervisor BackoffOpts]
            [pekko_clj.actor CljActor]
            [java.time Duration]
@@ -43,7 +42,7 @@
 
 (defn- wrap-with-supervision
   "Wrap actor Props with backoff supervision if configured."
-  [props supervision]
+  ^Props [^Props props supervision]
   (if supervision
     (let [{:keys [strategy min-backoff-ms max-backoff-ms random-factor]
            :or {min-backoff-ms 3000
@@ -52,20 +51,20 @@
       (case strategy
         :restart-with-backoff
         (let [backoff-opts (BackoffOpts/onFailure
-                             props
-                             "singleton"
-                             (Duration/ofMillis min-backoff-ms)
-                             (Duration/ofMillis max-backoff-ms)
-                             random-factor)]
+                            props
+                            "singleton"
+                            (Duration/ofMillis (long min-backoff-ms))
+                            (Duration/ofMillis (long max-backoff-ms))
+                            (double random-factor))]
           (BackoffSupervisor/props backoff-opts))
 
         :restart-with-stop
         (let [backoff-opts (BackoffOpts/onStop
-                             props
-                             "singleton"
-                             (Duration/ofMillis min-backoff-ms)
-                             (Duration/ofMillis max-backoff-ms)
-                             random-factor)]
+                            props
+                            "singleton"
+                            (Duration/ofMillis (long min-backoff-ms))
+                            (Duration/ofMillis (long max-backoff-ms))
+                            (double random-factor))]
           (BackoffSupervisor/props backoff-opts))
 
         ;; Default: no supervision wrapper
@@ -112,11 +111,16 @@
          :or {termination-message :stop}} opts
         base-props (CljActor/create ((:make-props actor-def) args))
         props (wrap-with-supervision base-props supervision)
-        settings (cond-> (ClusterSingletonManagerSettings/create system)
-                   role (.withRole role)
-                   hand-over-retry-interval
-                   (.withHandOverRetryInterval
-                     (FiniteDuration/apply hand-over-retry-interval TimeUnit/MILLISECONDS)))
+        ^ClusterSingletonManagerSettings settings
+        (ClusterSingletonManagerSettings/create system)
+        ^ClusterSingletonManagerSettings settings
+        (if role (.withRole settings ^String role) settings)
+        ^ClusterSingletonManagerSettings settings
+        (if hand-over-retry-interval
+          (.withHandOverRetryInterval
+           settings
+           (FiniteDuration/apply (long hand-over-retry-interval) TimeUnit/MILLISECONDS))
+          settings)
         manager-props (ClusterSingletonManager/props props termination-message settings)]
     (.actorOf system manager-props name)))
 
@@ -149,12 +153,18 @@
   [^ActorSystem system opts]
   (let [{:keys [singleton-manager-path role buffer-size identification-interval-ms]
          :or {buffer-size 1000}} opts
-        settings (cond-> (ClusterSingletonProxySettings/create system)
-                   role (.withRole role)
-                   buffer-size (.withBufferSize (int buffer-size))
-                   identification-interval-ms
-                   (.withSingletonIdentificationInterval
-                     (FiniteDuration/apply identification-interval-ms TimeUnit/MILLISECONDS)))
+        ^ClusterSingletonProxySettings settings
+        (ClusterSingletonProxySettings/create system)
+        ^ClusterSingletonProxySettings settings
+        (if role (.withRole settings ^String role) settings)
+        ^ClusterSingletonProxySettings settings
+        (if buffer-size (.withBufferSize settings (int buffer-size)) settings)
+        ^ClusterSingletonProxySettings settings
+        (if identification-interval-ms
+          (.withSingletonIdentificationInterval
+           settings
+           (FiniteDuration/apply (long identification-interval-ms) TimeUnit/MILLISECONDS))
+          settings)
         ;; ClusterSingletonProxy wants the MANAGER path; it locates the singleton
         ;; child itself via settings.singletonName (default "singleton"). Do NOT
         ;; append "/singleton" here, or the proxy looks under the wrong path and

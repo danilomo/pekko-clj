@@ -1,5 +1,5 @@
 (ns pekko-clj.event-stream-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.event-stream :as es]
             [pekko-clj.test-support :as ts :refer [eventually]])
@@ -12,7 +12,7 @@
 
 (core/defactor noop
   (init [_] {})
-  (handle msg state))
+  (handle _msg state))
 
 (deftest subscribe-and-publish-test
   (let [sys (core/actor-system "es-pub")]

@@ -1,5 +1,5 @@
 (ns pekko-clj.mailbox-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.mailbox :as mailbox]
             [pekko-clj.test-support :as ts :refer [eventually]])

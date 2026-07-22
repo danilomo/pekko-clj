@@ -1,5 +1,5 @@
 (ns pekko-clj.cluster.singleton-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.cluster :as cluster]
             [pekko-clj.cluster.singleton :as singleton]
@@ -54,7 +54,7 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [manager (singleton/start sys simple-singleton
-                      {:name "test-singleton"})]
+                                     {:name "test-singleton"})]
         (is (some? manager))
         (is (instance? org.apache.pekko.actor.ActorRef manager)))
       (finally
@@ -65,9 +65,9 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [_ (singleton/start sys simple-singleton
-                {:name "test-singleton"})
+                               {:name "test-singleton"})
             proxy (singleton/proxy sys
-                    {:singleton-manager-path "/user/test-singleton"})]
+                                   {:singleton-manager-path "/user/test-singleton"})]
         (is (some? proxy))
         (is (instance? org.apache.pekko.actor.ActorRef proxy)))
       (finally
@@ -78,7 +78,7 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [{:keys [manager proxy]} (singleton/start-with-proxy sys simple-singleton
-                                      {:name "test-singleton"})]
+                                                                {:name "test-singleton"})]
         (is (some? manager))
         (is (some? proxy))
         (is (not= manager proxy)))
@@ -92,9 +92,9 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [{:keys [proxy]} (singleton/start-with-proxy sys simple-singleton
-                              {:name "test-singleton"
-                               :args {:initial 42}
-                               :identification-interval-ms 100})]
+                                                        {:name "test-singleton"
+                                                         :args {:initial 42}
+                                                         :identification-interval-ms 100})]
         ;; Poll until the singleton is reachable via the proxy and returns its
         ;; initial value.
         (is (eventually 20000 (= 42 (core/<! proxy :get 3000))))
@@ -110,14 +110,14 @@
 
 (deftest singleton-with-role-test
   (let [sys (cluster/create-system "singleton-role-test"
-              {:hostname "127.0.0.1"
-               :port 0
-               :roles ["backend"]})]
+                                   {:hostname "127.0.0.1"
+                                    :port 0
+                                    :roles ["backend"]})]
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [manager (singleton/start sys simple-singleton
-                      {:name "role-singleton"
-                       :role "backend"})]
+                                     {:name "role-singleton"
+                                      :role "backend"})]
         (is (some? manager)))
       (finally
         (ts/terminate-system sys)))))
@@ -127,8 +127,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [manager (singleton/start sys simple-singleton
-                      {:name "handover-singleton"
-                       :hand-over-retry-interval 2000})]
+                                     {:name "handover-singleton"
+                                      :hand-over-retry-interval 2000})]
         (is (some? manager)))
       (finally
         (ts/terminate-system sys)))))
@@ -138,11 +138,11 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [_ (singleton/start sys simple-singleton
-                {:name "test-singleton"})
+                               {:name "test-singleton"})
             proxy (singleton/proxy sys
-                    {:singleton-manager-path "/user/test-singleton"
-                     :buffer-size 2000
-                     :identification-interval-ms 500})]
+                                   {:singleton-manager-path "/user/test-singleton"
+                                    :buffer-size 2000
+                                    :identification-interval-ms 500})]
         (is (some? proxy)))
       (finally
         (ts/terminate-system sys)))))
@@ -157,11 +157,11 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [{:keys [proxy]} (singleton/start-with-proxy sys logging-singleton
-                              {:name "supervised-singleton"
-                               :supervision {:strategy :restart-with-backoff
-                                             :min-backoff-ms 100
-                                             :max-backoff-ms 1000
-                                             :random-factor 0.1}})]
+                                                        {:name "supervised-singleton"
+                                                         :supervision {:strategy :restart-with-backoff
+                                                                       :min-backoff-ms 100
+                                                                       :max-backoff-ms 1000
+                                                                       :random-factor 0.1}})]
         ;; Poll until the singleton is up and answering via the proxy.
         (is (eventually 15000 (= :pong (await-result (core/<?> proxy :ping 3000)))))
         ;; Verify started event
@@ -181,12 +181,12 @@
       (is (not (singleton/singleton-running-here? sys "/user/nonexistent")))
       ;; Start the singleton; in a single-node cluster this node hosts it.
       (singleton/start sys simple-singleton
-        {:name "local-singleton"})
+                       {:name "local-singleton"})
       ;; Positive branch (B6): once the singleton child is running on this node,
       ;; singleton-running-here? must return true. Previously it always returned
       ;; false because (.provider (.dispatcher system)) threw and was swallowed.
       (is (ts/poll-until #(singleton/singleton-running-here? sys "/user/local-singleton")
-                      10000))
+                         10000))
       ;; A different, non-running manager path still returns false.
       (is (not (singleton/singleton-running-here? sys "/user/local-singleton-other")))
       (finally

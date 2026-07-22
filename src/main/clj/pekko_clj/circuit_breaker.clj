@@ -12,7 +12,6 @@
      (cb/call cb (fn [] (do-fragile-thing)))
      ;; Or an async one returning a CompletionStage:
      (cb/call-async cb (fn [] (fetch-async)))"
-  (:refer-clojure :exclude [fail])
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.pattern CircuitBreaker]
            [java.time Duration]

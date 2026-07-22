@@ -1,9 +1,8 @@
 (ns pekko-clj.error-handling-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.supervision :as sup])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [scala.concurrent Await]
+  (:import [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
 (def timeout-duration (Duration/create 5 "seconds"))
@@ -39,7 +38,7 @@
                               :fail (throw (RuntimeException. "test error"))
                               :ping (do (.reply this :pong) nil)
                               nil))
-                :error-handler (fn [this ex msg]
+                :error-handler (fn [_this ex msg]
                                  (reset! caught-exception {:ex ex :msg msg})
                                  nil)
                 :state nil})]
@@ -65,7 +64,7 @@
                                 :fail (throw (RuntimeException. "error"))
                                 :get-errors (do (core/reply (:errors @this)) nil)
                                 nil)))
-                :error-handler (fn [this ex msg]
+                :error-handler (fn [this ex _msg]
                                  (update @this :errors conj (.getMessage ex)))
                 :state {:errors []}})]
     ;; Trigger multiple errors
@@ -86,7 +85,7 @@
                                 :fail (throw (RuntimeException. "boom"))
                                 :get (do (core/reply (:count @this)) nil)
                                 nil)))
-                :error-handler (fn [this ex msg]
+                :error-handler (fn [_this _ex _msg]
                                  ;; Return nil - state should not change
                                  nil)
                 :state {:count 0}})]
@@ -109,7 +108,7 @@
                               :fail (throw (RuntimeException. "no handler"))
                               :ping (do (.reply this :pong) nil)
                               nil))
-                :pre-start (fn [this]
+                :pre-start (fn [_this]
                              (when @restarted
                                ;; Already restarted once
                                nil)
@@ -160,7 +159,7 @@
 (deftest on-error-can-change-behavior
   (core/defactor mode-switcher
     (init [_] {:mode :normal :error-count 0})
-    (on-error [ex msg]
+    (on-error [_ex _msg]
       (let [new-count (inc (:error-count state))]
         (if (>= new-count 3)
           {:mode :safe :error-count new-count}
@@ -190,7 +189,7 @@
         sender-ref (atom nil)]
     (core/defactor context-aware
       (init [_] nil)
-      (on-error [ex msg]
+      (on-error [_ex _msg]
         (reset! self-ref (core/self))
         (reset! sender-ref (core/sender))
         state)
@@ -221,7 +220,7 @@
         decider-received (promise)]
     (core/defactor b10-error-child
       (init [_] nil)
-      (on-error [ex msg]
+      (on-error [ex _msg]
         (swap! on-error-calls conj (class ex))
         state)
       (handle :throw-error
@@ -298,7 +297,7 @@
         decider-received (atom nil)]
     (core/defactor b10-recoverable-child
       (init [_] nil)
-      (on-error [ex msg]
+      (on-error [ex _msg]
         (swap! on-error-calls conj (class ex))
         state)
       (handle :boom

@@ -1,14 +1,12 @@
 (ns pekko-clj.core
   (:require [clojure.core.match :as m])
   (:import [org.apache.pekko.actor ActorSystem ActorRef ActorRefFactory ActorContext
-                                   ActorSelection PoisonPill Props ReceiveTimeout]
+            ActorSelection PoisonPill Props ReceiveTimeout]
            [org.apache.pekko.pattern Patterns AskTimeoutException]
            [pekko_clj.actor CljActor BecomeResult]
            [com.typesafe.config Config]
            [java.time Duration]
            [java.util.concurrent TimeUnit ExecutionException TimeoutException CompletableFuture]))
-
-(set! *warn-on-reflection* true)
 
 (def ^{:dynamic true :tag CljActor} *current-actor*
   "Bound to the current CljActor instance during message handling.
@@ -333,7 +331,11 @@
         on-error-body   (when on-error-clause (drop 2 on-error-clause))  ;; body...
 
         ;; gensyms
-        this-sym   (gensym "this")
+        ;; Tagged so the generated code calls CljActor methods directly. The tag is
+        ;; fully qualified because it is emitted into the caller's namespace, which
+        ;; need not import CljActor — without it every defactor body in every
+        ;; downstream project reflects on .unhandled and deref.
+        this-sym   (with-meta (gensym "this") {:tag 'pekko_clj.actor.CljActor})
         msg-sym    (gensym "msg")
         args-sym   (gensym "args")
         ex-sym     (gensym "ex")

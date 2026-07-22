@@ -1,6 +1,6 @@
 (ns pekko-clj.cluster.daemon-test
   "Tests for N5's Sharded Daemon Process wrapper."
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.cluster.daemon :as daemon]
             [pekko-clj.test-support :as ts :refer [eventually]])

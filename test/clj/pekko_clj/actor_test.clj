@@ -1,5 +1,5 @@
 (ns pekko-clj.actor-test
-  (:require [clojure.test :refer :all])
+  (:require [clojure.test :refer [deftest is testing use-fixtures]])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.pattern Patterns]
            [pekko_clj.actor BecomeResult CljActor]

@@ -1,8 +1,7 @@
 (ns pekko-clj.defactor-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core :refer [defactor]])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef UnhandledMessage]
-           [pekko_clj.actor BecomeResult CljActor]
+  (:import [org.apache.pekko.actor ActorRef UnhandledMessage]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -265,18 +264,18 @@
     (is (= a (core/<! *system* a :get-self)))))
 
 (deftest defactor-parent-returns-parent-ref
-  (let [a (core/spawn *system* test-context-info)]
-    (let [p (core/<! *system* a :get-parent)]
-      (is (instance? ActorRef p))
-      (is (not= a p)))))
+  (let [a (core/spawn *system* test-context-info)
+        p (core/<! *system* a :get-parent)]
+    (is (instance? ActorRef p))
+    (is (not= a p))))
 
 (deftest defactor-sender-returns-sender-ref
-  (let [a (core/spawn *system* test-context-info)]
-    (let [s (core/<! *system* a :get-sender)]
-      (is (instance? ActorRef s))
-      ;; Patterns/ask creates a temp actor as sender
-      (is (not= a s))
-      (is (not= (ActorRef/noSender) s)))))
+  (let [a (core/spawn *system* test-context-info)
+        s (core/<! *system* a :get-sender)]
+    (is (instance? ActorRef s))
+    ;; Patterns/ask creates a temp actor as sender
+    (is (not= a s))
+    (is (not= (ActorRef/noSender) s))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: docstring support

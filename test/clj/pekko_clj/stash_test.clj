@@ -1,9 +1,8 @@
 (ns pekko-clj.stash-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.test-support :refer [eventually]])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [scala.concurrent Await]
+  (:import [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
 (def timeout-duration (Duration/create 5 "seconds"))

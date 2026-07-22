@@ -60,6 +60,58 @@ lein test :only pekko-clj.core-test/counter-test
 lein repl
 ```
 
+### Linting
+
+```bash
+# clj-kondo + cljfmt check — both must report zero findings (CI runs this)
+lein lint
+
+# Apply the formatting cljfmt can fix automatically
+lein lint-fix
+```
+
+The tree is currently at **zero clj-kondo warnings and zero cljfmt diffs**; keep it there.
+
+clj-kondo cannot expand `defactor` / `defactor-persistent`, so hooks teach it to read
+them. Those hooks live in `resources/clj-kondo.exports/pekko-clj/pekko-clj/` (not in
+`.clj-kondo/`) so they ship in the jar and downstream projects using `defactor` lint
+cleanly too; `.clj-kondo/config.edn` consumes that same export via `:config-paths`.
+**If you add or rename a clause in either macro, update the hook alongside it** —
+otherwise every use of the new clause reports as an unresolved symbol.
+
+Likewise, the `defactor` clauses and the routing DSL are body forms, not function
+calls; `:cljfmt {:extra-indents ...}` in `project.clj` encodes that. New DSL forms
+need an entry there or cljfmt will re-align their bodies as arguments.
+
+### Reflection
+
+`src/` compiles with **zero reflection warnings**, enforced in CI by grepping
+`lein check`. `:global-vars {*warn-on-reflection* true}` in `project.clj` turns the
+warnings on (the `:dev`/`:test` profiles switch them back off — test code does ad-hoc
+interop where reflection is irrelevant and would bury the run in noise).
+
+This is not only about speed. A reflective call resolves against the *runtime* class,
+so a call that matches no declared Java signature still compiles and only blows up
+when that line is first executed. Hinting the interop turned four such latent bugs
+into compile errors:
+
+| Broken call | Why it never worked |
+|---|---|
+| `bind-server` with a function handler | reified `java.util.function.Function`; `ServerBuilder.bind` wants Pekko's `japi.function.Function` |
+| `(routing/complete status content-type body)` | `AllDirectives` has no `(StatusCode, ContentType, String)` overload |
+| `routing/extract-strict-entity` | `toStrictEntity` takes a `java.time.Duration`, not a bare `long` |
+| `spawn-pool-with-resizer` with `:balancing` | `BalancingPool` has no `withResizer` — its routees share one mailbox |
+
+So: when adding interop, check the actual Java signature (`.getMethods`) rather than
+assuming — and never silence a reflection warning without reading the signature first.
+
+`pekko-clj.stream` is the one place reflection survives by design. javadsl `Source`
+and `Flow` declare the same operators but share no supertype that declares them, so
+the private `op` macro tests both concrete types and falls back to an explicit
+`Reflector` call for the `SubSource`/`SubFlow` that `group-by` returns. `op` takes a
+bare Java method name, which is why `.clj-kondo/config.edn` excludes it from
+`:unresolved-symbol`.
+
 ### JVM Requirements
 
 The project requires `--add-opens=java.base/java.nio=ALL-UNNAMED` for LevelDB (persistence tests). This is configured in `project.clj`.

@@ -1,4 +1,5 @@
-.clj-kondo/
+# clj-kondo: keep config.edn tracked, ignore the analysis cache
+.clj-kondo/.cache/
 .idea/
 .lein-repl-history
 .lsp/

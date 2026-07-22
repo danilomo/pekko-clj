@@ -1,5 +1,5 @@
 (ns pekko-clj.http.response-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [pekko-clj.http.response :as resp])
   (:import [org.apache.pekko.http.javadsl.model StatusCodes ContentTypes HttpResponse]))
 

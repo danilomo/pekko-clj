@@ -2,19 +2,17 @@
   "Core HTTP server functionality for Pekko HTTP.
 
    Provides server binding, request accessors, and entity handling."
-  (:require [pekko-clj.stream :as stream]
-            [clojure.string :as str])
-  (:import [org.apache.pekko.http.javadsl Http ServerBinding]
-           [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse
-                                                  HttpMethod HttpMethods Uri Query]
+  (:require [clojure.string :as str])
+  (:import [org.apache.pekko.http.javadsl Http ServerBinding ServerBuilder]
+           [org.apache.pekko.http.javadsl.model HttpRequest HttpMethods HttpHeader RequestEntity]
+           [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
+           [org.apache.pekko.japi Pair]
+           [java.util Optional]
            [org.apache.pekko.http.javadsl.server Route]
            [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.stream Materializer SystemMaterializer]
-           [org.apache.pekko.util ByteString]
-           [java.util.concurrent CompletionStage CompletableFuture TimeUnit]
-           [java.util.function Function]
-           [scala.concurrent.duration Duration]
-           [scala.jdk.javaapi FutureConverters]))
+           [java.util.concurrent CompletionStage CompletableFuture]
+           [java.util.function Function]))
 
 ;; ---------------------------------------------------------------------------
 ;; Server Lifecycle
@@ -30,23 +28,25 @@
 
    Returns a CompletionStage<ServerBinding>."
   ([system host port route]
-   (let [http (Http/get system)
-         builder (.newServerAt http host (int port))]
+   (let [http (Http/get ^ActorSystem system)
+         ^ServerBuilder builder (.newServerAt http ^String host (int port))]
      (if (instance? Route route)
-       (.bind builder route)
-       ;; route is a function: HttpRequest -> CompletionStage<HttpResponse>
+       (.bind builder ^Route route)
+       ;; route is a function: HttpRequest -> CompletionStage<HttpResponse>.
+       ;; ServerBuilder.bind takes Pekko's japi Function, NOT java.util.function
+       ;; .Function — reifying the latter throws "No matching method bind".
        (.bind builder
-              (reify Function
+              (reify org.apache.pekko.japi.function.Function
                 (apply [_ request]
                   (route request)))))))
   ([system host port route materializer]
-   (let [http (Http/get system)
-         builder (-> (.newServerAt http host (int port))
-                     (.withMaterializer materializer))]
+   (let [http (Http/get ^ActorSystem system)
+         ^ServerBuilder builder (-> (.newServerAt http ^String host (int port))
+                                    (.withMaterializer materializer))]
      (if (instance? Route route)
-       (.bind builder route)
+       (.bind builder ^Route route)
        (.bind builder
-              (reify Function
+              (reify org.apache.pekko.japi.function.Function
                 (apply [_ request]
                   (route request))))))))
 
@@ -107,8 +107,8 @@
    Returns nil if no query string."
   [^HttpRequest request]
   (let [uri (.getUri request)
-        raw (.rawQueryString uri)]
-    (when (.isDefined raw)
+        ^Optional raw (.rawQueryString uri)]
+    (when (.isPresent raw)
       (.get raw))))
 
 (defn request-query-params
@@ -118,23 +118,23 @@
   (let [uri (.getUri request)
         query (.query uri)]
     (into {}
-          (for [param (iterator-seq (.iterator (.toList query)))]
+          (for [^Pair param (iterator-seq (.iterator (.toList query)))]
             [(.first param) (.second param)]))))
 
 (defn request-header
   "Get a single header value by name (case-insensitive).
    Returns nil if header not present."
   [^HttpRequest request header-name]
-  (let [optional (.getHeader request header-name)]
+  (let [^Optional optional (.getHeader request ^String header-name)]
     (when (.isPresent optional)
-      (.value (.get optional)))))
+      (.value ^HttpHeader (.get optional)))))
 
 (defn request-headers
   "Get all headers as a map.
    Multi-valued headers return the first value."
   [^HttpRequest request]
   (into {}
-        (for [header (iterator-seq (.iterator (.getHeaders request)))]
+        (for [^HttpHeader header (iterator-seq (.iterator (.getHeaders request)))]
           [(.lowercaseName header) (.value header)])))
 
 (defn request-content-type
@@ -148,13 +148,17 @@
 ;; Entity Handling
 ;; ---------------------------------------------------------------------------
 
+(def ^:private entity-strict-timeout-ms
+  "How long entity->string / entity->bytes wait for the body to be fully collected."
+  10000)
+
 (defn ->materializer
   "Resolve a Materializer from a Materializer or an ActorSystem.
 
    When given a system, returns the shared per-system materializer via
    SystemMaterializer instead of creating a fresh one each call — the latter
    leaks an unclosed materializer (and its actor) on every invocation."
-  [materializer-or-system]
+  ^Materializer [materializer-or-system]
   (if (instance? Materializer materializer-or-system)
     materializer-or-system
     (.materializer (SystemMaterializer/get ^ActorSystem materializer-or-system))))
@@ -166,12 +170,10 @@
    materializer-or-system: Materializer or ActorSystem"
   [^HttpRequest request materializer-or-system]
   (let [mat (->materializer materializer-or-system)]
-    (-> (.entity request)
-        (.toStrict (Duration/create 10 TimeUnit/SECONDS) mat)
-        (FutureConverters/asJava)
+    (-> (.toStrict ^RequestEntity (.entity request) (long entity-strict-timeout-ms) mat)
         (.thenApply (reify Function
                       (apply [_ strict]
-                        (.utf8String (.getData strict))))))))
+                        (.utf8String (.getData ^HttpEntity$Strict strict))))))))
 
 (defn entity->bytes
   "Convert a request entity to a byte array.
@@ -180,12 +182,10 @@
    materializer-or-system: Materializer or ActorSystem"
   [^HttpRequest request materializer-or-system]
   (let [mat (->materializer materializer-or-system)]
-    (-> (.entity request)
-        (.toStrict (Duration/create 10 TimeUnit/SECONDS) mat)
-        (FutureConverters/asJava)
+    (-> (.toStrict ^RequestEntity (.entity request) (long entity-strict-timeout-ms) mat)
         (.thenApply (reify Function
                       (apply [_ strict]
-                        (.toArray (.getData strict))))))))
+                        (.toArray (.getData ^HttpEntity$Strict strict))))))))
 
 (defn entity->data-bytes
   "Get the entity data as a Source of ByteString.
@@ -221,7 +221,7 @@
         (if (empty? remaining-path)
           params
           (let [path-part (first remaining-path)
-                pattern-part (first remaining-pattern)]
+                ^String pattern-part (first remaining-pattern)]
             (cond
               ;; Parameter placeholder
               (.startsWith pattern-part ":")

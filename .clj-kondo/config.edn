@@ -1,0 +1,27 @@
+;; clj-kondo configuration for pekko-clj itself.
+;;
+;; The hooks that teach clj-kondo to read `defactor` / `defactor-persistent` live in
+;; resources/clj-kondo.exports/ so that downstream users of this library get them too
+;; (see that directory's config.edn); this project consumes its own export rather than
+;; keeping a second copy in sync.
+{:config-paths ["../resources/clj-kondo.exports/pekko-clj/pekko-clj"]
+
+ :linters
+ {:unresolved-symbol
+  ;; pekko-clj.stream/op takes a bare Java method name — (op src viaMat flow) — and
+  ;; splices it into a `.` form. Those names are not Clojure symbols and never
+  ;; resolve; the surrounding arguments are still linted normally.
+  {:exclude [(pekko-clj.stream/op)]}}
+
+ :ns-groups [{:name test-namespaces :pattern ".*-test$"}]
+
+ :config-in-ns
+ {test-namespaces
+  ;; `defactor` expands to a `def`, so defining an actor inside a `deftest` trips
+  ;; :inline-def. Several lifecycle tests must do exactly that: the actor closes
+  ;; over a test-local atom or promise that the assertions then read (see
+  ;; supervision-with-defactor, stash-with-defactor). Lifting those actors to the
+  ;; top level would mean lifting the mutable state with them, turning per-test
+  ;; state into namespace-wide state shared across tests — a worse problem than
+  ;; the one the linter is pointing at. Scoped to test namespaces only.
+  {:linters {:inline-def {:level :off}}}}}

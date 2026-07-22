@@ -1,5 +1,5 @@
 (ns pekko-clj.become-result-test
-  (:require [clojure.test :refer :all])
+  (:require [clojure.test :refer [deftest is testing]])
   (:import [pekko_clj.actor BecomeResult]))
 
 (deftest of-creates-instance-with-function-and-state

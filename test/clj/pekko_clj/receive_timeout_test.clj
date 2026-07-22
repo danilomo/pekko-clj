@@ -1,5 +1,5 @@
 (ns pekko-clj.receive-timeout-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.test-support :as ts :refer [eventually]]))
 

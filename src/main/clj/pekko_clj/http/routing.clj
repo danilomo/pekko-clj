@@ -24,18 +24,17 @@
             [pekko-clj.http.marshalling :as marshal]
             [pekko-clj.stream :as stream]
             [clojure.string :as str])
-  (:import [org.apache.pekko.http.javadsl.server Route AllDirectives Directives
-                                                 ExceptionHandler RejectionHandler
-                                                 Rejection]
-           [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse HttpEntity$Strict
-                                                  HttpMethods StatusCodes]
-           [org.apache.pekko.http.javadsl.model.headers Location]
-           [org.apache.pekko.http.javadsl.model.ws Message TextMessage BinaryMessage]
+  (:import [org.apache.pekko.http.javadsl.server Route AllDirectives
+            ExceptionHandler RejectionHandler RejectionHandlerBuilder
+            Rejection]
+           [org.apache.pekko.http.javadsl.model HttpResponse HttpEntity$Strict
+            HttpRequest ResponseEntity Uri
+            StatusCodes]
+           [org.apache.pekko.http.javadsl.model.ws Message TextMessage]
            [org.apache.pekko.japi.pf FI$Apply]
            [java.time Duration]
            [java.util.function Supplier Function]
-           [java.util.concurrent CompletionStage CompletableFuture]
-           [scala.jdk.javaapi FutureConverters]))
+           [java.util.concurrent CompletionStage]))
 
 ;; ---------------------------------------------------------------------------
 ;; Internal: Directives Instance
@@ -60,7 +59,8 @@
       (if (empty? rest-routes)
         first-route
         (.concat directives
-                 first-route
+                 ^Route first-route
+                 ^"[Lorg.apache.pekko.http.javadsl.server.Route;"
                  (into-array Route (vec rest-routes)))))))
 
 ;; ---------------------------------------------------------------------------
@@ -82,25 +82,27 @@
   ([body]
    (cond
      (instance? HttpResponse body)
-     (.complete directives body)
+     (.complete directives ^HttpResponse body)
 
-     (instance? org.apache.pekko.http.javadsl.model.ResponseEntity body)
-     (.complete directives StatusCodes/OK body)
+     (instance? ResponseEntity body)
+     (.complete directives StatusCodes/OK ^ResponseEntity body)
 
      :else
-     (.complete directives (str body))))
+     (.complete directives ^String (str body))))
   ([status body]
    (let [sc (resp/->status-code status)]
      (cond
-       (instance? org.apache.pekko.http.javadsl.model.ResponseEntity body)
-       (.complete directives sc body)
+       (instance? ResponseEntity body)
+       (.complete directives sc ^ResponseEntity body)
 
        :else
-       (.complete directives sc (str body)))))
+       (.complete directives sc ^String (str body)))))
   ([status content-type body]
-   (let [sc (resp/->status-code status)
-         ct (resp/->content-type content-type)]
-     (.complete directives sc ct (str body)))))
+   ;; AllDirectives has no (StatusCode, ContentType, String) overload — build the
+   ;; entity first and use (StatusCode, ResponseEntity). The direct call used to
+   ;; throw "No matching method complete found taking 3 args".
+   (let [sc (resp/->status-code status)]
+     (.complete directives sc ^ResponseEntity (resp/entity (str body) content-type)))))
 
 (defn complete-future
   "Complete with a future response.
@@ -120,7 +122,7 @@
    (redirect url :found))
   ([url status]
    (.redirect directives
-              (org.apache.pekko.http.javadsl.model.Uri/create url)
+              (Uri/create ^String url)
               (resp/->status-code status))))
 
 (defn reject
@@ -138,7 +140,7 @@
    (path \"/users\" inner-route)"
   [path-str inner-route]
   (.path directives
-         path-str
+         ^String path-str
          (reify Supplier
            (get [_] inner-route))))
 
@@ -151,7 +153,7 @@
        post-routes))"
   [prefix inner-route]
   (.pathPrefix directives
-               prefix
+               ^String prefix
                (reify Supplier
                  (get [_] inner-route))))
 
@@ -239,8 +241,8 @@
                       param-name
                       (reify Function
                         (apply [_ opt-value]
-                          (let [value (if (.isPresent opt-value)
-                                        (.get opt-value)
+                          (let [value (if (.isPresent ^java.util.Optional opt-value)
+                                        (.get ^java.util.Optional opt-value)
                                         default-value)]
                             (inner-fn value))))))
 
@@ -276,8 +278,8 @@
                       field-name
                       (reify Function
                         (apply [_ opt-value]
-                          (inner-fn (if (.isPresent opt-value)
-                                      (.get opt-value)
+                          (inner-fn (if (.isPresent ^java.util.Optional opt-value)
+                                      (.get ^java.util.Optional opt-value)
                                       default-value))))))
 
 (defn form-fields
@@ -314,8 +316,8 @@
                               header-name
                               (reify Function
                                 (apply [_ opt-value]
-                                  (let [value (when (.isPresent opt-value)
-                                                (.get opt-value))]
+                                  (let [value (when (.isPresent ^java.util.Optional opt-value)
+                                                (.get ^java.util.Optional opt-value))]
                                     (inner-fn value))))))
 
 (defn respond-with-header
@@ -369,14 +371,15 @@
 
    (extract-strict-entity 5000 (fn [entity] ...))"
   [timeout-millis inner-fn]
+  ;; toStrictEntity takes a java.time.Duration (or FiniteDuration + long), never a
+  ;; bare long — passing one threw "No matching method toStrictEntity".
   (.toStrictEntity directives
-                   (long timeout-millis)
+                   (Duration/ofMillis (long timeout-millis))
                    (reify Supplier
                      (get [_]
                        (extract-request
                         (fn [req]
-                          (let [entity (.entity req)]
-                            (inner-fn entity))))))))
+                          (inner-fn (.entity ^HttpRequest req))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Compojure-style Macros
@@ -394,19 +397,19 @@
   (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     ;; Path with parameters - use extract-request
     `(method-get
-      (extract-request
-       (fn [req#]
-         (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-           (if params#
-             (let [{:keys ~bindings} params#]
-               ~@body)
-             (reject))))))
+       (extract-request
+        (fn [req#]
+          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
+            (if params#
+              (let [{:keys ~bindings} params#]
+                ~@body)
+              (reject))))))
     ;; Simple path
     `(path ~path-pattern
-           (method-get
-            (path-end
-             (let ~bindings
-               ~@body))))))
+       (method-get
+         (path-end
+           (let ~bindings
+             ~@body))))))
 
 (defmacro POST
   "Define a POST route with path matching.
@@ -416,72 +419,72 @@
   [path-pattern bindings & body]
   (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-post
-      (extract-request
-       (fn [req#]
-         (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-           (if params#
-             (let [{:keys ~bindings} params#]
-               ~@body)
-             (reject))))))
+       (extract-request
+        (fn [req#]
+          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
+            (if params#
+              (let [{:keys ~bindings} params#]
+                ~@body)
+              (reject))))))
     `(path ~path-pattern
-           (method-post
-            (path-end
-             (let ~bindings
-               ~@body))))))
+       (method-post
+         (path-end
+           (let ~bindings
+             ~@body))))))
 
 (defmacro PUT
   "Define a PUT route with path matching."
   [path-pattern bindings & body]
   (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-put
-      (extract-request
-       (fn [req#]
-         (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-           (if params#
-             (let [{:keys ~bindings} params#]
-               ~@body)
-             (reject))))))
+       (extract-request
+        (fn [req#]
+          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
+            (if params#
+              (let [{:keys ~bindings} params#]
+                ~@body)
+              (reject))))))
     `(path ~path-pattern
-           (method-put
-            (path-end
-             (let ~bindings
-               ~@body))))))
+       (method-put
+         (path-end
+           (let ~bindings
+             ~@body))))))
 
 (defmacro DELETE
   "Define a DELETE route with path matching."
   [path-pattern bindings & body]
   (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-delete
-      (extract-request
-       (fn [req#]
-         (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-           (if params#
-             (let [{:keys ~bindings} params#]
-               ~@body)
-             (reject))))))
+       (extract-request
+        (fn [req#]
+          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
+            (if params#
+              (let [{:keys ~bindings} params#]
+                ~@body)
+              (reject))))))
     `(path ~path-pattern
-           (method-delete
-            (path-end
-             (let ~bindings
-               ~@body))))))
+       (method-delete
+         (path-end
+           (let ~bindings
+             ~@body))))))
 
 (defmacro PATCH
   "Define a PATCH route with path matching."
   [path-pattern bindings & body]
   (if (some #(.startsWith (str %) ":") (str/split path-pattern #"/"))
     `(method-patch
-      (extract-request
-       (fn [req#]
-         (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
-           (if params#
-             (let [{:keys ~bindings} params#]
-               ~@body)
-             (reject))))))
+       (extract-request
+        (fn [req#]
+          (let [params# (http/match-path-pattern (http/request-path req#) ~path-pattern)]
+            (if params#
+              (let [{:keys ~bindings} params#]
+                ~@body)
+              (reject))))))
     `(path ~path-pattern
-           (method-patch
-            (path-end
-             (let ~bindings
-               ~@body))))))
+       (method-patch
+         (path-end
+           (let ~bindings
+             ~@body))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Utility Functions
@@ -583,18 +586,21 @@
        {:not-found (complete :not-found \"nothing here\")
         :handle {MethodRejection (fn [_] (complete :method-not-allowed \"nope\"))}})"
   ^RejectionHandler [{:keys [not-found all handle]}]
-  (let [builder (RejectionHandler/newBuilder)
-        builder (reduce (fn [b [klass f]]
-                          (.handle b klass (reify Function
-                                             (apply [_ rejection] (f rejection)))))
-                        builder
-                        handle)
-        builder (if all
-                  (.handleAll builder Rejection
-                              (reify Function
-                                (apply [_ rejections] (all (seq rejections)))))
-                  builder)
-        builder (if not-found (.handleNotFound builder not-found) builder)]
+  (let [^RejectionHandlerBuilder builder (RejectionHandler/newBuilder)
+        ^RejectionHandlerBuilder builder
+        (reduce (fn [^RejectionHandlerBuilder b [klass f]]
+                  (.handle b klass (reify Function
+                                     (apply [_ rejection] (f rejection)))))
+                builder
+                handle)
+        ^RejectionHandlerBuilder builder
+        (if all
+          (.handleAll builder Rejection
+                      (reify Function
+                        (apply [_ rejections] (all (seq rejections)))))
+          builder)
+        ^RejectionHandlerBuilder builder
+        (if not-found (.handleNotFound builder ^Route not-found) builder)]
     (.build builder)))
 
 (defn handle-rejections

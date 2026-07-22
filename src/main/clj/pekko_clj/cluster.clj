@@ -26,17 +26,17 @@
             [pekko-clj.serialization :as serialization]
             [clojure.string :as str])
   (:import [org.apache.pekko Done]
-           [org.apache.pekko.actor ActorSystem ActorRef Address AddressFromURIString
-                                   CoordinatedShutdown CoordinatedShutdown$Reason]
-           [org.apache.pekko.cluster Cluster Member MemberStatus ClusterEvent$ClusterDomainEvent
-                                     ClusterEvent$MemberUp ClusterEvent$MemberRemoved
-                                     ClusterEvent$MemberExited ClusterEvent$MemberDowned
-                                     ClusterEvent$MemberWeaklyUp ClusterEvent$MemberLeft
-                                     ClusterEvent$MemberJoined ClusterEvent$MemberPreparingForShutdown
-                                     ClusterEvent$UnreachableMember ClusterEvent$ReachableMember
-                                     ClusterEvent$LeaderChanged ClusterEvent$RoleLeaderChanged]
+           [org.apache.pekko.actor ActorSystem ActorRef AddressFromURIString
+            CoordinatedShutdown CoordinatedShutdown$Reason]
+           [org.apache.pekko.cluster Cluster Member ClusterEvent$ClusterDomainEvent
+            ClusterEvent$MemberUp ClusterEvent$MemberRemoved
+            ClusterEvent$MemberExited ClusterEvent$MemberDowned
+            ClusterEvent$MemberWeaklyUp ClusterEvent$MemberLeft
+            ClusterEvent$MemberJoined ClusterEvent$MemberPreparingForShutdown
+            ClusterEvent$UnreachableMember ClusterEvent$ReachableMember
+            ClusterEvent$LeaderChanged ClusterEvent$RoleLeaderChanged]
            [com.typesafe.config Config ConfigFactory]
-           [java.util Set List Optional]
+           [java.util Optional]
            [java.util.function Supplier]
            [java.util.concurrent CompletionStage CompletableFuture]))
 
@@ -46,7 +46,7 @@
 
 (defn cluster
   "Get the Cluster extension for an ActorSystem."
-  [^ActorSystem system]
+  ^Cluster [^ActorSystem system]
   (Cluster/get system))
 
 ;; ---------------------------------------------------------------------------
@@ -189,24 +189,24 @@
                                                        :stable-after 15000}
                                 :extra-config \"pekko.cluster.min-nr-of-members = 2\"})"
   [name config]
-  (let [cfg (if (instance? Config config)
-              config
-              (let [{:keys [hostname port seed-nodes roles extra-config split-brain-resolver
-                            transit-serialization]
-                     :or {hostname "127.0.0.1" port 7355}} config
-                    seed-nodes-str (if seed-nodes
-                                     (str "["
-                                          (str/join ", "
-                                            (map #(str "\"" % "\"") seed-nodes))
-                                          "]")
-                                     "[]")
-                    roles-str (if roles
-                                (str "["
-                                     (str/join ", "
-                                       (map #(str "\"" % "\"") roles))
-                                     "]")
-                                "[]")
-                    config-str (str "
+  (let [^Config cfg (if (instance? Config config)
+                      config
+                      (let [{:keys [hostname port seed-nodes roles extra-config split-brain-resolver
+                                    transit-serialization]
+                             :or {hostname "127.0.0.1" port 7355}} config
+                            seed-nodes-str (if seed-nodes
+                                             (str "["
+                                                  (str/join ", "
+                                                            (map #(str "\"" % "\"") seed-nodes))
+                                                  "]")
+                                             "[]")
+                            roles-str (if roles
+                                        (str "["
+                                             (str/join ", "
+                                                       (map #(str "\"" % "\"") roles))
+                                             "]")
+                                        "[]")
+                            config-str (str "
                       pekko {
                         actor {
                           provider = cluster
@@ -223,27 +223,27 @@
                           downing-provider-class = \"org.apache.pekko.cluster.sbr.SplitBrainResolverProvider\"
                         }
                       }")
-                    base-cfg (ConfigFactory/parseString config-str)
-                    transit-cfg (when transit-serialization
-                                  (serialization/transit-config
-                                   (if (map? transit-serialization) transit-serialization {})))
-                    sbr-cfg (when split-brain-resolver
-                              (split-brain-resolver-config split-brain-resolver))
-                    extra-cfg (cond
-                                (nil? extra-config) nil
-                                (instance? Config extra-config) extra-config
-                                (string? extra-config) (ConfigFactory/parseString extra-config)
-                                :else (throw (IllegalArgumentException.
-                                              (str ":extra-config must be a HOCON string or a "
-                                                   "com.typesafe.config.Config, got "
-                                                   (class extra-config)))))]
+                            base-cfg (ConfigFactory/parseString config-str)
+                            transit-cfg (when transit-serialization
+                                          (serialization/transit-config
+                                           (if (map? transit-serialization) transit-serialization {})))
+                            sbr-cfg (when split-brain-resolver
+                                      (split-brain-resolver-config split-brain-resolver))
+                            ^Config extra-cfg (cond
+                                                (nil? extra-config) nil
+                                                (instance? Config extra-config) extra-config
+                                                (string? extra-config) (ConfigFactory/parseString extra-config)
+                                                :else (throw (IllegalArgumentException.
+                                                              (str ":extra-config must be a HOCON string or a "
+                                                                   "com.typesafe.config.Config, got "
+                                                                   (class extra-config)))))]
                 ;; Precedence (highest first): extra-config > split-brain-resolver >
                 ;; transit-serialization > generated defaults > reference.conf (below).
-                (cond-> base-cfg
-                  transit-cfg (as-> c (.withFallback transit-cfg c))
-                  sbr-cfg     (as-> c (.withFallback sbr-cfg c))
-                  extra-cfg   (as-> c (.withFallback extra-cfg c)))))]
-    (ActorSystem/create name (.withFallback cfg (ConfigFactory/load)))))
+                        (cond-> base-cfg
+                          transit-cfg (as-> c (.withFallback transit-cfg c))
+                          sbr-cfg     (as-> c (.withFallback sbr-cfg c))
+                          extra-cfg   (as-> c (.withFallback extra-cfg c)))))]
+    (ActorSystem/create ^String name (.withFallback cfg (ConfigFactory/load)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster Membership
@@ -280,8 +280,8 @@
      (join-seed-nodes sys [\"pekko://my-app@host1:7355\"
                            \"pekko://my-app@host2:7355\"])"
   [system seed-nodes]
-  (let [addresses (java.util.ArrayList.
-                    (map #(AddressFromURIString/parse %) seed-nodes))]
+  (let [addresses (java.util.ArrayList. ^java.util.Collection
+                   (map #(AddressFromURIString/parse %) seed-nodes))]
     (.joinSeedNodes (cluster system) addresses)))
 
 (defn leave
@@ -482,8 +482,8 @@
    - :leader-changed, :role-leader-changed
    - :cluster-shutting-down"
   [system handler]
-  (let [subscriber (core/spawn system cluster-event-subscriber {:handler handler})
-        event-classes (into-array Class [ClusterEvent$ClusterDomainEvent])]
+  (let [^ActorRef subscriber (core/spawn system cluster-event-subscriber {:handler handler})
+        ^"[Ljava.lang.Class;" event-classes (into-array Class [ClusterEvent$ClusterDomainEvent])]
     (.subscribe (cluster system) subscriber event-classes)
     subscriber))
 
@@ -498,12 +498,12 @@
 
 (defn register-on-member-up
   "Register a callback to run when this node becomes Up in the cluster."
-  [system callback]
+  [system ^Runnable callback]
   (.registerOnMemberUp (cluster system) callback))
 
 (defn register-on-member-removed
   "Register a callback to run when this node is removed from the cluster."
-  [system callback]
+  [system ^Runnable callback]
   (.registerOnMemberRemoved (cluster system) callback))
 
 (defn prepare-for-shutdown

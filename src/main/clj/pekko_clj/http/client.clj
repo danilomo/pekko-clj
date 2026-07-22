@@ -6,17 +6,21 @@
             [pekko-clj.http.core :as http])
   (:import [org.apache.pekko.http.javadsl Http]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse HttpMethods
-                                                  ContentTypes]
-           [org.apache.pekko.http.javadsl.model.headers RawHeader]
+            HttpHeader ResponseEntity ContentType$NonBinary]
+           [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
            [org.apache.pekko.actor ActorSystem]
-           [java.util.concurrent CompletionStage CompletableFuture TimeUnit]
-           [java.util.function Function BiConsumer]
-           [scala.concurrent.duration Duration]
-           [scala.jdk.javaapi FutureConverters]))
+           [java.util Optional]
+           [org.apache.pekko.http.javadsl.model.headers RawHeader]
+           [java.util.concurrent CompletionStage]
+           [java.util.function Function BiConsumer]))
 
 ;; ---------------------------------------------------------------------------
 ;; Request Building
 ;; ---------------------------------------------------------------------------
+
+(def ^:private response-strict-timeout-ms
+  "How long response-body / response-body-bytes wait for the body to be collected."
+  30000)
 
 (defn- build-request
   "Build an HttpRequest from method, url, and options.
@@ -26,27 +30,28 @@
    - :body - request body (string, bytes, or entity)
    - :content-type - content type keyword or ContentType"
   [method url opts]
-  (let [req (-> (HttpRequest/create url)
-                (.withMethod method))]
-    (cond-> req
-      ;; Add headers
-      (:headers opts)
-      ((fn [r]
-         (reduce (fn [req [name value]]
-                   (.addHeader req (RawHeader/create name value)))
-                 r
-                 (:headers opts))))
+  ;; Built step by step rather than threaded through cond->: each step needs a
+  ;; known HttpRequest type for the interop call to resolve without reflection,
+  ;; and the String/byte[] entity overloads have to be picked in separate branches.
+  (let [{:keys [headers body content-type]} opts
+        ^HttpRequest req (.withMethod (HttpRequest/create ^String url) method)
+        ^HttpRequest req (if headers
+                           (reduce (fn [^HttpRequest r [header-name value]]
+                                     (.addHeader r (RawHeader/create ^String header-name
+                                                                     ^String value)))
+                                   req
+                                   headers)
+                           req)]
+    (cond
+      (and body content-type)
+      ;; withEntity's String overload is declared on ContentType$NonBinary.
+      (let [ct (resp/->content-type content-type)]
+        (if (string? body)
+          (.withEntity req ^ContentType$NonBinary ct ^String body)
+          (.withEntity req ct ^bytes body)))
 
-      ;; Add body with content type
-      (and (:body opts) (:content-type opts))
-      (.withEntity (resp/->content-type (:content-type opts))
-                   (if (string? (:body opts))
-                     ^String (:body opts)
-                     ^bytes (:body opts)))
-
-      ;; Add body without explicit content type
-      (and (:body opts) (not (:content-type opts)))
-      (.withEntity ^String (str (:body opts))))))
+      body (.withEntity req ^String (str body))
+      :else req)))
 
 ;; ---------------------------------------------------------------------------
 ;; Request Functions
@@ -74,7 +79,7 @@
                        :trace   HttpMethods/TRACE
                        :connect HttpMethods/CONNECT)
          req (build-request http-method url opts)
-         http (Http/get system)]
+         http (Http/get ^ActorSystem system)]
      (.singleRequest http req))))
 
 (defn GET
@@ -184,16 +189,16 @@
   "Get a single header value by name (case-insensitive).
    Returns nil if header not present."
   [^HttpResponse response header-name]
-  (let [optional (.getHeader response header-name)]
+  (let [^Optional optional (.getHeader response ^String header-name)]
     (when (.isPresent optional)
-      (.value (.get optional)))))
+      (.value ^HttpHeader (.get optional)))))
 
 (defn response-headers
   "Get all headers as a map.
    Multi-valued headers return the first value."
   [^HttpResponse response]
   (into {}
-        (for [header (iterator-seq (.iterator (.getHeaders response)))]
+        (for [^HttpHeader header (iterator-seq (.iterator (.getHeaders response)))]
           [(.lowercaseName header) (.value header)])))
 
 (defn response-body
@@ -203,12 +208,10 @@
    materializer-or-system: Materializer or ActorSystem"
   [^HttpResponse response materializer-or-system]
   (let [mat (http/->materializer materializer-or-system)]
-    (-> (.entity response)
-        (.toStrict (Duration/create 30 TimeUnit/SECONDS) mat)
-        (FutureConverters/asJava)
+    (-> (.toStrict ^ResponseEntity (.entity response) (long response-strict-timeout-ms) mat)
         (.thenApply (reify Function
                       (apply [_ strict]
-                        (.utf8String (.getData strict))))))))
+                        (.utf8String (.getData ^HttpEntity$Strict strict))))))))
 
 (defn response-body-bytes
   "Get the response body as a byte array.
@@ -217,12 +220,10 @@
    materializer-or-system: Materializer or ActorSystem"
   [^HttpResponse response materializer-or-system]
   (let [mat (http/->materializer materializer-or-system)]
-    (-> (.entity response)
-        (.toStrict (Duration/create 30 TimeUnit/SECONDS) mat)
-        (FutureConverters/asJava)
+    (-> (.toStrict ^ResponseEntity (.entity response) (long response-strict-timeout-ms) mat)
         (.thenApply (reify Function
                       (apply [_ strict]
-                        (.toArray (.getData strict))))))))
+                        (.toArray (.getData ^HttpEntity$Strict strict))))))))
 
 (defn discard-body
   "Discard the response body.
@@ -230,7 +231,7 @@
    Returns a CompletionStage<Done>."
   [^HttpResponse response materializer-or-system]
   (let [mat (http/->materializer materializer-or-system)]
-    (.discardBytes (.entity response) mat)))
+    (.discardBytes ^ResponseEntity (.entity response) mat)))
 
 ;; ---------------------------------------------------------------------------
 ;; Async Utilities

@@ -82,7 +82,7 @@
   (init [args]
     (let [{:keys [mediator topic group]} args]
       (core/! mediator (if group
-                         (DistributedPubSubMediator$Subscribe. ^String topic ^String group (core/self))
+                         (DistributedPubSubMediator$Subscribe. ^String topic ^String group ^ActorRef (core/self))
                          (DistributedPubSubMediator$Subscribe. ^String topic (core/self))))
       args))
   (handle msg

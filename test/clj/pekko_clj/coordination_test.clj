@@ -1,7 +1,7 @@
 (ns pekko-clj.coordination-test
   "Tests for N6: Split-Brain-Resolver config helper + CoordinatedShutdown wrapper
    (both live in pekko-clj.cluster)."
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.cluster :as cluster]
             [pekko-clj.test-support :as ts])
@@ -68,7 +68,7 @@
 
 (deftest sbr-unknown-strategy-throws-test
   (is (thrown? IllegalArgumentException
-               (cluster/split-brain-resolver-config {:active-strategy :bogus}))))
+        (cluster/split-brain-resolver-config {:active-strategy :bogus}))))
 
 ;; ---------------------------------------------------------------------------
 ;; create-system integration (SBR merged into the system's config)
@@ -76,10 +76,10 @@
 
 (deftest create-system-applies-sbr-test
   (let [sys (cluster/create-system "sbr-create"
-              {:port 0
-               :split-brain-resolver {:active-strategy :static-quorum
-                                      :quorum-size 3
-                                      :role "backend"}})]
+                                   {:port 0
+                                    :split-brain-resolver {:active-strategy :static-quorum
+                                                           :quorum-size 3
+                                                           :role "backend"}})]
     (try
       (let [cfg (.config (.settings sys))]
         (is (= "static-quorum" (.getString cfg "pekko.cluster.split-brain-resolver.active-strategy")))
@@ -91,9 +91,9 @@
   ;; :extra-config has higher precedence than :split-brain-resolver. (Override to
   ;; keep-majority, which needs no required params, so the node still starts.)
   (let [sys (cluster/create-system "sbr-precedence"
-              {:port 0
-               :split-brain-resolver {:active-strategy :static-quorum :quorum-size 3}
-               :extra-config "pekko.cluster.split-brain-resolver.active-strategy = keep-majority"})]
+                                   {:port 0
+                                    :split-brain-resolver {:active-strategy :static-quorum :quorum-size 3}
+                                    :extra-config "pekko.cluster.split-brain-resolver.active-strategy = keep-majority"})]
     (try
       (is (= "keep-majority"
              (.getString (.config (.settings sys))
@@ -139,7 +139,7 @@
   (let [sys (core/actor-system "cs-cancel")
         ran (atom false)
         c   (cluster/add-cancellable-shutdown-task sys :before-actor-system-terminate "cancel-me"
-                                                    (fn [] (reset! ran true)))]
+                                                   (fn [] (reset! ran true)))]
     (is (some? c))
     (is (true? (.cancel c)))
     (deref (cluster/run-coordinated-shutdown sys) 15000 nil)
@@ -155,12 +155,12 @@
   (let [sys (core/actor-system "cs-bad-reason")]
     (try
       (is (thrown? IllegalArgumentException
-                   (cluster/run-coordinated-shutdown sys :not-a-reason)))
+            (cluster/run-coordinated-shutdown sys :not-a-reason)))
       (finally (core/shutdown-system sys)))))
 
 (deftest add-shutdown-task-bad-phase-throws-test
   (let [sys (core/actor-system "cs-bad-phase")]
     (try
       (is (thrown? IllegalArgumentException
-                   (cluster/add-shutdown-task sys :not-a-phase "x" (fn [] nil))))
+            (cluster/add-shutdown-task sys :not-a-phase "x" (fn [] nil))))
       (finally (core/shutdown-system sys)))))

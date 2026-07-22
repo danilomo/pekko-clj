@@ -1,5 +1,5 @@
 (ns pekko-clj.examples.counter
-  (:require [pekko-clj.core :refer :all]))
+  (:require [pekko-clj.core :refer [! <! actor-system defactor reply spawn]]))
 
 (defactor counter
   "A simple counter actor."

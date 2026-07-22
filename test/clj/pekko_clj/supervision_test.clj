@@ -1,9 +1,8 @@
 (ns pekko-clj.supervision-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.supervision :as sup])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [org.apache.pekko.actor SupervisorStrategy
+  (:import [org.apache.pekko.actor SupervisorStrategy
             OneForOneStrategy AllForOneStrategy]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -85,8 +84,8 @@
                                                      nil)
                                                    nil)))
                                    :supervisor-strategy (sup/one-for-one
-                                                          {:max-retries 3 :within-ms 60000}
-                                                          (fn [_] :restart))
+                                                         {:max-retries 3 :within-ms 60000}
+                                                         (fn [_] :restart))
                                    :state nil})}
         parent (core/spawn *system* parent-def nil)
         child (await-ask parent :spawn-child)]
@@ -204,9 +203,9 @@
                                                    nil)))
                                    :supervisor-strategy
                                    (sup/one-for-one
-                                     (fn [ex]
-                                       (deliver received-exception ex)
-                                       :restart))
+                                    (fn [ex]
+                                      (deliver received-exception ex)
+                                      :restart))
                                    :state nil})}
         parent (core/spawn *system* parent-def nil)
         child (await-ask parent :spawn)]

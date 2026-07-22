@@ -5,12 +5,10 @@
    with proper content types and status codes."
   (:require [pekko-clj.http.marshalling :as marshal])
   (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes StatusCode
-                                                  ContentTypes ContentType HttpEntities
-                                                  ResponseEntity]
-           [org.apache.pekko.http.javadsl.model.headers RawHeader Location]
-           [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
-           [org.apache.pekko.util ByteString]
-           [org.apache.pekko.stream.javadsl Source]))
+            ContentTypes ContentType ContentType$NonBinary HttpEntities
+            ResponseEntity]
+           [org.apache.pekko.stream.javadsl Source]
+           [org.apache.pekko.http.javadsl.model.headers RawHeader Location]))
 
 ;; ---------------------------------------------------------------------------
 ;; Status Codes
@@ -45,7 +43,7 @@
 
 (defn ->status-code
   "Convert a status keyword or integer to a StatusCode."
-  [status]
+  ^StatusCode [status]
   (cond
     (instance? StatusCode status) status
     (keyword? status) (or (get status-codes status)
@@ -71,7 +69,7 @@
 
 (defn ->content-type
   "Convert a content type keyword to a ContentType."
-  [ct]
+  ^ContentType [ct]
   (cond
     (instance? ContentType ct) ct
     (keyword? ct) (or (get content-types ct)
@@ -88,9 +86,11 @@
    content: string or byte array
    content-type: keyword or ContentType"
   [content content-type]
+  ;; The (ContentType, String) overload is declared on ContentType$NonBinary — every
+  ;; content type here is NonBinary except :binary, which takes the byte[] overload.
   (let [ct (->content-type content-type)]
     (if (string? content)
-      (HttpEntities/create ct ^String content)
+      (HttpEntities/create ^ContentType$NonBinary ct ^String content)
       (HttpEntities/create ct ^bytes content))))
 
 (defn json
@@ -128,7 +128,7 @@
    content-type: keyword or ContentType"
   [source content-type]
   (let [ct (->content-type content-type)]
-    (HttpEntities/create ct source)))
+    (HttpEntities/create ct ^Source source)))
 
 ;; ---------------------------------------------------------------------------
 ;; Response Builders
@@ -151,20 +151,22 @@
    headers: map of header names (keyword or string) to values, added as raw headers
    body: HttpEntity, string, or nil"
   ([status body]
+   ;; Each branch picks its own withEntity overload. A single hinted `ent` would
+   ;; not do: an entity body needs withEntity(ResponseEntity) while a string needs
+   ;; withEntity(String), and hinting one would mis-dispatch the other.
+   ;; scaladsl HttpEntity$Strict implements javadsl ResponseEntity, so the
+   ;; ResponseEntity branch already covers it.
    (let [sc (->status-code status)
-         ent (cond
-               (nil? body) ""
-               (instance? ResponseEntity body) body
-               (instance? HttpEntity$Strict body) body
-               (string? body) body
-               :else (str body))]
-     (-> (HttpResponse/create)
-         (.withStatus sc)
-         (.withEntity ^String ent))))
+         ^HttpResponse resp (.withStatus (HttpResponse/create) ^StatusCode sc)]
+     (cond
+       (nil? body)                     (.withEntity resp "")
+       (instance? ResponseEntity body) (.withEntity resp ^ResponseEntity body)
+       (string? body)                  (.withEntity resp ^String body)
+       :else                           (.withEntity resp ^String (str body)))))
   ([status headers body]
-   (let [resp (response status body)]
+   (let [^HttpResponse resp (response status body)]
      (if (seq headers)
-       (.addHeaders resp (java.util.ArrayList. (->headers headers)))
+       (.addHeaders resp (java.util.ArrayList. ^java.util.Collection (->headers headers)))
        resp))))
 
 (defn ok
@@ -219,5 +221,5 @@
   ([url]
    (redirect url :found))
   ([url status]
-   (-> (response status (text (str "Redirecting to " url)))
-       (.addHeader (Location/create ^String url)))))
+   (let [^HttpResponse resp (response status (text (str "Redirecting to " url)))]
+     (.addHeader resp (Location/create ^String url)))))

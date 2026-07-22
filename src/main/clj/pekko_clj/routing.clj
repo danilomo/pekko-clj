@@ -19,52 +19,80 @@
    - tail-chopping      - Latency reduction via speculative sends
    - cluster-pool/group - Cluster-aware routers across nodes"
   (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [org.apache.pekko.routing RoundRobinPool RoundRobinGroup
-                                     RandomPool RandomGroup
-                                     BroadcastPool BroadcastGroup
-                                     SmallestMailboxPool BalancingPool
-                                     ConsistentHashingPool ConsistentHashingGroup
-                                     ConsistentHashingRouter$ConsistentHashMapper
-                                     ScatterGatherFirstCompletedPool
-                                     TailChoppingPool
-                                     DefaultResizer
-                                     AddRoutee RemoveRoutee AdjustPoolSize
-                                     ActorRefRoutee
-                                     FromConfig]
+  (:import [org.apache.pekko.actor ActorSystem Props]
+           [org.apache.pekko.routing Pool Group
+            RoundRobinPool RoundRobinGroup
+            RandomPool RandomGroup
+            BroadcastPool BroadcastGroup
+            SmallestMailboxPool BalancingPool
+            ConsistentHashingPool ConsistentHashingGroup
+            ConsistentHashingRouter$ConsistentHashMapper
+            ScatterGatherFirstCompletedPool
+            TailChoppingPool
+            DefaultResizer
+            AddRoutee RemoveRoutee AdjustPoolSize
+            ActorRefRoutee]
            [org.apache.pekko.cluster.routing ClusterRouterPool ClusterRouterPoolSettings
-                                             ClusterRouterGroup ClusterRouterGroupSettings]
+            ClusterRouterGroup ClusterRouterGroupSettings]
            [scala.concurrent.duration FiniteDuration]
            [java.util.concurrent TimeUnit]
            [pekko_clj.actor CljActor]))
 
 (defn- make-props
   "Create Props from an actor-def and args."
-  [actor-def args]
+  ^Props [actor-def args]
   (CljActor/create ((:make-props actor-def) args)))
 
 (defn- strategy->pool
   "Convert a strategy keyword to a Pool router."
-  [strategy size]
-  (case strategy
-    :round-robin (RoundRobinPool. size)
-    :random (RandomPool. size)
-    :broadcast (BroadcastPool. size)
-    :smallest-mailbox (SmallestMailboxPool. size)
-    :balancing (BalancingPool. size)
-    ;; Default to round-robin
-    (RoundRobinPool. size)))
+  ^Pool [strategy size]
+  (let [n (int size)]
+    (case strategy
+      :round-robin (RoundRobinPool. n)
+      :random (RandomPool. n)
+      :broadcast (BroadcastPool. n)
+      :smallest-mailbox (SmallestMailboxPool. n)
+      :balancing (BalancingPool. n)
+      ;; Default to round-robin
+      (RoundRobinPool. n))))
 
 (defn- strategy->group
   "Convert a strategy keyword to a Group router."
-  [strategy paths]
-  (let [path-list (java.util.ArrayList. paths)]
+  ^Group [strategy paths]
+  (let [path-list (java.util.ArrayList. ^java.util.Collection paths)]
     (case strategy
       :round-robin (RoundRobinGroup. path-list)
       :random (RandomGroup. path-list)
       :broadcast (BroadcastGroup. path-list)
       ;; Default to round-robin
       (RoundRobinGroup. path-list))))
+
+(defn- role-set
+  "The role set Pekko's cluster router settings take — empty when no role given."
+  ^java.util.Set [role]
+  (let [s (java.util.HashSet.)]
+    (when role (.add s role))
+    s))
+
+(defn- pool-with-resizer
+  "A pool of `strategy` with `resizer` attached.
+
+   `withResizer` is declared on each concrete pool class, not on the `Pool`
+   interface, so the strategy is re-dispatched here to keep every call direct.
+   BalancingPool does not declare it at all — its routees share one mailbox, so
+   there is nothing per-routee to resize — and is rejected with a clear message
+   rather than an opaque \"no matching method\" from the reflective call."
+  ^Pool [strategy size ^DefaultResizer resizer]
+  (let [n (int size)]
+    (case strategy
+      :random           (.withResizer (RandomPool. n) resizer)
+      :broadcast        (.withResizer (BroadcastPool. n) resizer)
+      :smallest-mailbox (.withResizer (SmallestMailboxPool. n) resizer)
+      :balancing (throw (IllegalArgumentException.
+                         (str ":balancing pools cannot be resized — all routees share a "
+                              "single mailbox. Use :round-robin, :random, :broadcast or "
+                              ":smallest-mailbox with :min-size/:max-size.")))
+      (.withResizer (RoundRobinPool. n) resizer))))
 
 (defn spawn-pool
   "Create a pool router that spawns and manages N worker actors.
@@ -89,7 +117,7 @@
    (let [props (make-props actor-def args)
          router (strategy->pool strategy size)
          router-props (.props router props)]
-     (.actorOf system router-props))))
+     (.actorOf ^ActorSystem system router-props))))
 
 (defn spawn-group
   "Create a group router that routes to existing actors at specified paths.
@@ -113,7 +141,7 @@
   ([system paths {:keys [strategy] :or {strategy :round-robin}}]
    (let [router (strategy->group strategy paths)
          props (.props router)]
-     (.actorOf system props))))
+     (.actorOf ^ActorSystem system props))))
 
 (defn broadcast
   "Send a message to all routees via a broadcast router.
@@ -170,11 +198,11 @@
     (throw (IllegalArgumentException. ":hash-fn is required for consistent-hash-pool")))
   (let [props (make-props actor-def args)
         mapper (make-hash-mapper hash-fn)
-        pool (-> (ConsistentHashingPool. size)
+        pool (-> (ConsistentHashingPool. (int size))
                  (.withVirtualNodesFactor virtual-nodes)
                  (.withHashMapper mapper))
         router-props (.props pool props)]
-    (.actorOf system router-props)))
+    (.actorOf ^ActorSystem system router-props)))
 
 (defn spawn-consistent-hash-group
   "Create a group router with consistent hashing.
@@ -195,13 +223,13 @@
                  :or {virtual-nodes 10}}]
   (when-not hash-fn
     (throw (IllegalArgumentException. ":hash-fn is required for consistent-hash-group")))
-  (let [path-list (java.util.ArrayList. paths)
+  (let [path-list (java.util.ArrayList. ^java.util.Collection paths)
         mapper (make-hash-mapper hash-fn)
-        group (-> (ConsistentHashingGroup. path-list)
+        group (-> (ConsistentHashingGroup. ^java.util.Collection path-list)
                   (.withVirtualNodesFactor virtual-nodes)
                   (.withHashMapper mapper))
         props (.props group)]
-    (.actorOf system props)))
+    (.actorOf ^ActorSystem system props)))
 
 ;; ---------------------------------------------------------------------------
 ;; Scatter-Gather Router
@@ -228,10 +256,10 @@
   (when-not timeout-ms
     (throw (IllegalArgumentException. ":timeout-ms is required for scatter-gather-pool")))
   (let [props (make-props actor-def args)
-        timeout (FiniteDuration/create timeout-ms TimeUnit/MILLISECONDS)
-        pool (ScatterGatherFirstCompletedPool. size timeout)
+        timeout (FiniteDuration/create (long timeout-ms) TimeUnit/MILLISECONDS)
+        pool (ScatterGatherFirstCompletedPool. (int size) timeout)
         router-props (.props pool props)]
-    (.actorOf system router-props)))
+    (.actorOf ^ActorSystem system router-props)))
 
 ;; ---------------------------------------------------------------------------
 ;; Tail-Chopping Router
@@ -260,11 +288,11 @@
   (when-not (and timeout-ms interval-ms)
     (throw (IllegalArgumentException. ":timeout-ms and :interval-ms are required for tail-chopping-pool")))
   (let [props (make-props actor-def args)
-        timeout (FiniteDuration/create timeout-ms TimeUnit/MILLISECONDS)
-        interval (FiniteDuration/create interval-ms TimeUnit/MILLISECONDS)
-        pool (TailChoppingPool. size timeout interval)
+        timeout (FiniteDuration/create (long timeout-ms) TimeUnit/MILLISECONDS)
+        interval (FiniteDuration/create (long interval-ms) TimeUnit/MILLISECONDS)
+        pool (TailChoppingPool. (int size) timeout interval)
         router-props (.props pool props)]
-    (.actorOf system router-props)))
+    (.actorOf ^ActorSystem system router-props)))
 
 ;; ---------------------------------------------------------------------------
 ;; Pool with Resizer
@@ -304,16 +332,15 @@
                           backoff-rate 0.1
                           messages-per-resize 10}}]
   (let [props (make-props actor-def args)
-        resizer (DefaultResizer. min-size max-size
-                                 pressure-threshold
-                                 rampup-rate
-                                 backoff-rate
-                                 messages-per-resize
-                                 3)  ; backoff-threshold
-        pool (-> (strategy->pool strategy min-size)
-                 (.withResizer resizer))
+        resizer (DefaultResizer. (int min-size) (int max-size)
+                                 (int pressure-threshold)
+                                 (double rampup-rate)
+                                 (double backoff-rate)
+                                 (int messages-per-resize)
+                                 (int 3))  ; backoff-threshold
+        pool (pool-with-resizer strategy min-size resizer)
         router-props (.props pool props)]
-    (.actorOf system router-props)))
+    (.actorOf ^ActorSystem system router-props)))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster-Aware Routers
@@ -346,16 +373,16 @@
                           allow-local true}}]
   (when-not (and total-instances max-per-node)
     (throw (IllegalArgumentException.
-             ":total-instances and :max-per-node are required for cluster-pool")))
+            ":total-instances and :max-per-node are required for cluster-pool")))
   (let [props (make-props actor-def args)
         local-pool (strategy->pool strategy max-per-node)
-        settings (ClusterRouterPoolSettings. total-instances
-                                              max-per-node
-                                              allow-local
-                                              (if role (java.util.HashSet. [role]) (java.util.HashSet.)))
+        settings (ClusterRouterPoolSettings. (int total-instances)
+                                             (int max-per-node)
+                                             (boolean allow-local)
+                                             (role-set role))
         cluster-pool (ClusterRouterPool. local-pool settings)
         router-props (.props cluster-pool props)]
-    (.actorOf system router-props)))
+    (.actorOf ^ActorSystem system router-props)))
 
 (defn spawn-cluster-group
   "Create a cluster-aware group router.
@@ -376,15 +403,15 @@
   [system paths {:keys [strategy role allow-local]
                  :or {strategy :round-robin
                       allow-local true}}]
-  (let [path-list (java.util.ArrayList. paths)
+  (let [path-list (java.util.ArrayList. ^java.util.Collection paths)
         local-group (strategy->group strategy paths)
-        settings (ClusterRouterGroupSettings. Integer/MAX_VALUE
-                                               path-list
-                                               allow-local
-                                               (if role (java.util.HashSet. [role]) (java.util.HashSet.)))
+        settings (ClusterRouterGroupSettings. (int Integer/MAX_VALUE)
+                                              path-list
+                                              (boolean allow-local)
+                                              (role-set role))
         cluster-group (ClusterRouterGroup. local-group settings)
         props (.props cluster-group)]
-    (.actorOf system props)))
+    (.actorOf ^ActorSystem system props)))
 
 ;; ---------------------------------------------------------------------------
 ;; Dynamic Routee Management

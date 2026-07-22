@@ -1,5 +1,5 @@
 (ns pekko-clj.http.client-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [pekko-clj.http.client :as client])
   (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes]))
 
@@ -16,7 +16,7 @@
   (testing "Response status keyword mapping"
     (let [ok-response (HttpResponse/create)
           not-found-response (-> (HttpResponse/create)
-                                  (.withStatus StatusCodes/NOT_FOUND))]
+                                 (.withStatus StatusCodes/NOT_FOUND))]
       (is (= :ok (client/response-status-keyword ok-response)))
       (is (= :not-found (client/response-status-keyword not-found-response))))))
 
@@ -28,9 +28,9 @@
   (testing "Successful response check"
     (let [ok-response (HttpResponse/create)
           created-response (-> (HttpResponse/create)
-                                (.withStatus StatusCodes/CREATED))
+                               (.withStatus StatusCodes/CREATED))
           error-response (-> (HttpResponse/create)
-                              (.withStatus StatusCodes/NOT_FOUND))]
+                             (.withStatus StatusCodes/NOT_FOUND))]
       (is (client/successful? ok-response))
       (is (client/successful? created-response))
       (is (not (client/successful? error-response))))))
@@ -39,9 +39,9 @@
   (testing "Client error response check"
     (let [ok-response (HttpResponse/create)
           bad-request (-> (HttpResponse/create)
-                           (.withStatus StatusCodes/BAD_REQUEST))
+                          (.withStatus StatusCodes/BAD_REQUEST))
           not-found (-> (HttpResponse/create)
-                         (.withStatus StatusCodes/NOT_FOUND))]
+                        (.withStatus StatusCodes/NOT_FOUND))]
       (is (not (client/client-error? ok-response)))
       (is (client/client-error? bad-request))
       (is (client/client-error? not-found)))))
@@ -50,9 +50,9 @@
   (testing "Server error response check"
     (let [ok-response (HttpResponse/create)
           server-error (-> (HttpResponse/create)
-                            (.withStatus StatusCodes/INTERNAL_SERVER_ERROR))
+                           (.withStatus StatusCodes/INTERNAL_SERVER_ERROR))
           bad-gateway (-> (HttpResponse/create)
-                           (.withStatus StatusCodes/BAD_GATEWAY))]
+                          (.withStatus StatusCodes/BAD_GATEWAY))]
       (is (not (client/server-error? ok-response)))
       (is (client/server-error? server-error))
       (is (client/server-error? bad-gateway)))))

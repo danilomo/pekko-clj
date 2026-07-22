@@ -1,14 +1,12 @@
 (ns pekko-clj.cluster-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [pekko-clj.core :as core]
             [pekko-clj.cluster :as cluster]
             [pekko-clj.cluster.singleton :as singleton]
             [pekko-clj.cluster.sharding :as sharding]
             [pekko-clj.test-support :as ts :refer [eventually]])
-  (:import [org.apache.pekko.actor ActorSystem]
-           [com.typesafe.config ConfigFactory]
-           [scala.concurrent Await]
-           [scala.concurrent.duration Duration]))
+  (:import [com.typesafe.config ConfigFactory]))
 
 ;; ---------------------------------------------------------------------------
 ;; Test Actor Definitions
@@ -49,7 +47,7 @@
       (is (ts/wait-for-cluster-up sys))
       (let [self (cluster/self-member sys)]
         (is (some? self))
-        (is (= :up (keyword (clojure.string/lower-case (str (.status self)))))))
+        (is (= :up (keyword (str/lower-case (str (.status self)))))))
       (finally
         (ts/terminate-system sys)))))
 
@@ -77,8 +75,8 @@
         events (atom [])]
     (try
       (let [subscriber (cluster/subscribe sys
-                         (fn [event]
-                           (swap! events conj (:type event))))]
+                                          (fn [event]
+                                            (swap! events conj (:type event))))]
         (is (some? subscriber))
         ;; Join to trigger events
         (.join (cluster/cluster sys) (.selfAddress (cluster/cluster sys)))
@@ -94,8 +92,8 @@
 (deftest create-system-accepts-config-object
   ;; A Config object is used verbatim (falling back to reference.conf).
   (let [cfg (.withFallback
-              (ConfigFactory/parseString "my.custom.key = 42\npekko.actor.provider = local")
-              (ConfigFactory/load))
+             (ConfigFactory/parseString "my.custom.key = 42\npekko.actor.provider = local")
+             (ConfigFactory/load))
         sys (cluster/create-system "b5-config-passthrough" cfg)]
     (try
       (let [config (.config (.settings sys))]
@@ -106,7 +104,7 @@
 
 (deftest create-system-applies-roles-and-hostname
   (let [sys (cluster/create-system "b5-roles"
-              {:hostname "127.0.0.1" :port 0 :roles ["backend" "data-node"]})]
+                                   {:hostname "127.0.0.1" :port 0 :roles ["backend" "data-node"]})]
     (try
       (let [config (.config (.settings sys))]
         (is (= "127.0.0.1" (.getString config "pekko.remote.artery.canonical.hostname")))
@@ -118,9 +116,9 @@
 (deftest create-system-merges-extra-config
   ;; :extra-config overrides a generated default (provider) and adds a new key.
   (let [sys (cluster/create-system "b5-extra"
-              {:hostname "127.0.0.1" :port 0
-               :extra-config (str "pekko.actor.provider = local\n"
-                                  "pekko.cluster.min-nr-of-members = 3")})]
+                                   {:hostname "127.0.0.1" :port 0
+                                    :extra-config (str "pekko.actor.provider = local\n"
+                                                       "pekko.cluster.min-nr-of-members = 3")})]
     (try
       (let [config (.config (.settings sys))]
         ;; overrides the generated provider = cluster
@@ -142,8 +140,8 @@
   ;; With seed-nodes configured, (join sys) parses them and calls joinSeedNodes
   ;; (async — it must not throw synchronously).
   (let [sys (cluster/create-system "b5-join-seeds"
-              {:hostname "127.0.0.1" :port 0
-               :seed-nodes ["pekko://b5-join-seeds@127.0.0.1:25599"]})]
+                                   {:hostname "127.0.0.1" :port 0
+                                    :seed-nodes ["pekko://b5-join-seeds@127.0.0.1:25599"]})]
     (try
       (is (nil? (cluster/join sys)))
       (finally
@@ -162,8 +160,8 @@
 
       ;; Start singleton manager
       (let [manager (singleton/start sys counter-actor
-                      {:name "test-singleton"
-                       :args {:initial 10}})]
+                                     {:name "test-singleton"
+                                      :args {:initial 10}})]
         (is (some? manager))
         (is (= "test-singleton" (.name (.path manager)))))
       (finally
@@ -178,13 +176,13 @@
 
       ;; Start singleton manager
       (let [manager (singleton/start sys counter-actor
-                      {:name "proxy-test-singleton"
-                       :args {:initial 5}})]
+                                     {:name "proxy-test-singleton"
+                                      :args {:initial 5}})]
         (is (some? manager))
 
         ;; Create proxy
         (let [proxy-ref (singleton/proxy sys
-                          {:singleton-manager-path "/user/proxy-test-singleton"})]
+                                         {:singleton-manager-path "/user/proxy-test-singleton"})]
           (is (some? proxy-ref))))
       (finally
         (ts/terminate-system sys)))))
@@ -200,8 +198,8 @@
 
       ;; Start sharding
       (let [region (sharding/start sys entity-actor
-                     {:type-name "TestEntity"
-                      :num-shards 10})]
+                                   {:type-name "TestEntity"
+                                    :num-shards 10})]
         (is (some? region))
         ;; Send a message to entity "entity-1" (created on demand).
         (sharding/tell region "entity-1" [:set-data "hello"])
@@ -220,8 +218,8 @@
       (is (ts/wait-for-cluster-up sys))
 
       (let [region (sharding/start sys entity-actor
-                     {:type-name "MultiEntity"
-                      :num-shards 10})]
+                                   {:type-name "MultiEntity"
+                                    :num-shards 10})]
         ;; Send to multiple entities
         (sharding/tell region "order-1" [:set-data {:item "book" :qty 2}])
         (sharding/tell region "order-2" [:set-data {:item "pen" :qty 5}])
@@ -249,12 +247,12 @@
       (is (ts/wait-for-cluster-up sys))
 
       (let [region (sharding/start sys entity-actor
-                     {:type-name "IdEntity"
-                      :num-shards 10})]
-        ;; Entity should know its own ID (poll until it responds).
-        (let [result (ts/poll-until
-                      #(deref (sharding/ask region "my-entity-id" :get-id) 5000 nil))]
-          (is (= "my-entity-id" result))))
+                                   {:type-name "IdEntity"
+                                    :num-shards 10})
+            ;; Entity should know its own ID (poll until it responds).
+            result (ts/poll-until
+                    #(deref (sharding/ask region "my-entity-id" :get-id) 5000 nil))]
+        (is (= "my-entity-id" result)))
       (finally
         (ts/terminate-system sys)))))
 
@@ -264,9 +262,9 @@
 
 (deftest cluster-create-system-with-config
   (let [sys (cluster/create-system "config-test"
-              {:hostname "127.0.0.1"
-               :port 0
-               :roles ["test-role"]})]
+                                   {:hostname "127.0.0.1"
+                                    :port 0
+                                    :roles ["test-role"]})]
     (try
       (is (some? sys))
       (is (= "config-test" (.name sys)))
@@ -277,9 +275,9 @@
 
 (deftest cluster-has-role
   (let [sys (cluster/create-system "role-test"
-              {:hostname "127.0.0.1"
-               :port 0
-               :roles ["backend" "api"]})]
+                                   {:hostname "127.0.0.1"
+                                    :port 0
+                                    :roles ["backend" "api"]})]
     (try
       (is (ts/wait-for-cluster-up sys))
       (is (cluster/has-role? sys "backend"))
@@ -295,8 +293,8 @@
 (deftest join-seed-nodes-test
   (testing "Join cluster with seed nodes"
     (let [sys (cluster/create-system "seed-test"
-                {:hostname "127.0.0.1"
-                 :port 0})]
+                                     {:hostname "127.0.0.1"
+                                      :port 0})]
       (try
         ;; Test that join-seed-nodes can be called with a list of addresses
         ;; In a single-node test, we use our own address
@@ -310,8 +308,8 @@
 (deftest is-terminated-test
   (testing "Check cluster termination status"
     (let [sys (cluster/create-system "term-test"
-                {:hostname "127.0.0.1"
-                 :port 0})]
+                                     {:hostname "127.0.0.1"
+                                      :port 0})]
       (try
         (is (ts/wait-for-cluster-up sys))
         ;; Cluster should not be terminated while running
@@ -322,8 +320,8 @@
 (deftest members-by-age-test
   (testing "Members sorted by age"
     (let [sys (cluster/create-system "age-test"
-                {:hostname "127.0.0.1"
-                 :port 0})]
+                                     {:hostname "127.0.0.1"
+                                      :port 0})]
       (try
         (is (ts/wait-for-cluster-up sys))
         (let [members (cluster/members-by-age sys)]
@@ -340,8 +338,8 @@
 (deftest state-snapshot-test
   (testing "Get cluster state snapshot"
     (let [sys (cluster/create-system "snapshot-test"
-                {:hostname "127.0.0.1"
-                 :port 0})]
+                                     {:hostname "127.0.0.1"
+                                      :port 0})]
       (try
         (is (ts/wait-for-cluster-up sys))
         (let [snapshot (cluster/state-snapshot sys)]
@@ -364,16 +362,16 @@
 (deftest prepare-for-shutdown-test
   (testing "Coordinated cluster shutdown preparation"
     (let [sys (cluster/create-system "shutdown-test"
-                {:hostname "127.0.0.1"
-                 :port 0})
+                                     {:hostname "127.0.0.1"
+                                      :port 0})
           shutdown-event (promise)]
       (try
         (is (ts/wait-for-cluster-up sys))
         ;; Subscribe to cluster events to observe shutdown event
         (cluster/subscribe sys
-          (fn [event]
-            (when (= :member-preparing-for-shutdown (:type event))
-              (deliver shutdown-event event))))
+                           (fn [event]
+                             (when (= :member-preparing-for-shutdown (:type event))
+                               (deliver shutdown-event event))))
         ;; Call prepare-for-shutdown
         (cluster/prepare-for-shutdown sys)
         ;; Should receive shutdown event within timeout

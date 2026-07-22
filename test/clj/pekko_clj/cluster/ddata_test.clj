@@ -1,14 +1,13 @@
 (ns pekko-clj.cluster.ddata-test
   "Tests for N8: Distributed Data (ORSet / LWWMap / PNCounter)."
-  (:require [clojure.test :refer :all]
-            [pekko-clj.core :as core]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.cluster.ddata :as ddata]
             [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.actor ActorRef]
-           [org.apache.pekko.cluster.ddata Key ORSet LWWMap PNCounter SelfUniqueAddress
-                                           Replicator$WriteLocal$ Replicator$WriteAll
-                                           Replicator$WriteMajority Replicator$ReadLocal$
-                                           Replicator$ReadAll Replicator$ReadMajority]))
+           [org.apache.pekko.cluster.ddata Key ORSet SelfUniqueAddress
+            Replicator$WriteLocal$ Replicator$WriteAll
+            Replicator$WriteMajority Replicator$ReadLocal$
+            Replicator$ReadAll Replicator$ReadMajority]))
 
 (defn- await-result [future]
   (deref future 10000 {:status :ask-timeout}))

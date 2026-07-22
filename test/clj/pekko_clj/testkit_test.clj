@@ -1,5 +1,5 @@
 (ns pekko-clj.testkit-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.test :as t]
             [pekko-clj.stream :as s])

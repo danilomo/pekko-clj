@@ -18,7 +18,6 @@
        (t/send-to p echo :ping)
        (t/expect-msg p :ping)
        (t/shutdown p))"
-  (:require [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorRef ActorSystem]
            [org.apache.pekko.testkit TestActorRef]
            [org.apache.pekko.testkit.javadsl TestKit]

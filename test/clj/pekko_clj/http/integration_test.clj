@@ -1,6 +1,6 @@
 (ns pekko-clj.http.integration-test
   "Integration tests for HTTP server and client."
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.string :as str]
             [pekko-clj.core :as core]
             [pekko-clj.stream :as stream]
@@ -10,14 +10,13 @@
             [pekko-clj.http.marshalling :as marshal]
             [pekko-clj.http.client :as client]
             [pekko-clj.test-support :as ts])
-  (:import [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.http.javadsl Http]
+  (:import [org.apache.pekko.http.javadsl Http]
            [org.apache.pekko.http.javadsl.model.ws WebSocketRequest]
-           [org.apache.pekko.stream Materializer]
            [org.apache.pekko.stream.javadsl Flow]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
-           [java.net ServerSocket]))
+           [java.net ServerSocket]
+           [java.util.concurrent CompletableFuture]))
 
 (def ^:dynamic *system* nil)
 (def ^:dynamic *mat* nil)
@@ -96,21 +95,21 @@
                    (routing/method-post
                      (routing/path-end
                        (routing/extract-request
-                         (fn [req]
-                           (routing/extract-materializer
-                             (fn [mat]
-                               (routing/complete-future
-                                 (-> (http/entity->string req mat)
-                                     (client/then-apply
-                                       (fn [body]
-                                         (reset! received-body body)
-                                         (resp/ok body))))))))))))]
+                        (fn [req]
+                          (routing/extract-materializer
+                           (fn [mat]
+                             (routing/complete-future
+                              (-> (http/entity->string req mat)
+                                  (client/then-apply
+                                   (fn [body]
+                                     (reset! received-body body)
+                                     (resp/ok body))))))))))))]
       (with-test-server routes
         (fn []
           (let [response (-> (client/POST *system*
                                           (str "http://127.0.0.1:" *port* "/echo")
-                                          {:body "Test body content"
-                                           :content-type :plain})
+                               {:body "Test body content"
+                                :content-type :plain})
                              (client/await-response 5000))]
             (is (client/successful? response))
             (let [body (-> (client/response-body response *system*)
@@ -246,15 +245,15 @@
                    (routing/method-post
                      (routing/path-end
                        (routing/with-json-body
-                         (fn [data]
-                           (reset! received data)
-                           (routing/complete-json :created
-                             {:id 7 :name (:name data) :tags (:tags data)}))))))]
+                        (fn [data]
+                          (reset! received data)
+                          (routing/complete-json :created
+                                                 {:id 7 :name (:name data) :tags (:tags data)}))))))]
       (with-test-server routes
         (fn []
           (let [response (-> (client/POST *system* (url "/users")
-                                          {:body (marshal/->json {:name "ada" :tags ["x" "y"]})
-                                           :content-type :json})
+                               {:body (marshal/->json {:name "ada" :tags ["x" "y"]})
+                                :content-type :json})
                              (client/await-response 5000))]
             (is (= 201 (client/response-status response)))
             ;; Handler saw real Clojure data with keywordized keys
@@ -272,7 +271,7 @@
       (with-test-server routes
         (fn []
           (let [response (-> (client/POST *system* (url "/users")
-                                          {:body "{not json" :content-type :json})
+                               {:body "{not json" :content-type :json})
                              (client/await-response 5000))]
             (is (= 400 (client/response-status response)))
             (is (str/includes? (get-body response) "Malformed JSON"))))))))
@@ -283,12 +282,12 @@
                    (routing/method-post
                      (routing/path-end
                        (routing/with-edn-body
-                         (fn [data] (routing/complete-edn {:echo data :n (count (:items data))}))))))]
+                        (fn [data] (routing/complete-edn {:echo data :n (count (:items data))}))))))]
       (with-test-server routes
         (fn []
           (let [response (-> (client/POST *system* (url "/edn")
-                                          {:body (pr-str {:items #{:a :b}})
-                                           :content-type :edn})
+                               {:body (pr-str {:items #{:a :b}})
+                                :content-type :edn})
                              (client/await-response 5000))
                 body (marshal/edn-> (get-body response))]
             (is (= 200 (client/response-status response)))
@@ -305,7 +304,7 @@
       (with-test-server routes
         (fn []
           (let [response (-> (client/POST *system* (url "/raw")
-                                          {:body "hello" :content-type :plain})
+                               {:body "hello" :content-type :plain})
                              (client/await-response 5000))]
             (is (= 200 (client/response-status response)))
             (is (= "got:hello" (get-body response)))))))))
@@ -324,15 +323,15 @@
       (with-test-server routes
         (fn []
           (let [json-resp (-> (client/POST *system* (url "/any")
-                                           {:body "{\"a\":1}" :content-type :json})
+                                {:body "{\"a\":1}" :content-type :json})
                               (client/await-response 5000))]
             (is (= "{:a 1}" (get-body json-resp))))
           (let [edn-resp (-> (client/POST *system* (url "/any")
-                                          {:body "{:a 1}" :content-type :edn})
+                               {:body "{:a 1}" :content-type :edn})
                              (client/await-response 5000))]
             (is (= "{:a 1}" (get-body edn-resp))))
           (let [text-resp (-> (client/POST *system* (url "/any")
-                                           {:body "just text" :content-type :plain})
+                                {:body "just text" :content-type :plain})
                               (client/await-response 5000))]
             (is (= "\"just text\"" (get-body text-resp)))))))))
 
@@ -342,24 +341,24 @@
                    (routing/method-post
                      (routing/path-end
                        (routing/form-field "username"
-                         (fn [username]
-                           (routing/form-field-opt "realm" "default"
-                             (fn [realm]
-                               (routing/complete (str username "@" realm)))))))))]
+                                           (fn [username]
+                                             (routing/form-field-opt "realm" "default"
+                                                                     (fn [realm]
+                                                                       (routing/complete (str username "@" realm)))))))))]
       (with-test-server routes
         (fn []
           ;; The optional field falls back to its default when absent
           (let [response (-> (client/POST *system* (url "/login")
-                                          {:body "username=ada" :content-type :form})
+                               {:body "username=ada" :content-type :form})
                              (client/await-response 5000))]
             (is (= "ada@default" (get-body response))))
           (let [response (-> (client/POST *system* (url "/login")
-                                          {:body "username=ada&realm=lovelace" :content-type :form})
+                               {:body "username=ada&realm=lovelace" :content-type :form})
                              (client/await-response 5000))]
             (is (= "ada@lovelace" (get-body response))))
           ;; A missing required field is a rejection (400), not a 500
           (let [response (-> (client/POST *system* (url "/login")
-                                          {:body "realm=x" :content-type :form})
+                               {:body "realm=x" :content-type :form})
                              (client/await-response 5000))]
             (is (= 400 (client/response-status response)))))))))
 
@@ -368,8 +367,8 @@
                  (routing/method-get
                    (routing/path-end
                      (routing/params
-                       (fn [{:keys [q page]}]
-                         (routing/complete-json {:q q :page page}))))))]
+                      (fn [{:keys [q page]}]
+                        (routing/complete-json {:q q :page page}))))))]
     (with-test-server routes
       (fn []
         (let [response (-> (client/GET *system* (url "/search?q=pekko&page=2"))
@@ -382,13 +381,13 @@
                    (routing/path-end
                      (routing/routes
                        (routing/form-fields
-                         (fn [{:keys [username]}]
-                           (routing/complete (str "hello " username))))))))]
+                        (fn [{:keys [username]}]
+                          (routing/complete (str "hello " username))))))))]
     (with-test-server routes
       (fn []
         (let [response (-> (client/POST *system* (url "/login")
-                                        {:body "username=ada&password=secret"
-                                         :content-type :form})
+                             {:body "username=ada&password=secret"
+                              :content-type :form})
                            (client/await-response 5000))]
           (is (= "hello ada" (get-body response))))))))
 
@@ -399,21 +398,21 @@
 (deftest exception-handler-test
   (testing "a throwing handler is turned into a response instead of a bare 500"
     (let [routes (routing/handle-exceptions
-                   (routing/exception-handler
-                     {IllegalArgumentException (fn [e] (routing/complete :bad-request
-                                                                         (str "bad: " (.getMessage e))))
-                      Throwable (fn [_] (routing/complete :internal-server-error "unexpected"))})
+                  (routing/exception-handler
+                   {IllegalArgumentException (fn [e] (routing/complete :bad-request
+                                                                       (str "bad: " (.getMessage e))))
+                    Throwable (fn [_] (routing/complete :internal-server-error "unexpected"))})
                    (routing/routes
                      (routing/path "boom"
                        (routing/method-get
                          (routing/path-end
                            (routing/handle-request
-                             (fn [_] (throw (IllegalArgumentException. "nope")))))))
+                            (fn [_] (throw (IllegalArgumentException. "nope")))))))
                      (routing/path "kaboom"
                        (routing/method-get
                          (routing/path-end
                            (routing/handle-request
-                             (fn [_] (throw (RuntimeException. "other")))))))))]
+                            (fn [_] (throw (RuntimeException. "other")))))))))]
       (with-test-server routes
         (fn []
           (let [response (-> (client/GET *system* (url "/boom")) (client/await-response 5000))]
@@ -426,8 +425,8 @@
 (deftest rejection-handler-test
   (testing "custom not-found rejection handling"
     (let [routes (routing/handle-rejections
-                   (routing/rejection-handler
-                     {:not-found (routing/complete :not-found "custom 404")})
+                  (routing/rejection-handler
+                   {:not-found (routing/complete :not-found "custom 404")})
                    (routing/path "exists"
                      (routing/method-get
                        (routing/path-end (routing/complete "here")))))]
@@ -470,10 +469,10 @@
   (testing "Custom request handler"
     (let [routes (routing/path "custom"
                    (routing/handle-request
-                     (fn [req]
-                       (let [method (http/request-method req)
-                             path (http/request-path req)]
-                         (resp/ok (str "Method: " (name method) ", Path: " path))))))]
+                    (fn [req]
+                      (let [method (http/request-method req)
+                            path (http/request-path req)]
+                        (resp/ok (str "Method: " (name method) ", Path: " path))))))]
       (with-test-server routes
         (fn []
           (let [response (-> (client/GET *system* (str "http://127.0.0.1:" *port* "/custom"))
@@ -483,3 +482,25 @@
                            (client/await-response 5000))]
               (is (clojure.string/includes? body "Method: get"))
               (is (clojure.string/includes? body "Path: /custom")))))))))
+
+(deftest bind-server-with-function-handler-test
+  ;; Regression: bind-server documents "a Route or function (request ->
+  ;; CompletionStage<HttpResponse>)", but the function branch reified
+  ;; java.util.function.Function while ServerBuilder.bind takes Pekko's
+  ;; japi.function.Function — so it threw "No matching method bind found taking
+  ;; 1 args". Reflection hid the mismatch and no test exercised this branch.
+  (testing "a plain function handler binds and serves requests"
+    (let [handler (fn [req]
+                    (CompletableFuture/completedFuture
+                     (resp/ok (str "fn-handler:" (http/request-path req)))))
+          binding (-> (http/bind-server *system* "127.0.0.1" *port* handler)
+                      (stream/await-completion 5000))]
+      (try
+        (let [response (-> (client/GET *system* (str "http://127.0.0.1:" *port* "/anything"))
+                           (client/await-response 5000))]
+          (is (client/successful? response))
+          (is (= "fn-handler:/anything"
+                 (-> (client/response-body response *system*)
+                     (client/await-response 5000)))))
+        (finally
+          (stream/await-completion (http/unbind binding) 5000))))))

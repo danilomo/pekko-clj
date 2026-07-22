@@ -1,5 +1,5 @@
 (ns pekko-clj.persistence-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.persistence :as p]
             [pekko-clj.core :as core]
             [pekko-clj.test-support :refer [eventually]])
@@ -7,18 +7,9 @@
            [com.typesafe.config ConfigFactory]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
-           [java.io File]
            [java.util UUID]))
 
 (def timeout-duration (Duration/create 5 "seconds"))
-
-(defn- delete-directory [^File dir]
-  (when (.exists dir)
-    (doseq [f (.listFiles dir)]
-      (if (.isDirectory f)
-        (delete-directory f)
-        (.delete f)))
-    (.delete dir)))
 
 (defn- create-test-system [name]
   (let [config (ConfigFactory/load "persistence-test.conf")]
@@ -63,7 +54,7 @@
 (p/defactor-persistent counter-with-snapshot
   :persistence-id (fn [args] (str "counter-snap-" (:id args)))
 
-  (init [args] {:count 0})
+  (init [_args] {:count 0})
 
   (command :increment
     (p/persist [:incremented]))
@@ -127,7 +118,7 @@
   (event [:incremented]
     (update state :count inc))
 
-  (on-recovery-complete [this]
+  (on-recovery-complete [_this]
     (reset! recovery-completed true)))
 
 (p/defactor-persistent reply-helper-actor
@@ -434,7 +425,8 @@
   (reset! recovery-completed false)
   (let [sys (create-test-system "persistence-test")
         id (unique-id)
-        actor (p/spawn sys recovery-callback-actor {:id id})]
+        ;; Spawning is the trigger: recovery runs on start and fires the callback.
+        _actor (p/spawn sys recovery-callback-actor {:id id})]
     (try
       (is (eventually @recovery-completed) "Recovery callback should have been called")
       (finally

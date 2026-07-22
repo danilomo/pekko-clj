@@ -1,10 +1,10 @@
 (ns pekko-clj.cluster.sharding-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.core :as core]
             [pekko-clj.cluster.sharding :as sharding]
             [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.cluster.sharding ClusterShardingSettings
-                                              ClusterShardingSettings$PassivationStrategySettings]))
+            ClusterShardingSettings$PassivationStrategySettings]))
 
 ;; core/<?> now returns a CompletableFuture; block on it (deref returns nil on
 ;; timeout, rethrows the actor's failure otherwise).
@@ -49,8 +49,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys counter-entity
-                     {:type-name "Counter"
-                      :num-shards 10})]
+                                   {:type-name "Counter"
+                                    :num-shards 10})]
         (is (some? region))
         (is (instance? org.apache.pekko.actor.ActorRef region)))
       (finally
@@ -61,8 +61,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys counter-entity
-                     {:type-name "Counter"
-                      :num-shards 10})]
+                                   {:type-name "Counter"
+                                    :num-shards 10})]
         ;; Tell some increments
         (sharding/tell region "counter-1" [:inc])
         (sharding/tell region "counter-1" [:inc])
@@ -81,8 +81,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [_ (sharding/start sys counter-entity
-                {:type-name "Counter"
-                 :num-shards 10})
+                              {:type-name "Counter"
+                               :num-shards 10})
             ref (sharding/entity-ref sys "Counter" "test-entity-1")]
         (is (some? ref))
         (is (= "test-entity-1" (:entity-id ref)))
@@ -96,8 +96,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [_ (sharding/start sys counter-entity
-                {:type-name "Counter"
-                 :num-shards 10})
+                              {:type-name "Counter"
+                               :num-shards 10})
             ref (sharding/entity-ref sys "Counter" "entity-123")]
         ;; Use tell-entity
         (sharding/tell-entity ref [:inc])
@@ -112,8 +112,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [_ (sharding/start sys counter-entity
-                {:type-name "Counter"
-                 :num-shards 10})
+                              {:type-name "Counter"
+                               :num-shards 10})
             ref-a (sharding/entity-ref sys "Counter" "entity-a")
             ref-b (sharding/entity-ref sys "Counter" "entity-b")]
         ;; Increment different entities
@@ -135,8 +135,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [original (sharding/start sys counter-entity
-                       {:type-name "TestEntity"
-                        :num-shards 10})
+                                     {:type-name "TestEntity"
+                                      :num-shards 10})
             retrieved (sharding/get-shard-region sys "TestEntity")]
         (is (some? retrieved))
         (is (= original retrieved)))
@@ -151,8 +151,8 @@
       (is (not (sharding/shard-region-registered? sys "NotStarted")))
       ;; Start a region
       (sharding/start sys counter-entity
-        {:type-name "Started"
-         :num-shards 10})
+                      {:type-name "Started"
+                       :num-shards 10})
       ;; Now it should be registered
       (is (sharding/shard-region-registered? sys "Started"))
       (finally
@@ -222,11 +222,11 @@
   ;; An empty map disables passivation rather than guessing a strategy
   (is (nil? (opt-get (.idleEntitySettings (sharding/passivation-settings {})))))
   (is (thrown? IllegalArgumentException
-               (sharding/passivation-settings {:strategy :bogus :active-entity-limit 1})))
+        (sharding/passivation-settings {:strategy :bogus :active-entity-limit 1})))
   (is (thrown? IllegalArgumentException
-               (sharding/passivation-settings {:strategy :least-recently-used
-                                               :active-entity-limit 1
-                                               :segmented :nonsense}))))
+        (sharding/passivation-settings {:strategy :least-recently-used
+                                        :active-entity-limit 1
+                                        :segmented :nonsense}))))
 
 (deftest sharding-settings-from-opts-test
   (let [sys (ts/create-cluster-system "sharding-settings-test")]
@@ -254,7 +254,7 @@
       ;; Defaults: the store mode stays whatever config says (ddata in the test conf)
       (is (= "ddata" (.rememberEntitiesStore (sharding/sharding-settings sys {}))))
       (is (thrown? IllegalArgumentException
-                   (sharding/sharding-settings sys {:remember-entities-store :sqlite})))
+            (sharding/sharding-settings sys {:remember-entities-store :sqlite})))
       ;; A ready-made PassivationStrategySettings is accepted as-is
       (let [^ClusterShardingSettings s
             (sharding/sharding-settings
@@ -289,11 +289,11 @@
       (is (ts/wait-for-cluster-up sys))
       (reset! stopped-entities #{})
       (let [region (sharding/start sys passivating-entity
-                     {:type-name "IdlePassivating"
-                      :num-shards 10
-                      :passivation {:strategy :idle
-                                    :idle-timeout 1000
-                                    :idle-interval 200}})]
+                                   {:type-name "IdlePassivating"
+                                    :num-shards 10
+                                    :passivation {:strategy :idle
+                                                  :idle-timeout 1000
+                                                  :idle-interval 200}})]
         (sharding/tell region "idle-1" [:inc])
         (is (eventually (= 1 (await-result (sharding/ask region "idle-1" [:get])))))
         ;; Left alone, the shard passivates it.
@@ -309,8 +309,8 @@
       (is (ts/wait-for-cluster-up sys))
       (reset! stopped-entities #{})
       (let [region (sharding/start sys passivating-entity
-                     {:type-name "ManualPassivating"
-                      :num-shards 10})]
+                                   {:type-name "ManualPassivating"
+                                    :num-shards 10})]
         (sharding/tell region "manual-1" [:inc])
         (sharding/tell region "manual-1" [:inc])
         (is (eventually (= 2 (await-result (sharding/ask region "manual-1" [:get])))))
@@ -330,10 +330,10 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys passivating-entity
-                     {:type-name "HandOff"
-                      :num-shards 10
-                      :remember-entities true
-                      :stop-message :stop-now})]
+                                   {:type-name "HandOff"
+                                    :num-shards 10
+                                    :remember-entities true
+                                    :stop-message :stop-now})]
         (sharding/tell region "handoff-1" [:inc])
         (is (eventually (= 1 (await-result (sharding/ask region "handoff-1" [:get]))))))
       (finally
@@ -348,8 +348,8 @@
     (try
       (is (ts/wait-for-cluster-up sys))
       (let [region (sharding/start sys counter-entity
-                     {:type-name "StatsEntity"
-                      :num-shards 10})]
+                                   {:type-name "StatsEntity"
+                                    :num-shards 10})]
         ;; Create some entities
         (sharding/tell region "entity-1" [:inc])
         (sharding/tell region "entity-2" [:inc])

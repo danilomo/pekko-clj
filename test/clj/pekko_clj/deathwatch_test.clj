@@ -1,8 +1,8 @@
 (ns pekko-clj.deathwatch-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.test-support :refer [eventually]])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
+  (:import [org.apache.pekko.actor ActorRef]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -51,7 +51,7 @@
                   :state nil})
         target (core/new-actor
                 *system*
-                {:function (fn [this msg] nil)
+                {:function (fn [_this _msg] nil)
                  :state nil})]
     ;; Have watcher watch target
     (is (= :watching (await-ask watcher [:watch-target target])))
@@ -89,14 +89,14 @@
                                                       nil)
 
                                                     :else nil)))
-                                    :state nil})}]
-    (let [target (core/spawn *system* watchable-def nil)
-          watcher (core/spawn *system* watcher-def target)]
-      (is (= :started (await-ask watcher :start-watching)))
-      (core/! target :stop)
-      (let [terminated-ref (deref terminated-received 3000 :timeout)]
-        (is (not= :timeout terminated-ref))
-        (is (= target terminated-ref))))))
+                                    :state nil})}
+        target (core/spawn *system* watchable-def nil)
+        watcher (core/spawn *system* watcher-def target)]
+    (is (= :started (await-ask watcher :start-watching)))
+    (core/! target :stop)
+    (let [terminated-ref (deref terminated-received 3000 :timeout)]
+      (is (not= :timeout terminated-ref))
+      (is (= target terminated-ref)))))
 
 (deftest unwatch-prevents-terminated-message
   (let [terminated-received (atom false)
@@ -126,7 +126,7 @@
                   :state nil})
         target (core/new-actor
                 *system*
-                {:function (fn [this msg] nil)
+                {:function (fn [_this _msg] nil)
                  :state nil})]
     ;; Watch then unwatch
     (is (= :watching (await-ask watcher [:watch target])))

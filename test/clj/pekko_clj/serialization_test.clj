@@ -1,12 +1,12 @@
 (ns pekko-clj.serialization-test
   "Tests for N4: the Transit-backed Clojure-data serializer and its config helpers."
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [pekko-clj.core :as core]
             [pekko-clj.cluster :as cluster]
             [pekko-clj.serialization :as ser]
             [pekko-clj.test-support :as ts])
   (:import [com.typesafe.config Config ConfigFactory]
-           [org.apache.pekko.actor ActorRef ActorSystem ExtendedActorSystem]
+           [org.apache.pekko.actor ActorRef ActorSystem]
            [org.apache.pekko.serialization SerializationExtension Serializers]
            [pekko_clj.actor CljTransitSerializer]))
 
@@ -183,9 +183,9 @@
 
 (deftest create-system-transit-options-and-precedence-test
   (let [sys (cluster/create-system "transit-create-opts"
-              {:port 0
-               :transit-serialization {:format :msgpack :allow-java-serialization true}
-               :extra-config "pekko-clj.serialization.transit.format = json-verbose"})]
+                                   {:port 0
+                                    :transit-serialization {:format :msgpack :allow-java-serialization true}
+                                    :extra-config "pekko-clj.serialization.transit.format = json-verbose"})]
     (try
       (let [cfg (.config (.settings sys))]
         ;; :extra-config beats :transit-serialization
@@ -198,9 +198,9 @@
   ;; message even for local sends, so this drives the real actor-message path
   ;; through the Transit serializer.
   (let [sys (cluster/create-system "transit-verify"
-              {:port 0
-               :transit-serialization true
-               :extra-config "pekko.actor.serialize-messages = on"})]
+                                   {:port 0
+                                    :transit-serialization true
+                                    :extra-config "pekko.actor.serialize-messages = on"})]
     (try
       (let [actor (core/spawn sys echo-actor nil)
             payload {:nested [{:k :v} #{1 2}] :ratio 1/3}

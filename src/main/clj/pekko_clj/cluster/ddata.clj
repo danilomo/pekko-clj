@@ -36,37 +36,36 @@
    elements must be serializable — enable the Transit serializer
    (`pekko-clj.serialization`, `create-system`'s `:transit-serialization`) to
    replicate Clojure data."
-  (:refer-clojure :exclude [get key remove])
   (:require [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorRef ActorSystem]
            [org.apache.pekko.cluster.ddata DistributedData SelfUniqueAddress Key
-                                           ORSet ORSetKey LWWMap LWWMapKey
-                                           PNCounter PNCounterKey
-                                           Replicator
-                                           Replicator$Update
-                                           Replicator$UpdateSuccess
-                                           Replicator$UpdateTimeout
-                                           Replicator$ModifyFailure
-                                           Replicator$UpdateDataDeleted
-                                           Replicator$Get
-                                           Replicator$GetSuccess
-                                           Replicator$NotFound
-                                           Replicator$GetFailure
-                                           Replicator$GetDataDeleted
-                                           Replicator$Subscribe
-                                           Replicator$Unsubscribe
-                                           Replicator$Changed
-                                           Replicator$Deleted
-                                           Replicator$Delete
-                                           Replicator$DeleteSuccess
-                                           Replicator$ReplicationDeleteFailure
-                                           Replicator$DataDeleted
-                                           Replicator$WriteConsistency
-                                           Replicator$WriteAll
-                                           Replicator$WriteMajority
-                                           Replicator$ReadConsistency
-                                           Replicator$ReadAll
-                                           Replicator$ReadMajority]
+            ORSet ORSetKey LWWMap LWWMapKey
+            PNCounter PNCounterKey
+            Replicator
+            Replicator$Update
+            Replicator$UpdateSuccess
+            Replicator$UpdateTimeout
+            Replicator$ModifyFailure
+            Replicator$UpdateDataDeleted
+            Replicator$Get
+            Replicator$GetSuccess
+            Replicator$NotFound
+            Replicator$GetFailure
+            Replicator$GetDataDeleted
+            Replicator$Subscribe
+            Replicator$Unsubscribe
+            Replicator$Changed
+            Replicator$Deleted
+            Replicator$Delete
+            Replicator$DeleteSuccess
+            Replicator$ReplicationDeleteFailure
+            Replicator$DataDeleted
+            Replicator$WriteConsistency
+            Replicator$WriteAll
+            Replicator$WriteMajority
+            Replicator$ReadConsistency
+            Replicator$ReadAll
+            Replicator$ReadMajority]
            [pekko_clj.actor FnWrapper]
            [java.time Duration]
            [java.util.concurrent CompletableFuture]))
@@ -248,8 +247,8 @@
   ([system key f] (update! system key f {}))
   ([system ^Key key f {:keys [initial consistency timeout-ms]}]
    (let [^scala.Function1 modify (FnWrapper/create
-                 (fn [opt]
-                   (f (if (.isDefined ^scala.Option opt) (.get ^scala.Option opt) initial))))]
+                                  (fn [opt]
+                                    (f (if (.isDefined ^scala.Option opt) (.get ^scala.Option opt) initial))))]
      (ask-replicator system
                      (Replicator$Update. key
                                          (write-consistency consistency

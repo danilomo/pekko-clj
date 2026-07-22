@@ -38,23 +38,47 @@
            (smap inc)
            (sfilter even?)
            (run-foreach println mat)))"
-  (:refer-clojure :exclude [concat drop drop-while map filter mapcat take take-while merge distinct partition group-by])
-  (:import [org.apache.pekko.stream Materializer OverflowStrategy Graph SourceShape SinkShape
-                                    ActorAttributes Attributes CompletionStrategy KillSwitch
-                                    KillSwitches RestartSettings SharedKillSwitch Supervision]
+  (:refer-clojure :exclude [concat drop drop-while mapcat take take-while merge distinct partition group-by])
+  (:import [org.apache.pekko.stream Materializer OverflowStrategy
+            ActorAttributes Attributes CompletionStrategy KillSwitch
+            KillSwitches RestartSettings SharedKillSwitch Supervision]
            [org.apache.pekko.stream.javadsl Source Flow Sink Keep RunnableGraph
-                                            AsPublisher SinkQueueWithCancel
-                                            SourceQueueWithComplete
-                                            Broadcast Balance Merge Partition SubSource
-                                            RestartSource RestartFlow RestartSink RetryFlow]
+            AsPublisher
+            Broadcast Balance Merge Partition SubSource
+            RestartSource RestartFlow RestartSink RetryFlow]
            [org.apache.pekko.actor ActorSystem ActorRef]
+           [org.apache.pekko.japi Pair]
            [org.apache.pekko.japi.pf PFBuilder FI$Apply]
            [org.apache.pekko.pattern StatusReply]
            [org.apache.pekko.util Timeout]
-           [java.util.concurrent CompletionStage CompletableFuture]
+           [java.util.concurrent CompletionStage]
            [java.util Optional]
            [java.time Duration]
+           [clojure.lang Reflector]
            [org.reactivestreams Publisher]))
+
+;; ---------------------------------------------------------------------------
+;; Operator dispatch
+;; ---------------------------------------------------------------------------
+
+(defmacro ^:private op
+  "Call instance method `method` on a stream stage, without reflection.
+
+   The javadsl `Source` and `Flow` declare the same operator names but share no
+   supertype that declares them — only `Graph`, which declares none of them — so
+   there is no single type hint that resolves a bare `(.map src f)`. Testing the two
+   concrete types lets the compiler emit a direct invocation on each branch.
+
+   `group-by` hands back a `SubSource`/`SubFlow`, which callers may pipe through
+   these same operators before merging. Those take the last branch and are
+   dispatched reflectively at runtime — the same thing an un-hinted call did, so
+   behaviour is unchanged; only the compile-time warning goes away."
+  [src method & args]
+  `(let [s# ~src]
+     (cond
+       (instance? Source s#) (. ^Source s# ~method ~@args)
+       (instance? Flow s#)   (. ^Flow s# ~method ~@args)
+       :else (Reflector/invokeInstanceMethod s# ~(name method) (object-array [~@args])))))
 
 ;; ---------------------------------------------------------------------------
 ;; Coercion helpers
@@ -161,116 +185,116 @@
 (defn smap
   "Transform elements using a function. (Named smap to avoid clash with clojure.core/map)"
   [src f]
-  (.map src (reify org.apache.pekko.japi.function.Function
-              (apply [_ x] (f x)))))
+  (op src map (reify org.apache.pekko.japi.function.Function
+                (apply [_ x] (f x)))))
 
 (defn sfilter
   "Filter elements using a predicate. (Named sfilter to avoid clash with clojure.core/filter)"
   [src pred]
-  (.filter src (reify org.apache.pekko.japi.function.Predicate
-                 (test [_ x] (boolean (pred x))))))
+  (op src filter (reify org.apache.pekko.japi.function.Predicate
+                   (test [_ x] (boolean (pred x))))))
 
 (defn mapcat
   "Transform each element to zero or more elements."
   [src f]
-  (.mapConcat src (reify org.apache.pekko.japi.function.Function
-                    (apply [_ x] (seq (f x))))))
+  (op src mapConcat (reify org.apache.pekko.japi.function.Function
+                      (apply [_ x] (seq (f x))))))
 
 (defn take
   "Take only the first n elements."
   [src n]
-  (.take src (long n)))
+  (op src take (long n)))
 
 (defn drop
   "Drop the first n elements."
   [src n]
-  (.drop src (long n)))
+  (op src drop (long n)))
 
 (defn take-while
   "Take elements while predicate is true."
   [src pred]
-  (.takeWhile src (reify org.apache.pekko.japi.function.Predicate
-                    (test [_ x] (boolean (pred x))))))
+  (op src takeWhile (reify org.apache.pekko.japi.function.Predicate
+                      (test [_ x] (boolean (pred x))))))
 
 (defn drop-while
   "Drop elements while predicate is true."
   [src pred]
-  (.dropWhile src (reify org.apache.pekko.japi.function.Predicate
-                    (test [_ x] (boolean (pred x))))))
+  (op src dropWhile (reify org.apache.pekko.japi.function.Predicate
+                      (test [_ x] (boolean (pred x))))))
 
 (defn grouped
   "Group elements into vectors of n elements."
   [src n]
-  (.grouped src (int n)))
+  (op src grouped (int n)))
 
 (defn sliding
   "Create sliding windows of n elements."
   ([src n] (sliding src n 1))
   ([src n step]
-   (.sliding src (int n) (int step))))
+   (op src sliding (int n) (int step))))
 
 (defn scan
   "Fold over elements, emitting each intermediate result."
   [src initial f]
-  (.scan src initial (reify org.apache.pekko.japi.function.Function2
-                       (apply [_ acc x] (f acc x)))))
+  (op src scan initial (reify org.apache.pekko.japi.function.Function2
+                         (apply [_ acc x] (f acc x)))))
 
 (defn fold
   "Fold over elements, emitting only the final result."
   [src initial f]
-  (.fold src initial (reify org.apache.pekko.japi.function.Function2
-                       (apply [_ acc x] (f acc x)))))
+  (op src fold initial (reify org.apache.pekko.japi.function.Function2
+                         (apply [_ acc x] (f acc x)))))
 
 (defn intersperse
   "Insert an element between each pair of elements."
   [src separator]
-  (.intersperse src separator))
+  (op src intersperse separator))
 
 (defn throttle
   "Limit the rate of elements.
    elements: number of elements
    per: Duration for the rate limit"
   [src elements ^Duration per]
-  (.throttle src (int elements) per))
+  (op src throttle (int elements) per))
 
 (defn delay-each
   "Delay each element by the given duration (backpressuring upstream while waiting)."
   [src ^Duration duration]
-  (.delay src duration (org.apache.pekko.stream.DelayOverflowStrategy/backpressure)))
+  (op src delay duration (org.apache.pekko.stream.DelayOverflowStrategy/backpressure)))
 
 (defn buffer
   "Buffer elements when downstream is slower.
    size: buffer size
    strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail"
   [src size strategy]
-  (.buffer src (int size) (->overflow-strategy strategy :drop-new)))
+  (op src buffer (int size) (->overflow-strategy strategy :drop-new)))
 
 (defn async
   "Run the previous stages asynchronously."
   [src]
-  (.async src))
+  (op src async))
 
 (defn via
   "Connect a Source to a Flow."
   [src flow]
-  (.via src flow))
+  (op src via flow))
 
 (defn concat
   "Concatenate another source after this one completes."
   [src other-src]
-  (.concat src other-src))
+  (op src concat other-src))
 
 (defn merge
   "Merge elements from another source."
   [src other-src]
-  (.merge src other-src))
+  (op src merge other-src))
 
 (defn zip-with
   "Zip with another source using a combining function."
   [src other-src f]
-  (.zipWith src other-src
-            (reify org.apache.pekko.japi.function.Function2
-              (apply [_ a b] (f a b)))))
+  (op src zipWith other-src
+      (reify org.apache.pekko.japi.function.Function2
+        (apply [_ a b] (f a b)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sinks
@@ -347,12 +371,15 @@
 
 (defn run
   "Run a stream with a Sink, returning a CompletionStage of the materialized value."
-  [src sink materializer]
-  (.run (.toMat src sink (Keep/right)) materializer))
+  [src ^Sink sink ^Materializer materializer]
+  ;; Bound to a hinted local rather than hinting the form: `op` expands to a
+  ;; `cond`, and the hint would not survive the expansion.
+  (let [^RunnableGraph graph (op src toMat sink (Keep/right))]
+    (.run graph materializer)))
 
 (defn run-with
   "Run a stream with a Sink, returning a CompletionStage of the materialized value."
-  [src sink materializer]
+  [^Source src ^Sink sink ^Materializer materializer]
   (.runWith src sink materializer))
 
 (defn run-foreach
@@ -438,15 +465,16 @@
          ;; preMaterialize returns a Pair (materialized-value, source): .first is
          ;; the ActorRef, .second is the reusable Source (same convention as
          ;; source-queue). Return [source actor-ref] per the docstring.
-         pair (.preMaterialize source materializer)]
+         ^Pair pair (.preMaterialize ^Source source ^Materializer materializer)]
      [(.second pair) (.first pair)])))
 
 (defn to-actor
   "Connect a Source to an actor, sending each element as a message.
    complete-msg: message to send when stream completes
    Note: Returns NotUsed, not a CompletionStage. The stream runs asynchronously."
-  [src ^ActorRef actor-ref complete-msg materializer]
-  (.run (.to src (sink-actor-ref actor-ref complete-msg)) materializer))
+  [src ^ActorRef actor-ref complete-msg ^Materializer materializer]
+  (let [^RunnableGraph graph (op src to (sink-actor-ref actor-ref complete-msg))]
+    (.run graph materializer)))
 
 ;; ---------------------------------------------------------------------------
 ;; Utility functions
@@ -485,18 +513,18 @@
    Preserves order of elements.
    parallelism: maximum number of concurrent async operations"
   [src parallelism f]
-  (.mapAsync src (int parallelism)
-             (reify org.apache.pekko.japi.function.Function
-               (apply [_ x] (f x)))))
+  (op src mapAsync (int parallelism)
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (f x)))))
 
 (defn map-async-unordered
   "Transform elements using an async function that returns a CompletionStage.
    Results are emitted as completed, order is not preserved.
    parallelism: maximum number of concurrent async operations"
   [src parallelism f]
-  (.mapAsyncUnordered src (int parallelism)
-                      (reify org.apache.pekko.japi.function.Function
-                        (apply [_ x] (f x)))))
+  (op src mapAsyncUnordered (int parallelism)
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (f x)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Phase 2: Sub-streams
@@ -506,16 +534,16 @@
   "Transform each element into a Source and flatten the resulting sources
    sequentially (one at a time)."
   [src f]
-  (.flatMapConcat src (reify org.apache.pekko.japi.function.Function
-                        (apply [_ x] (f x)))))
+  (op src flatMapConcat (reify org.apache.pekko.japi.function.Function
+                          (apply [_ x] (f x)))))
 
 (defn flat-map-merge
   "Transform each element into a Source and flatten with parallelism.
    breadth: maximum number of concurrent sub-streams"
   [src breadth f]
-  (.flatMapMerge src (int breadth)
-                 (reify org.apache.pekko.japi.function.Function
-                   (apply [_ x] (f x)))))
+  (op src flatMapMerge (int breadth)
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (f x)))))
 
 (defn group-by
   "Partition the stream into sub-streams by key.
@@ -523,9 +551,9 @@
    key-fn: function to extract the key from each element
    Returns a SubFlow that can be transformed and then merged."
   [src max-substreams key-fn]
-  (.groupBy src (int max-substreams)
-            (reify org.apache.pekko.japi.function.Function
-              (apply [_ x] (key-fn x)))))
+  (op src groupBy (int max-substreams)
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (key-fn x)))))
 
 (defn merge-substreams
   "Merge sub-streams back into a single stream."
@@ -546,45 +574,45 @@
    pf is a function that takes an exception and returns a fallback value,
    or nil if the exception should not be recovered."
   [src pf]
-  (.recover src
-            (-> (PFBuilder.)
-                (.match Throwable
-                        (reify FI$Apply
-                          (apply [_ ex]
-                            (if-let [result (pf ex)]
-                              result
-                              (throw ex)))))
-                (.build))))
+  (op src recover
+      (-> (PFBuilder.)
+          (.match Throwable
+                  (reify FI$Apply
+                    (apply [_ ex]
+                      (if-let [result (pf ex)]
+                        result
+                        (throw ex)))))
+          (.build))))
 
 (defn recover-with
   "Switch to an alternative source on failure.
    pf is a function that takes an exception and returns an alternative Source,
    or nil if the exception should not be recovered."
   [src pf]
-  (.recoverWith src
-                (-> (PFBuilder.)
-                    (.match Throwable
-                            (reify FI$Apply
-                              (apply [_ ex]
-                                (if-let [result (pf ex)]
-                                  result
-                                  (throw ex)))))
-                    (.build))))
+  (op src recoverWith
+      (-> (PFBuilder.)
+          (.match Throwable
+                  (reify FI$Apply
+                    (apply [_ ex]
+                      (if-let [result (pf ex)]
+                        result
+                        (throw ex)))))
+          (.build))))
 
 (defn recover-with-retries
   "Switch to an alternative source on failure with retry limit.
    attempts: maximum number of recovery attempts (-1 for infinite)
    pf is a function that takes an exception and returns an alternative Source."
   [src attempts pf]
-  (.recoverWithRetries src (int attempts)
-                       (-> (PFBuilder.)
-                           (.match Throwable
-                                   (reify FI$Apply
-                                     (apply [_ ex]
-                                       (if-let [result (pf ex)]
-                                         result
-                                         (throw ex)))))
-                           (.build))))
+  (op src recoverWithRetries (int attempts)
+      (-> (PFBuilder.)
+          (.match Throwable
+                  (reify FI$Apply
+                    (apply [_ ex]
+                      (if-let [result (pf ex)]
+                        result
+                        (throw ex)))))
+          (.build))))
 
 ;; ---------------------------------------------------------------------------
 ;; Phase 4: Time-based Operators
@@ -595,25 +623,25 @@
    n: maximum batch size
    d: maximum duration to wait"
   [src n ^Duration d]
-  (.groupedWithin src (int n) d))
+  (op src groupedWithin (int n) d))
 
 (defn take-within
   "Take elements for a duration from stream start."
   [src ^Duration d]
-  (.takeWithin src d))
+  (op src takeWithin d))
 
 (defn drop-within
   "Drop elements for a duration from stream start."
   [src ^Duration d]
-  (.dropWithin src d))
+  (op src dropWithin d))
 
 (defn keep-alive
   "Inject elements on idle to prevent timeout.
    d: maximum idle time before injecting
    inject-fn: function to create the element to inject"
   [src ^Duration d inject-fn]
-  (.keepAlive src d (reify org.apache.pekko.japi.function.Creator
-                      (create [_] (inject-fn)))))
+  (op src keepAlive d (reify org.apache.pekko.japi.function.Creator
+                        (create [_] (inject-fn)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Phase 5: Backpressure Strategies
@@ -625,41 +653,41 @@
    seed-fn: function to create the seed from the first element
    aggregate-fn: function to combine seed with next element"
   [src max seed-fn aggregate-fn]
-  (.batch src (long max)
-          (reify org.apache.pekko.japi.function.Function
-            (apply [_ x] (seed-fn x)))
-          (reify org.apache.pekko.japi.function.Function2
-            (apply [_ seed elem] (aggregate-fn seed elem)))))
+  (op src batch (long max)
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (seed-fn x)))
+      (reify org.apache.pekko.japi.function.Function2
+        (apply [_ seed elem] (aggregate-fn seed elem)))))
 
 (defn conflate
   "Merge fast elements when downstream is slower.
    aggregate-fn: function to merge two elements into one"
   [src aggregate-fn]
-  (.conflate src (reify org.apache.pekko.japi.function.Function2
-                   (apply [_ a b] (aggregate-fn a b)))))
+  (op src conflate (reify org.apache.pekko.japi.function.Function2
+                     (apply [_ a b] (aggregate-fn a b)))))
 
 (defn conflate-with-seed
   "Conflate with a seed transformation for the first element.
    seed-fn: function to transform the first element into the seed
    aggregate-fn: function to merge seed with next element"
   [src seed-fn aggregate-fn]
-  (.conflateWithSeed src
-                     (reify org.apache.pekko.japi.function.Function
-                       (apply [_ x] (seed-fn x)))
-                     (reify org.apache.pekko.japi.function.Function2
-                       (apply [_ seed elem] (aggregate-fn seed elem)))))
+  (op src conflateWithSeed
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (seed-fn x)))
+      (reify org.apache.pekko.japi.function.Function2
+        (apply [_ seed elem] (aggregate-fn seed elem)))))
 
 (defn expand
   "Extrapolate elements for slow downstream.
    extrapolate-fn: function that takes an element and returns an iterator
    of elements to emit until the next upstream element arrives"
   [src extrapolate-fn]
-  (.expand src (reify org.apache.pekko.japi.function.Function
-                 (apply [_ x]
-                   (let [result (extrapolate-fn x)]
-                     (if (instance? java.util.Iterator result)
-                       result
-                       (.iterator ^Iterable result)))))))
+  (op src expand (reify org.apache.pekko.japi.function.Function
+                   (apply [_ x]
+                     (let [result (extrapolate-fn x)]
+                       (if (instance? java.util.Iterator result)
+                         result
+                         (.iterator ^Iterable result)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Phase 6: Graph DSL
@@ -709,7 +737,7 @@
    overflow-strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail, :backpressure"
   [buffer-size overflow-strategy materializer]
   (let [source (Source/queue (int buffer-size) (->overflow-strategy overflow-strategy :backpressure))
-        pair (.preMaterialize source materializer)]
+        ^Pair pair (.preMaterialize ^Source source ^Materializer materializer)]
     [(.first pair) (.second pair)]))
 
 (defn source-cycle
@@ -755,8 +783,8 @@
    fan-out: if true, allows multiple subscribers"
   [fan-out]
   (Sink/asPublisher (if fan-out
-                      (AsPublisher/WITH_FANOUT)
-                      (AsPublisher/WITHOUT_FANOUT))))
+                      AsPublisher/WITH_FANOUT
+                      AsPublisher/WITHOUT_FANOUT)))
 
 (defn sink-queue
   "Create a Sink backed by a queue for pull-based consumption.
@@ -771,81 +799,81 @@
 (defn log
   "Add logging to the stream for debugging.
    name: identifier for log messages"
-  ([src name]
-   (.log src name))
-  ([src name extract-fn]
-   (.log src name (reify org.apache.pekko.japi.function.Function
-                    (apply [_ x] (extract-fn x))))))
+  ([src ^String name]
+   (op src log name))
+  ([src ^String name extract-fn]
+   (op src log name (reify org.apache.pekko.japi.function.Function
+                      (apply [_ x] (extract-fn x))))))
 
 (defn wire-tap
   "Send a copy of each element to a secondary sink without affecting the main flow."
-  [src sink]
-  (.wireTap src sink))
+  [src ^Sink sink]
+  (op src wireTap sink))
 
 (defn also-to
   "Send elements to a secondary sink while continuing the flow.
    Similar to wire-tap but with different backpressure semantics."
   [src sink]
-  (.alsoTo src sink))
+  (op src alsoTo sink))
 
 (defn distinct
   "Remove consecutive duplicate elements."
   [src]
-  (.statefulMapConcat src
-                      (reify org.apache.pekko.japi.function.Creator
-                        (create [_]
-                          (let [prev (atom ::none)]
-                            (reify org.apache.pekko.japi.function.Function
-                              (apply [_ x]
-                                (if (= @prev x)
-                                  []
-                                  (do (reset! prev x)
-                                      [x])))))))))
+  (op src statefulMapConcat
+      (reify org.apache.pekko.japi.function.Creator
+        (create [_]
+          (let [prev (atom ::none)]
+            (reify org.apache.pekko.japi.function.Function
+              (apply [_ x]
+                (if (= @prev x)
+                  []
+                  (do (reset! prev x)
+                      [x])))))))))
 
 (defn distinct-by
   "Remove consecutive duplicate elements by a key function."
   [src key-fn]
-  (.statefulMapConcat src
-                      (reify org.apache.pekko.japi.function.Creator
-                        (create [_]
-                          (let [prev-key (atom ::none)]
-                            (reify org.apache.pekko.japi.function.Function
-                              (apply [_ x]
-                                (let [k (key-fn x)]
-                                  (if (= @prev-key k)
-                                    []
-                                    (do (reset! prev-key k)
-                                        [x]))))))))))
+  (op src statefulMapConcat
+      (reify org.apache.pekko.japi.function.Creator
+        (create [_]
+          (let [prev-key (atom ::none)]
+            (reify org.apache.pekko.japi.function.Function
+              (apply [_ x]
+                (let [k (key-fn x)]
+                  (if (= @prev-key k)
+                    []
+                    (do (reset! prev-key k)
+                        [x]))))))))))
 
 (defn zip-with-index
   "Pair each element with its index (starting from 0)."
   [src]
-  (.zipWithIndex src))
+  (op src zipWithIndex))
 
 (defn stateful-map
   "Apply a stateful transformation to each element.
    create-fn: no-arg function that returns initial state
    f: function (state, element) -> [new-state, emitted-element]"
   [src create-fn f]
-  (.statefulMapConcat src
-                      (reify org.apache.pekko.japi.function.Creator
-                        (create [_]
-                          (let [state (atom (create-fn))]
-                            (reify org.apache.pekko.japi.function.Function
-                              (apply [_ x]
-                                (let [[new-state result] (f @state x)]
-                                  (reset! state new-state)
-                                  [result]))))))))
+  (op src statefulMapConcat
+      (reify org.apache.pekko.japi.function.Creator
+        (create [_]
+          (let [state (atom (create-fn))]
+            (reify org.apache.pekko.japi.function.Function
+              (apply [_ x]
+                (let [[new-state result] (f @state x)]
+                  (reset! state new-state)
+                  [result]))))))))
 
 (defn watch-termination
   "Add a callback for when the stream terminates.
    f: function called with (materialized-value, completion-stage)"
   [src f]
-  (.watchTermination src
-                     (reify org.apache.pekko.japi.function.Function2
-                       (apply [_ mat-value done]
-                         (f mat-value done)
-                         mat-value))))
+  (op src watchTermination
+      (reify org.apache.pekko.japi.function.Function2
+        (apply [_ mat-value done]
+          (f mat-value done)
+          mat-value))))
 
 (defn on-complete
   "Add a callback for when the stream completes (success or failure).
@@ -928,7 +956,7 @@
    Example:
      (-> (source (range 100)) (via-mat (kill-switch-single) :right))"
   [src flow which]
-  (.viaMat src flow (keep-mat which)))
+  (op src viaMat flow (keep-mat which)))
 
 (defn to-mat
   "Connect a Source to a Sink, combining their materialized values with `which`
@@ -941,12 +969,12 @@
          (run-graph mat)
          (await-completion))"
   [src sink which]
-  (.toMat src sink (keep-mat which)))
+  (op src toMat sink (keep-mat which)))
 
 (defn run-graph
   "Run a RunnableGraph (from to-mat), returning its materialized value.
    A Keep/both pair is returned as a Clojure vector [left right]."
-  [^RunnableGraph graph materializer]
+  [^RunnableGraph graph ^Materializer materializer]
   (mat-value (.run graph materializer)))
 
 (defn run-mat
@@ -958,8 +986,8 @@
 
    Example:
      (let [[queue done] (run-mat queued-src (sink-seq) :both mat)] ...)"
-  [src sink which materializer]
-  (mat-value (.run (to-mat src sink which) materializer)))
+  [src sink which ^Materializer materializer]
+  (mat-value (.run ^RunnableGraph (to-mat src sink which) materializer)))
 
 (defn run-source-queue
   "Materialize a queue-backed Source into `sink` in one step.
@@ -1099,7 +1127,7 @@
 (defn with-attributes
   "Apply Attributes to a Source, Flow or Sink."
   [src ^Attributes attributes]
-  (.withAttributes src attributes))
+  (op src withAttributes attributes))
 
 (defn with-supervision
   "Supervise a Source or Flow with a decider fn of Throwable -> :stop, :resume or
@@ -1264,9 +1292,9 @@
          (ask worker Long 3000)
          (run-to-seq mat))"
   ([src actor-ref reply-class timeout]
-   (.ask src actor-ref reply-class (Timeout/create (->duration timeout))))
+   (op src ask actor-ref reply-class (Timeout/create (->duration timeout))))
   ([src parallelism actor-ref reply-class timeout]
-   (.ask src (int parallelism) actor-ref reply-class (Timeout/create (->duration timeout)))))
+   (op src ask (int parallelism) actor-ref reply-class (Timeout/create (->duration timeout)))))
 
 (defn- unwrap-status-reply
   [^StatusReply reply]

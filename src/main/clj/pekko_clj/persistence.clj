@@ -31,7 +31,7 @@
        ;; Snapshot every 100 events, keeping the 2 most recent
        (snapshot-every 100 2))"
   (:require [clojure.core.match :refer [match]])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
+  (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.persistence SnapshotSelectionCriteria]
            [pekko_clj.actor CljPersistentActor PersistAll]))
 

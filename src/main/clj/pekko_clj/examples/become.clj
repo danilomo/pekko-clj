@@ -1,5 +1,5 @@
 (ns pekko-clj.examples.become
-  (:require [pekko-clj.core :refer :all]))
+  (:require [pekko-clj.core :refer [! <! actor-system become defactor reply spawn]]))
 
 (declare sad)
 

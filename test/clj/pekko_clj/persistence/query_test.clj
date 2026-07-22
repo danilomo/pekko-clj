@@ -1,5 +1,5 @@
 (ns pekko-clj.persistence.query-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is]]
             [pekko-clj.persistence :as p]
             [pekko-clj.persistence.query :as q]
             [pekko-clj.stream :as s]
@@ -107,9 +107,9 @@
       (is (= 6 (core/<! actor :get 3000)))
       (let [j (q/read-journal sys)
             events (eventually
-                     (let [es (->> (drain (q/current-events-by-persistence-id j pid) mat)
-                                   (mapv :event))]
-                       (when (= 2 (count es)) es)))]
+                    (let [es (->> (drain (q/current-events-by-persistence-id j pid) mat)
+                                  (mapv :event))]
+                      (when (= 2 (count es)) es)))]
         (is (= [[:incremented] [:added 5]] events)))
       (finally
         (terminate-system sys)))))
@@ -136,15 +136,15 @@
       (let [j (q/read-journal sys)]
         ;; "counter" tag: the two :increment events from these two actors.
         (let [counters (eventually
-                         (let [es (->> (drain (q/current-events-by-tag j "counter") mat)
-                                       (filter mine?) (mapv :event))]
-                           (when (= 2 (count es)) es)))]
+                        (let [es (->> (drain (q/current-events-by-tag j "counter") mat)
+                                      (filter mine?) (mapv :event))]
+                          (when (= 2 (count es)) es)))]
           (is (= [[:incremented] [:incremented]] counters)))
         ;; "all" tag: all three events from these two actors.
         (let [alls (eventually
-                     (let [es (->> (drain (q/current-events-by-tag j "all") mat)
-                                   (filter mine?) (mapv :event))]
-                       (when (= 3 (count es)) es)))]
+                    (let [es (->> (drain (q/current-events-by-tag j "all") mat)
+                                  (filter mine?) (mapv :event))]
+                      (when (= 3 (count es)) es)))]
           (is (= 3 (count alls)))
           (is (= #{[:incremented] [:added 2]} (set alls)))))
       (finally
@@ -163,9 +163,9 @@
       (is (= 2 (core/<! actor :get 3000)))
       (let [j (q/read-journal sys)
             mine (eventually
-                   (let [es (->> (drain (q/current-events-by-tag j "counter") mat)
-                                 (filter mine?))]
-                     (when (= 2 (count es)) es)))
+                  (let [es (->> (drain (q/current-events-by-tag j "counter") mat)
+                                (filter mine?))]
+                    (when (= 2 (count es)) es)))
             first-offset (:offset (first mine))]
         (is (= :sequence (:type first-offset)))
         ;; Resuming from the first event's offset skips it, leaving the second.
@@ -186,7 +186,7 @@
       (is (= 1 (core/<! actor :get 3000)))
       (let [j (q/read-journal sys)]
         (is (eventually
-              (contains? (set (drain (q/current-persistence-ids j) mat)) pid))))
+             (contains? (set (drain (q/current-persistence-ids j) mat)) pid))))
       (finally
         (terminate-system sys)))))
 
@@ -226,8 +226,8 @@
       (is (= 6 (core/<! actor :get 3000)))
       (let [j (q/read-journal sys)
             remaining (eventually
-                        (let [es (drain (q/current-events-by-persistence-id j pid) mat)]
-                          (when (= 2 (count es)) es)))]
+                       (let [es (drain (q/current-events-by-persistence-id j pid) mat)]
+                         (when (= 2 (count es)) es)))]
         (is (= [5 6] (mapv :sequence-nr remaining))))
       (finally
         (terminate-system sys)))))

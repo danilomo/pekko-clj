@@ -1,0 +1,9 @@
+;; clj-kondo configuration exported to consumers of pekko-clj.
+;;
+;; Projects that depend on pekko-clj pick this up by running `clj-kondo --copy-configs
+;; --dependencies --lint <classpath>`; it teaches clj-kondo how to read the macros
+;; this library defines, so user code using `defactor` lints cleanly out of the box.
+{:hooks
+ {:analyze-call
+  {pekko-clj.core/defactor                hooks.pekko-clj.defactor/defactor
+   pekko-clj.persistence/defactor-persistent hooks.pekko-clj.defactor/defactor-persistent}}}

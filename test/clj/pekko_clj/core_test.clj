@@ -1,8 +1,8 @@
 (ns pekko-clj.core-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [pekko_clj.actor BecomeResult CljActor]
+           [pekko_clj.actor BecomeResult]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -82,7 +82,7 @@
   ;; ! outside actor context should use noSender and not throw
   (let [received (promise)
         actor (core/new-actor *system*
-                              (fn [this msg]
+                              (fn [_this msg]
                                 (deliver received msg)
                                 nil)
                               nil)]
@@ -91,7 +91,7 @@
 
 (deftest tell-outside-context-returns-nil
   (let [actor (core/new-actor *system*
-                              (fn [this msg] nil)
+                              (fn [_this _msg] nil)
                               nil)]
     (is (nil? (core/! actor :any)))))
 
@@ -101,7 +101,7 @@
 
 (deftest ask-returns-completion-stage
   (let [actor  (core/new-actor *system*
-                               (fn [this msg] (.reply this :pong) nil)
+                               (fn [this _msg] (.reply this :pong) nil)
                                nil)
         future (core/<?> actor :ping 3000)]
     (is (instance? java.util.concurrent.CompletionStage future))
@@ -110,14 +110,14 @@
 
 (deftest ask-future-derefs-to-reply
   (let [actor  (core/new-actor *system*
-                               (fn [this msg] (.reply this :pong) nil)
+                               (fn [this _msg] (.reply this :pong) nil)
                                nil)]
     ;; @ works because <?> returns a CompletableFuture.
     (is (= :pong @(core/<?> actor :ping 3000)))))
 
 (deftest ask-future-composes-with-then-apply
   (let [actor  (core/new-actor *system*
-                               (fn [this msg] (.reply this :pong) nil)
+                               (fn [this _msg] (.reply this :pong) nil)
                                nil)
         stage  (.thenApply (core/<?> actor :ping 3000)
                            (reify java.util.function.Function
@@ -127,7 +127,7 @@
 (deftest ask-uses-dynamic-timeout
   (binding [core/*timeout* 5000]
     (let [actor (core/new-actor *system*
-                                (fn [this msg] (.reply this :ok) nil)
+                                (fn [this _msg] (.reply this :ok) nil)
                                 nil)]
       (is (= :ok (await-ask actor :go))))))
 
@@ -145,7 +145,7 @@
 
 (deftest blocking-ask-with-explicit-timeout
   (let [actor (core/new-actor *system*
-                              (fn [this msg] (.reply this :done) nil)
+                              (fn [this _msg] (.reply this :done) nil)
                               nil)]
     (is (= :done (core/<! *system* actor :go 5000)))))
 
@@ -182,7 +182,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest become-returns-become-result
-  (let [handler-fn (fn [this msg] nil)
+  (let [handler-fn (fn [_this _msg] nil)
         actor-def  {:receive handler-fn}
         result     (core/become actor-def :new-state)]
     (is (instance? BecomeResult result))
@@ -248,12 +248,12 @@
   ;; report the sender it observed.
   (let [observed-sender (promise)
         receiver (core/new-actor *system*
-                                 (fn [this msg]
+                                 (fn [this _msg]
                                    (deliver observed-sender (.senderRef this))
                                    nil)
                                  nil)
         sending-actor (core/new-actor *system*
-                                      (fn [this msg]
+                                      (fn [this _msg]
                                         (binding [core/*current-actor* this]
                                           (core/! receiver :payload)
                                           (.reply this :done)
