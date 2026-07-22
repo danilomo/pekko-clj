@@ -108,8 +108,14 @@ pekko-clj includes these Apache Pekko modules:
     new-state)
 
   (on-stop
-    ;; Cleanup when actor stops.
-    cleanup-expr))
+    ;; Cleanup when actor stops (also runs on the old instance on restart).
+    cleanup-expr)
+
+  (on-restart [reason]
+    ;; Runs on the fresh instance after a supervised restart, once init has
+    ;; re-run. `reason` (optional) is the causing Throwable; return value
+    ;; becomes the new state.
+    new-state))
 ```
 
 ### Clauses
@@ -118,7 +124,10 @@ pekko-clj includes these Apache Pekko modules:
 |--------|----------|-------------|
 | `init` | No | Called once before actor starts. Returns initial state. |
 | `handle` | Yes (1+) | Message handlers with pattern matching. Returns new state. |
-| `on-stop` | No | Lifecycle hook for cleanup when actor stops. |
+| `on-stop` | No | Lifecycle hook for cleanup when the actor stops (also fires on the old instance during a supervised restart). |
+| `on-restart` | No | Lifecycle hook that fires on the fresh instance after a supervised restart. `(on-restart [reason] ...)`; return value becomes new state. |
+| `on-error` | No | Recover from a thrown Exception in place. `(on-error [ex msg] ...)`; return value becomes new state. |
+| `supervision` | No | Supervisor strategy for this actor's children. |
 
 ### Pattern Matching
 
@@ -134,7 +143,7 @@ Patterns in `handle` clauses use `core.match`:
 
 ### Implicit Bindings
 
-Inside any `handle`, `init`, or `on-stop` body:
+Inside any `handle`, `init`, `on-stop`, `on-restart`, or `on-error` body:
 
 | Binding | Description |
 |---------|-------------|

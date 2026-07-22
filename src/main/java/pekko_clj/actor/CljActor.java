@@ -160,6 +160,33 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   }
 
   @Override
+  public void preRestart(Throwable reason, java.util.Optional<Object> message) throws Exception {
+    // Runs on the OLD instance just before it is discarded by a supervised
+    // restart. Powers the low-level :pre-restart prop. The default behaviour
+    // (super) stops this actor's children and then calls postStop(), which
+    // fires the on-stop hook — so on a restart both on-restart (new instance,
+    // below) and on-stop (old instance) run. (We override the javadsl
+    // Optional-based overload; the scala.Option one is deprecated.)
+    if (preRestart != null) {
+      preRestart.invoke(this, reason);
+    }
+    super.preRestart(reason, message);
+  }
+
+  @Override
+  public void postRestart(Throwable reason) throws Exception {
+    // Runs on the FRESH instance after a supervised restart. The default (super)
+    // calls preStart(), re-running init so state is rebuilt before the hook
+    // runs. Powers the defactor `on-restart` clause and the :post-restart prop;
+    // like a message handler, the hook's return value becomes the new state
+    // (a nil return leaves it unchanged).
+    super.postRestart(reason);
+    if (postRestart != null) {
+      handleState(postRestart.invoke(this, reason));
+    }
+  }
+
+  @Override
   public SupervisorStrategy supervisorStrategy() {
     if (supervisorStrategy != null) {
       return supervisorStrategy;
@@ -267,8 +294,14 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   }
 
   /**
-   * Unstash all messages, prepending them to the mailbox.
-   * Messages will be processed in the order they were stashed (FIFO).
+   * Re-enqueue all stashed messages, in the order they were stashed (FIFO), each
+   * with its original sender.
+   *
+   * <p>Note: unlike Pekko's {@code Stash} (which prepends to the mailbox front),
+   * this re-sends the messages to {@code self}, so they land at the TAIL of the
+   * mailbox — after any messages already queued. Equivalent for the common
+   * stash-until-ready pattern; differs only when other messages queued up in
+   * between and their relative ordering matters.
    */
   public void unstashAll() {
     // Send messages in FIFO order
@@ -279,7 +312,8 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   }
 
   /**
-   * Unstash the first stashed message only.
+   * Re-enqueue the first stashed message only (with its original sender), placing
+   * it at the tail of the mailbox (see {@link #unstashAll()} for the ordering note).
    */
   public void unstash() {
     if (!stash.isEmpty()) {

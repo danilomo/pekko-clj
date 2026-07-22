@@ -263,11 +263,20 @@
                             switch behavior. A message matching no clause is sent
                             to Pekko's unhandled() (see `unhandled`) rather than
                             crashing, unless you supply your own catch-all.
-   - (on-stop ...)          Run when the actor stops (post-stop).
+   - (on-stop ...)          Run when the actor stops (post-stop). Also runs on
+                            the OLD instance during a supervised restart.
+   - (on-restart [reason] ...) Run on the FRESH instance after a supervised
+                            restart, once init has re-run. `reason` (optional
+                            binding) is the Throwable that caused the restart;
+                            `state` is bound to the re-initialized state and the
+                            body's value becomes the new state (nil leaves it
+                            unchanged). A restart fires on-stop (old instance)
+                            then on-restart (new instance).
 
    Reserved anaphor: `state` is implicitly bound to the current state inside
-   handle/on-error bodies — do not shadow it with an init argument or on-error
-   binding named `state` (defactor throws at macro-expansion if you do).
+   handle/on-error/on-restart bodies — do not shadow it with an init argument or
+   an on-error/on-restart binding named `state` (defactor throws at
+   macro-expansion if you do).
    - (supervision strat)    Supervisor strategy for this actor's children.
    - (on-error [ex msg] ...) Handle a recoverable Exception thrown while handling
                             a message; the body's value becomes the new state, so
@@ -303,7 +312,16 @@
 
         ;; lifecycle
         on-stop    (:on-stop parsed)
-        on-restart (:on-restart parsed)
+
+        ;; on-restart: (on-restart [reason] body...) or (on-restart body...) —
+        ;; runs on the fresh instance after a supervised restart.
+        on-restart-clause  (:on-restart parsed)
+        on-restart-binding (when (and on-restart-clause (vector? (second on-restart-clause)))
+                             (second on-restart-clause))
+        on-restart-body    (when on-restart-clause
+                             (if on-restart-binding
+                               (drop 2 on-restart-clause)
+                               (rest on-restart-clause)))
 
         ;; supervision: (supervision strategy-expr)
         supervision-clause (:supervision parsed)
@@ -315,10 +333,11 @@
         on-error-body   (when on-error-clause (drop 2 on-error-clause))  ;; body...
 
         ;; gensyms
-        this-sym (gensym "this")
-        msg-sym  (gensym "msg")
-        args-sym (gensym "args")
-        ex-sym   (gensym "ex")]
+        this-sym   (gensym "this")
+        msg-sym    (gensym "msg")
+        args-sym   (gensym "args")
+        ex-sym     (gensym "ex")
+        reason-sym (gensym "reason")]
 
     ;; Reserved-anaphor guard: `state` is auto-bound to the current state in
     ;; handle/on-error bodies — don't let the init or on-error bindings shadow it.
@@ -330,6 +349,10 @@
       (throw (ex-info (str "defactor " name ": `state` is a reserved binding (the "
                            "current state) — rename the on-error binding")
                       {:clause 'on-error :binding 'state})))
+    (when (some #{'state} on-restart-binding)
+      (throw (ex-info (str "defactor " name ": `state` is a reserved binding (the "
+                           "current state) — rename the on-restart binding")
+                      {:clause 'on-restart :binding 'state})))
 
     `(def ~(if docstring (vary-meta name assoc :doc docstring) name)
        (let [receive-fn#
@@ -356,6 +379,14 @@
                               (fn [~this-sym]
                                 (binding [*current-actor* ~this-sym]
                                   ~@(rest on-stop)))})
+                         ~(when on-restart-clause
+                            `{:post-restart
+                              (fn [~this-sym ~reason-sym]
+                                (binding [*current-actor* ~this-sym]
+                                  (let [~'state (deref ~this-sym)
+                                        ~@(when on-restart-binding
+                                            [(first on-restart-binding) reason-sym])]
+                                    ~@on-restart-body)))})
                          ~(when supervision-expr
                             `{:supervisor-strategy ~supervision-expr})
                          ~(when on-error-clause
@@ -462,15 +493,21 @@
   nil)
 
 (defn unstash-all
-  "Unstash all messages, prepending them to the mailbox.
-   Messages will be processed in the order they were stashed.
-   Returns nil (doesn't affect state)."
+  "Re-enqueue all stashed messages, in the order they were stashed, each with its
+   original sender. Returns nil (doesn't affect state).
+
+   Note: unlike Pekko's Stash (which prepends to the mailbox front), this re-sends
+   the messages to self, so they land at the TAIL of the mailbox — after any
+   messages that are already queued. For the common 'stash until ready, then
+   unstash' pattern this is equivalent; it differs only if other messages queued
+   up between stashing and unstashing and their relative order matters."
   []
   (.unstashAll *current-actor*)
   nil)
 
 (defn unstash
-  "Unstash the first stashed message only.
+  "Re-enqueue the first stashed message only (with its original sender), placing it
+   at the tail of the mailbox (see `unstash-all` for the ordering note).
    Returns nil (doesn't affect state)."
   []
   (.unstash *current-actor*)

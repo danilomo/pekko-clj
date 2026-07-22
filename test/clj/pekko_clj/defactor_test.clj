@@ -300,6 +300,18 @@
           (catch clojure.lang.Compiler$CompilerException e
             (throw (.getCause e)))))))
 
+(deftest defactor-rejects-state-shadow-in-on-restart
+  ;; `state` is auto-bound in the on-restart body too, so a binding named
+  ;; `state` must be rejected at macro-expansion.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reserved"
+        (try
+          (macroexpand-1 '(pekko-clj.core/defactor bad-restart-actor
+                            (init [_] nil)
+                            (on-restart [state] nil)
+                            (handle :ping nil)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: unhandled-message parity (B3) — no catch-all must not crash the actor
 ;; ---------------------------------------------------------------------------

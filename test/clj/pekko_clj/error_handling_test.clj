@@ -245,6 +245,52 @@
       (is (empty? @on-error-calls)
           "on-error was NOT called for the Error"))))
 
+;; ---------------------------------------------------------------------------
+;; Tests: on-restart lifecycle clause (fires on the fresh instance after a
+;; supervised restart)
+;; ---------------------------------------------------------------------------
+
+(deftest defactor-on-restart-clause
+  ;; on-restart runs on the fresh instance after a supervised restart: it sees
+  ;; the causing Throwable, init has already re-run (state reset), and its
+  ;; return value becomes the new state. on-stop fires on the old instance too.
+  (let [restart-events (atom [])
+        stop-events    (atom [])]
+    (core/defactor restartable-child
+      (init [_] {:value 0})
+      (on-stop
+        (swap! stop-events conj :stopped))
+      (on-restart [reason]
+        (swap! restart-events conj (class reason))
+        (assoc state :restarted true))
+      (handle :inc
+        (update state :value inc))
+      (handle :boom
+        (throw (IllegalStateException. "boom")))
+      (handle :get
+        (core/reply state)))
+
+    (core/defactor restart-parent
+      (supervision (sup/one-for-one (fn [_] :restart)))
+      (init [_] nil)
+      (handle :spawn
+        (core/reply (core/spawn restartable-child nil))))
+
+    (let [parent (core/spawn *system* restart-parent nil)
+          child  (await-ask parent :spawn)]
+      ;; Build up some state, then crash the child → supervised restart.
+      (core/! child :inc)
+      (core/! child :inc)
+      (is (= {:value 2} (await-ask child :get)))
+      (core/! child :boom)
+      (Thread/sleep 200)
+      ;; on-restart fired once with the causing exception's class.
+      (is (= [IllegalStateException] @restart-events))
+      ;; on-stop fired on the old instance during the restart.
+      (is (= [:stopped] @stop-events))
+      ;; init re-ran (value back to 0) and on-restart's return set :restarted.
+      (is (= {:value 0 :restarted true} (await-ask child :get))))))
+
 (deftest on-error-intercepts-exceptions-before-supervision
   ;; A recoverable Exception is handled by on-error in place; the parent's
   ;; supervision decider is not invoked and the child keeps running.
