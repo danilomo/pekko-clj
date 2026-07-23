@@ -94,6 +94,41 @@ can be a child of another actor instead of always top-level:
     {:pool (routing/spawn-pool (core/context) worker 5)}))
 ```
 
+## Scatter-gather and tail-chopping (pool and group)
+
+Both latency-oriented routers come in a pool form (spawns the routees) and a
+group form (routes to existing actors at given paths):
+
+```clojure
+;; Send to all, take the first response within the timeout
+(routing/spawn-scatter-gather-pool  sys worker 3   {:timeout-ms 5000})
+(routing/spawn-scatter-gather-group sys ["/user/w1" "/user/w2"] {:timeout-ms 5000})
+
+;; Send to one, then another after :interval-ms if no reply yet
+(routing/spawn-tail-chopping-pool   sys worker 3   {:timeout-ms 5000 :interval-ms 100})
+(routing/spawn-tail-chopping-group  sys ["/user/w1" "/user/w2"] {:timeout-ms 5000 :interval-ms 100})
+```
+
+## Supervising a pool's routees
+
+A pool supervises the routees it creates. By default a routee failure escalates
+(and the pool is restarted); pass a `pekko-clj.supervision` strategy as
+`:supervisor-strategy` to resume/restart/stop the routee instead. A `:dispatcher`
+option runs the routees on a named dispatcher. Both are available on every pool
+spawner; groups route to actors that already exist, so they own neither.
+
+```clojure
+(require '[pekko-clj.supervision :as sup])
+
+(routing/spawn-pool sys worker 5
+  {:supervisor-strategy (sup/one-for-one sup/resume-decider)  ; keep state on failure
+   :dispatcher "my-dispatcher"})
+```
+
+(Note: Pekko's *classic* routers — what this library wraps — have no
+"prefer local routees" option; that exists only in Pekko Typed. Cluster routers
+do expose `:allow-local`.)
+
 ### Contrast with Scala (Pekko Typed)
 
 In Pekko Typed Scala, routers are just another sort of behavior that you `spawn`.

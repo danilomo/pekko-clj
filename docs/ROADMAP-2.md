@@ -56,12 +56,12 @@ commit `7e59e55`.
 | N11 | Persistence depth: `persist-async`, `defer`, plugins, recovery, lifecycle | New | DONE | B12, B15 | medium |
 | N12 | At-least-once delivery | New | TODO | N11 | medium |
 | N13 | Streams consistency fixes + missing operators | New | DONE | — | medium |
-| N14 | Streams FileIO + StreamConverters | New | TODO | N13 | low |
+| N14 | Streams FileIO + StreamConverters | New | DONE | N13 | low |
 | N15 | HTTP routing completion: segment capture, static content, auth | New | DONE | B11 | medium |
 | N16 | HTTPS + compression + request timeouts | New | TODO | N15 | medium |
 | N17 | Transit record support | New | DONE | — | low |
-| N18 | Router parity leftovers | New | TODO | H7 | low |
-| N19 | Small parity odds and ends | New | TODO | — | low |
+| N18 | Router parity leftovers | New | DONE | H7 | low |
+| N19 | Small parity odds and ends | New | DONE | — | low |
 
 **Definition of done for this epic:** all B + H stories `DONE`; N10, N11, N13, N15
 `DONE` (the rest are prioritized-optional); `doc/`+`docs/` reflect reality;
@@ -663,8 +663,9 @@ subscribe/unsubscribe rows were already ✅ and stay that way.
 ## Milestone N — Parity
 
 **Definition of done reached (2026-07-23):** all B + H stories plus the four
-required N stories (N10, N11, N13, N15) are `DONE`. What is left — N12, N14,
-N16, N18, N19 — is the prioritized-optional tail (N17 was done too).
+required N stories (N10, N11, N13, N15) are `DONE`. Of the prioritized-optional
+tail, N14, N17, N18, and N19 are now also `DONE`; what remains is **N12**
+(at-least-once delivery) and **N16** (HTTPS + compression + request timeouts).
 
 
 ### N10 · Persistent sharded entities (CQRS aggregates) — `DONE`
@@ -929,7 +930,47 @@ Clojure-idiomatic `skeep`, keep-shaped: fn returns nil to drop), `zip`, `zip-all
 **Tests:** per-op driving tests; SubFlow regression through a Flow `group-by`;
 run-with-system-arity smoke test.
 
-### N14 · Streams FileIO + StreamConverters — `TODO`
+### N14 · Streams FileIO + StreamConverters — `DONE`
+**Note (2026-07-23):** built as scoped, in one new `pekko-clj.stream` section.
+**Files:** `source-from-file` (`FileIO/fromPath`, optional chunk size) and
+`sink-to-file` (`FileIO/toPath`, optional open-option collection — keywords like
+`:append`/`:create`/`:truncate-existing` or `java.nio.file.OpenOption` values via
+a private `->open-option`); both coerce a String/`File`/`Path` argument through a
+private `->path` and materialize to `CompletionStage<IOResult>`.
+**StreamConverters:** `source-from-input-stream`/`sink-to-output-stream` (factory
+fn → blocking `java.io.*Stream`, `IOResult` mat value) and their inverses
+`sink-as-input-stream`/`source-as-output-stream` (the mat value *is* the blocking
+stream; optional read/write timeout coerced through the existing `->duration`).
+**ByteString + framing:** `->byte-string` (String→UTF-8 / byte-array / passthrough,
+throws otherwise), `byte-string->string`, `byte-string->bytes`; `frame-delimiter`
+(`Framing/delimiter`, delimiter as String or ByteString, `FramingTruncation`
+ALLOW/DISALLOW) and `lines` (newline framing + UTF-8 decode → String Flow). Added
+`io-result->map` (`{:count :success? :error}`, guards `getError` behind
+`wasSuccessful`), mirroring `stats->map`/`state->map`.
+**Naming deviates from the tracker sketch, deliberately** — the tracker named the
+reverse coercion `byte-string->` (a dangling arrow); split into the two clear
+`byte-string->string`/`byte-string->bytes` since a single reverse can't cover both
+the text and raw-bytes cases. `lines` splits on `\n` only (documented: a CRLF file
+leaves a trailing `\r`; use `frame-delimiter` with `"\r\n"`), because
+`Framing/delimiter` frames on a fixed byte sequence.
+**Reflection:** clean — `->path`/`->byte-string`/`io-result->map` args and the
+`sink-to-file` open-option `Set` are hinted; `asInputStream`/`asOutputStream` have
+both a `java.time.Duration` and a `FiniteDuration` overload, so the `^Duration`
+from `->duration` disambiguates. Composes with `http.response/stream` for file
+serving (no new HTTP code — `source-from-file` already yields a ByteString Source;
+N15 covers the routing-directive path).
+Tests (`stream_test.clj`, 10 new): `byte-string-coercions`,
+`io-result->map-shapes-success-and-failure` (`IOResult/createSuccessful` /
+`createFailed`), `file-source-and-sink-round-trip` (write IOResult byte count +
+`run-mat :both` to read the file's own IOResult), `sink-to-file-append-option-appends`,
+`lines-splits-a-multiline-file`, `frame-delimiter-strips-and-splits`,
+`source-from-input-stream-reads-bytes`, `sink-to-output-stream-writes-bytes`,
+`sink-as-input-stream-bridges-out` (slurp the materialized InputStream),
+`source-as-output-stream-bridges-in` (write to the materialized OutputStream).
+`doc/05-streams.md` gained a "Files and blocking I/O" section; README's streams
+paragraph lists the new surface. No `docs/specs/*` checklist covers streams (same
+as N13). `lein test` (582 tests, was 572), `lein lint`, `lein check` (no
+reflection warnings) all clean.
 **Deps:** N13.
 No file or blocking-IO integration at all — a glaring practical gap for a streams
 API: `FileIO.fromPath`/`toPath` (source/sink of ByteString with IOResult mat-value),
@@ -1086,7 +1127,49 @@ cache.
 **Tests:** record round trip standalone and through a live system
 (`serialize-messages = on`); nested records; unknown-tag failure mode is clear.
 
-### N18 · Router parity leftovers — `TODO`
+### N18 · Router parity leftovers — `DONE`
+**Note (2026-07-23):** three of four bullets built; the fourth turned out not to
+exist in classic routing.
+**Group variants:** `spawn-scatter-gather-group` (`ScatterGatherFirstCompletedGroup`)
+and `spawn-tail-chopping-group` (`TailChoppingGroup`) — the route-to-existing-actors
+counterparts of the existing pools. Built on the **Java-friendly** constructors
+(`(java.lang.Iterable<String>, java.time.Duration[, java.time.Duration])`), found via
+javap, so a plain `ArrayList` of paths + `Duration/ofMillis` cross without touching
+Scala's immutable `Iterable`/`FiniteDuration` (the only constructor javap shows first
+takes those); the path arg is hinted `^Iterable` to disambiguate.
+**Pool `:supervisor-strategy` / `:dispatcher`:** every pool spawner (`spawn-pool`,
+consistent-hash, scatter-gather, tail-chopping, resizer) now accepts a
+`pekko-clj.supervision` strategy (a Pekko `SupervisorStrategy`) via
+`.withSupervisorStrategy` and a dispatcher name via `.withDispatcher`. These withers
+are declared on each concrete pool class, not the `Pool` interface (same as
+`withResizer`), so a private `configure-pool` **macro** applies them on the concrete
+constructor *expression* — inlined per cond branch — to stay reflection-free.
+`spawn-cluster-pool`'s local pool passes `nil nil` (behavior unchanged).
+**Reflection wrinkle worth recording:** `withSupervisorStrategy` has a covariant
+bridge (`RoundRobinPool` and `Pool` return types), so an untyped argument left
+Clojure unable to pick an overload → reflection, which cascaded to a
+target-unknown `withDispatcher`. Hinting the argument `^SupervisorStrategy` (and
+`^String` for the dispatcher) resolves both; `lein check` is clean.
+**prefer-local-routees — dropped as N/A.** `preferLocalRoutees`/
+`withPreferLocalRoutees` exists **only** in `pekko-actor-typed` (Typed's
+`GroupRouter`); classic routing — all this library wraps — has no such method on any
+pool, group, or cluster-router settings class (grepped the whole
+`pekko-actor`/`pekko-cluster` surface at 1.6.0). The classic analogue already
+shipped is `:allow-local` (`allowLocalRoutees`) on the cluster routers. Recorded the
+spec's long-standing ❌ as ⛔ N/A rather than wrapping a method that isn't there.
+Tests (`routing_test.clj`, 6 new): `scatter-gather-group-returns-first-response`,
+`scatter-gather-group-requires-timeout`, `tail-chopping-group-returns-response`,
+`tail-chopping-group-requires-timeout-and-interval`,
+`pool-supervisor-strategy-resumes-routee` (size-1 pool + `resume-decider`: `:inc`
+twice → 2, `:boom` throws, `:get` still 2 — verified via a throwaway test that the
+**default** pool loses the count here, so the assertion genuinely turns on the
+strategy), `pool-dispatcher-option-routes` (routees on
+`pekko.actor.default-dispatcher`, always present). `docs/specs/routing-parity-spec.md`
+updated (sections 7/9/10 + status table + test list); `doc/03-routing.md` gained
+"Scatter-gather and tail-chopping (pool and group)" and "Supervising a pool's
+routees" sections. No macro clause added/renamed (the DSL macros are untouched), so
+no clj-kondo hook / cljfmt change. `lein test` (588 tests, was 582), `lein lint`,
+`lein check` (no reflection warnings) all clean.
 **Deps:** H7.
 - Group variants that exist upstream but not here:
   `ScatterGatherFirstCompletedGroup`, `TailChoppingGroup`.
@@ -1100,7 +1183,54 @@ Update `routing-parity-spec.md`.
 **Tests:** group variants end-to-end; a pool child failure handled by the provided
 strategy (not escalated).
 
-### N19 · Small parity odds and ends — `TODO`
+### N19 · Small parity odds and ends — `DONE`
+**Note (2026-07-23):** all five bullets built.
+**CircuitBreaker:** `circuit-breaker` gained `:max-reset-timeout`
+(`.withExponentialBackoff`) and `:random-factor` (`.withRandomFactor`), applied
+via `cond->`. **`:exponential-backoff-factor` intentionally NOT added** — javap
+shows Pekko's Java `withExponentialBackoff` takes only the max reset timeout (the
+factor is hardcoded 2.0 internally, no overload exposes it); documented that in the
+option's docstring rather than shipping an ignored key. `defineFailureFn` is a
+*per-call* `BiFunction<Optional,Optional,Boolean>`, not a breaker wither, so
+`:failure-fn` became an optional trailing arg on `call`/`call-async` — a fn of
+`(result-or-nil, throwable-or-nil) -> truthy`, letting a *successful* result count
+as a failure. A private `->failure-bifn` adapts it (`.orElse … nil` unwraps each
+Optional).
+**Pub-sub:** `count-subscribers` and `get-topics` — blocking asks (`core/<!`,
+default 5s) of the mediator's `Count`/`GetTopics`, reached through the
+Java-friendly `DistributedPubSubMediator/getCountInstance` /
+`getTopicsInstance` statics (the messages are Scala case objects); `get-topics`
+maps `CurrentTopics.getTopics` to a Clojure set. Had to import the bare
+`DistributedPubSubMediator` class (only its nested `$Subscribe` etc. were imported,
+so the static call read as a namespace and failed to compile).
+**Sharding:** `stats->map` now surfaces `ShardRegionStats.getFailed`; each region
+value changed from a bare `{shard-id count}` map to `{:stats {shard-id count}
+:failed #{…}}` (breaking the region-value shape — the only test on it asserted just
+`:regions` presence, and the helper is a thin view, so recorded as the shape
+decision rather than kept dual).
+**Persistence query:** `envelope->map` adds `:metadata` from
+`EventEnvelope.getEventMetaData` (`.orElse … nil` → nil when absent).
+**Watch:** `core/watch` gained a 2-arity `(watch ref msg)` = Pekko's `watchWith`;
+added a tiny `watchWith(ActorRef, Object)` to `CljActor` (mirrors `watch`,
+delegating to `getContext().watchWith`). The custom message flows through the normal
+handler and is NOT translated to `[:terminated ref]` — documented in both.
+Tests (4 new deftests + 2 extended): `circuit-breaker-failure-fn-counts-results-as-failures-test`
+(two `:bad` results — successful calls — trip a max-failures-2 breaker, then it
+throws `CircuitBreakerOpenException`), `circuit-breaker-backoff-and-random-factor-construct-test`;
+`count-subscribers-and-get-topics-test` (single-node cluster: empty topics →
+subscribe → topic appears + positive count); `watch-with-custom-message-delivers-marker`
+(marker map delivered, not a terminated vector); extended `envelope->map-shape`
+(nil metadata on a plain envelope, present via `.withMetadata`) and
+`cluster-sharding-stats-test` (polls until the entity counts appear, then asserts
+every region value has a map `:stats` and a set `:failed`). Reflection-clean
+(hinted `^Optional`, `^CurrentTopics`; `->duration` disambiguates the two
+`withExponentialBackoff` overloads). Docstrings updated on every touched fn;
+`docs/specs/sharding-parity-spec.md`'s `cluster-sharding-stats` return shape updated
+for `:stats`/`:failed`. No `doc/` guide or other `docs/specs` checklist covers
+circuit-breaker / pub-sub / persistence-query / death-watch (grepped) — those live
+in docstrings. No macro clause added/renamed → no clj-kondo hook / cljfmt change.
+`lein test` (592 tests, was 588), `lein lint`, `lein check` (no reflection
+warnings) all clean.
 **Deps:** none. A grab-bag of one-liners; do in one session:
 - **CircuitBreaker:** `:max-reset-timeout` + `:exponential-backoff-factor` +
   `:random-factor` (the `CircuitBreaker.create` overload/withers), and

@@ -11,6 +11,8 @@
            [org.apache.pekko Done NotUsed]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
+           [org.apache.pekko.stream IOResult]
+           [java.io File ByteArrayInputStream ByteArrayOutputStream OutputStream]
            [java.util.concurrent CompletableFuture]))
 
 (def ^:dynamic *system* nil)
@@ -1252,3 +1254,101 @@
     (is (= 0 @created) "nothing ran at construction time")
     (is (= [1 2] (vec (s/await-completion (s/run-to-seq src *mat*) 3000))))
     (is (= 1 @created))))
+
+;; ---------------------------------------------------------------------------
+;; N14: File & blocking-IO integration
+;; ---------------------------------------------------------------------------
+
+(deftest byte-string-coercions
+  (is (= "hi" (s/byte-string->string (s/->byte-string "hi"))))
+  (let [bs (s/->byte-string "hi")]
+    (is (identical? bs (s/->byte-string bs)) "an existing ByteString passes through"))
+  (is (= "bytes" (s/byte-string->string (s/->byte-string (.getBytes "bytes" "UTF-8")))))
+  (is (= (seq (.getBytes "hi" "UTF-8")) (seq (s/byte-string->bytes (s/->byte-string "hi")))))
+  (is (thrown? IllegalArgumentException (s/->byte-string 42))))
+
+(deftest io-result->map-shapes-success-and-failure
+  (is (= {:count 42 :success? true :error nil}
+         (s/io-result->map (IOResult/createSuccessful 42))))
+  (let [ex (RuntimeException. "boom")
+        m  (s/io-result->map (IOResult/createFailed 3 ex))]
+    (is (= 3 (:count m)))
+    (is (false? (:success? m)))
+    (is (= ex (:error m)))))
+
+(deftest file-source-and-sink-round-trip
+  (let [f (File/createTempFile "pekko-clj-n14" ".txt")]
+    (try
+      (let [content    "hello\nfrom\npekko-clj\n"
+            byte-count (alength (.getBytes content "UTF-8"))
+            write      (s/io-result->map
+                        (-> (s/source [(s/->byte-string content)])
+                            (s/run-with (s/sink-to-file f) *mat*)
+                            (s/await-completion 3000)))
+            ;; :both keeps [source-IOResult sink-seq]; the source carries the read count
+            [read-stage seq-stage] (s/run-mat (s/source-from-file f) (s/sink-seq) :both *mat*)
+            chunks     (s/await-completion seq-stage 3000)
+            read-back  (apply str (map s/byte-string->string chunks))
+            read       (s/io-result->map (s/await-completion read-stage 3000))]
+        (is (:success? write))
+        (is (= byte-count (:count write)) "wrote every byte")
+        (is (= content read-back) "read the file back verbatim")
+        (is (= byte-count (:count read)) "IOResult reports the bytes read"))
+      (finally (.delete f)))))
+
+(deftest sink-to-file-append-option-appends
+  (let [f (File/createTempFile "pekko-clj-n14-append" ".txt")]
+    (try
+      (-> (s/source [(s/->byte-string "first\n")])
+          (s/run-with (s/sink-to-file f) *mat*) (s/await-completion 3000))
+      (-> (s/source [(s/->byte-string "second\n")])
+          (s/run-with (s/sink-to-file f [:create :append]) *mat*) (s/await-completion 3000))
+      (is (= "first\nsecond\n" (slurp f)))
+      (finally (.delete f)))))
+
+(deftest lines-splits-a-multiline-file
+  (let [f (File/createTempFile "pekko-clj-n14-lines" ".txt")]
+    (try
+      (spit f "alpha\nbeta\ngamma\n")
+      (is (= ["alpha" "beta" "gamma"]
+             (vec (-> (s/source-from-file f)
+                      (s/via (s/lines))
+                      (s/run-to-seq *mat*)
+                      (s/await-completion 3000)))))
+      (finally (.delete f)))))
+
+(deftest frame-delimiter-strips-and-splits
+  (is (= ["a" "bb" "ccc"]
+         (vec (-> (s/source [(s/->byte-string "a,bb,ccc")])
+                  (s/via (s/frame-delimiter "," 1024))
+                  (s/smap s/byte-string->string)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))))
+
+(deftest source-from-input-stream-reads-bytes
+  (let [bytes  (.getBytes "streamed input" "UTF-8")
+        chunks (-> (s/source-from-input-stream #(ByteArrayInputStream. bytes))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= "streamed input" (apply str (map s/byte-string->string chunks))))))
+
+(deftest sink-to-output-stream-writes-bytes
+  (let [baos   (ByteArrayOutputStream.)
+        result (s/io-result->map
+                (-> (s/source [(s/->byte-string "part1-") (s/->byte-string "part2")])
+                    (s/run-with (s/sink-to-output-stream (fn [] baos)) *mat*)
+                    (s/await-completion 3000)))]
+    (is (= "part1-part2" (.toString baos "UTF-8")))
+    (is (:success? result))
+    (is (= 11 (:count result)))))
+
+(deftest sink-as-input-stream-bridges-out
+  (let [in (-> (s/source [(s/->byte-string "abc") (s/->byte-string "def")])
+               (s/run-with (s/sink-as-input-stream) *mat*))]
+    (is (= "abcdef" (slurp in)))))
+
+(deftest source-as-output-stream-bridges-in
+  (let [[os done] (s/run-mat (s/source-as-output-stream) (s/sink-seq) :both *mat*)]
+    (.write ^OutputStream os (.getBytes "xy" "UTF-8"))
+    (.close ^OutputStream os)
+    (is (= "xy" (apply str (map s/byte-string->string (s/await-completion done 3000)))))))

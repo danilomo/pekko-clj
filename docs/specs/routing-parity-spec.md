@@ -268,21 +268,58 @@
 
 ---
 
-### 7. `prefer-local-routees` Option (Medium Priority)
+### 7. `prefer-local-routees` Option — N/A (Pekko Typed only)
 
-**Pekko API:** `withPreferLocalRoutees(true)`
+**Status (N18, 2026-07-23):** not applicable to this library. `preferLocalRoutees`
+exists **only** in `pekko-actor-typed` (the Typed `GroupRouter.withPreferLocalRoutees`);
+Pekko's *classic* routing API — the API this library wraps — has no
+`withPreferLocalRoutees` on any pool, group, or cluster-router settings class
+(grepped the whole `pekko-actor` / `pekko-cluster` surface at 1.6.0). The classic
+analogue already exposed is `:allow-local` (`allowLocalRoutees`) on the cluster
+routers. Resolving the spec's long-standing ❌ as "does not exist in classic
+routing" rather than shipping a wrapper for a method that isn't there.
 
-**Purpose:** Prefer local routees over remote ones.
+---
+
+### 9. Scatter-gather / tail-chopping **groups** ✅ Implemented (N18)
+
+**Pekko API:** `ScatterGatherFirstCompletedGroup`, `TailChoppingGroup`
+
+**Purpose:** the group (route-to-existing-actors) counterparts of the
+already-implemented scatter-gather and tail-chopping *pools*.
 
 **Signature:**
 ```clojure
-;; Add to spawn-pool and spawn-group opts
-:prefer-local - Prefer local routees (default: false)
+(spawn-scatter-gather-group sys ["/user/w1" "/user/w2"] {:timeout-ms 5000})
+(spawn-tail-chopping-group  sys ["/user/w1" "/user/w2"] {:timeout-ms 5000 :interval-ms 100})
 ```
 
 **Implementation Notes:**
-- Add option parsing in `spawn-pool` and `spawn-group`
-- Call `.withPreferLocalRoutees(true)` on pool/group when enabled
+- Use the Java-friendly constructors — `(java.lang.Iterable<String>, java.time.Duration)`
+  and `(java.lang.Iterable<String>, java.time.Duration, java.time.Duration)` — so a
+  plain `ArrayList` of paths and `Duration/ofMillis` work without touching Scala types.
+
+---
+
+### 10. Pool `:supervisor-strategy` / `:dispatcher` ✅ Implemented (N18)
+
+**Pekko API:** `Pool.withSupervisorStrategy(SupervisorStrategy)`, `withDispatcher(String)`
+
+**Purpose:** pools supervise their routees; `:supervisor-strategy` lets a routee
+failure be resumed/restarted/stopped instead of the default escalate.
+`:dispatcher` runs the routees on a named dispatcher.
+
+**Signature:**
+```clojure
+(spawn-pool sys worker 3 {:supervisor-strategy (supervision/one-for-one supervision/resume-decider)
+                          :dispatcher "my-dispatcher"})
+```
+
+**Implementation Notes:**
+- These withers are declared on each concrete pool class, not the `Pool` interface
+  (like `withResizer`), so a private `configure-pool` macro applies them on the
+  concrete constructor expression to stay reflection-free. Available on every pool
+  spawner (`spawn-pool`, consistent-hash, scatter-gather, tail-chopping, resizer).
 
 ---
 
@@ -322,9 +359,10 @@
 | Cluster-aware routers | ✅ Implemented | `spawn-cluster-pool`, `spawn-cluster-group` |
 | BalancingPool | ✅ Implemented | `:balancing` strategy in `spawn-pool` |
 | Resizers | ✅ Implemented | `spawn-pool-with-resizer` |
-| prefer-local-routees | ❌ Not implemented | Low priority optimization |
-| ScatterGatherPool | ✅ Implemented | `spawn-scatter-gather-pool` |
-| TailChoppingPool | ✅ Implemented | `spawn-tail-chopping-pool` |
+| prefer-local-routees | ⛔ N/A | Pekko Typed only; no classic-routing equivalent (N18) |
+| ScatterGatherPool/Group | ✅ Implemented | `spawn-scatter-gather-pool`, `spawn-scatter-gather-group` (N18) |
+| TailChoppingPool/Group | ✅ Implemented | `spawn-tail-chopping-pool`, `spawn-tail-chopping-group` (N18) |
+| Pool supervisor-strategy / dispatcher | ✅ Implemented | `:supervisor-strategy`, `:dispatcher` on pool spawners (N18) |
 | Dynamic routee mgmt | ✅ Implemented | `add-routee`, `remove-routee`, `adjust-pool-size` |
 
 ---
@@ -340,6 +378,10 @@ Tests in `test/clj/pekko_clj/routing_test.clj`:
 - `tail-chopping-pool-returns-response` - Latency reduction
 - `pool-with-resizer-starts` - Auto-scaling pool
 - `adjust-pool-size-changes-routees` - Dynamic routee management
+- `scatter-gather-group-returns-first-response` / `-requires-timeout` - Group form (N18)
+- `tail-chopping-group-returns-response` / `-requires-timeout-and-interval` - Group form (N18)
+- `pool-supervisor-strategy-resumes-routee` - Routee failure resumed, not escalated (N18)
+- `pool-dispatcher-option-routes` - Routees on a named dispatcher (N18)
 
 ---
 

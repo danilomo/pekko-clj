@@ -144,7 +144,9 @@ Note: Pekko disables automatic passivation entirely when `:remember-entities` is
    - timeout-ms: Timeout for gathering stats (default: 5000)
 
    Returns a future of stats map with:
-   - :regions - Map of region address to shard stats"
+   - :regions - Map of region address to a per-region map of
+     {:stats {shard-id count} :failed #{shard-id …}} (N19 added :failed —
+     ShardRegionStats.getFailed — and nested the counts under :stats)"
   ([system type-name]
    (cluster-sharding-stats system type-name 5000))
   ([system type-name timeout-ms]

@@ -532,10 +532,18 @@
 
 ;; DeathWatch functions
 (defn watch
-  "Watch an actor for termination. When the watched actor stops,
-   this actor will receive [:terminated actor-ref]."
-  [actor-ref]
-  (.watch *current-actor* actor-ref))
+  "Watch an actor for termination.
+
+   - (watch actor-ref)     — when the watched actor stops, this actor receives
+     [:terminated actor-ref].
+   - (watch actor-ref msg) — Pekko's watchWith: this actor receives `msg` (as-is)
+     instead, so a custom marker can ride along (e.g. which child died and why).
+     `msg` is delivered through the normal handler and is NOT translated to a
+     [:terminated ...] vector."
+  ([actor-ref]
+   (.watch *current-actor* actor-ref))
+  ([actor-ref msg]
+   (.watchWith *current-actor* actor-ref msg)))
 
 (defn unwatch
   "Stop watching an actor for termination."

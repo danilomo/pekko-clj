@@ -30,6 +30,7 @@
   (:require [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorRef ActorSystem]
            [org.apache.pekko.cluster.pubsub DistributedPubSub
+            DistributedPubSubMediator
             DistributedPubSubMediator$Subscribe
             DistributedPubSubMediator$Unsubscribe
             DistributedPubSubMediator$Publish
@@ -38,7 +39,8 @@
             DistributedPubSubMediator$Put
             DistributedPubSubMediator$Remove
             DistributedPubSubMediator$SubscribeAck
-            DistributedPubSubMediator$UnsubscribeAck]))
+            DistributedPubSubMediator$UnsubscribeAck
+            DistributedPubSubMediator$CurrentTopics]))
 
 ;; ---------------------------------------------------------------------------
 ;; Mediator access
@@ -171,6 +173,28 @@
 ;; ---------------------------------------------------------------------------
 ;; Point-to-point / broadcast by actor path
 ;; ---------------------------------------------------------------------------
+
+(defn count-subscribers
+  "Ask the mediator how many registry entries it holds on this node (topic
+   subscriptions plus `put` registrations), blocking up to `timeout-ms`
+   (default 5000) for the reply. Returns an integer.
+
+   Cluster-wide the count converges by gossip, so shortly after a subscribe on
+   another node this may still report the pre-propagation value."
+  ([system-or-mediator] (count-subscribers system-or-mediator 5000))
+  ([system-or-mediator timeout-ms]
+   (core/<! (->mediator system-or-mediator)
+            (DistributedPubSubMediator/getCountInstance) timeout-ms)))
+
+(defn get-topics
+  "Ask the mediator for the set of topic names known on this node, blocking up to
+   `timeout-ms` (default 5000). Returns a set of topic strings (empty if none)."
+  ([system-or-mediator] (get-topics system-or-mediator 5000))
+  ([system-or-mediator timeout-ms]
+   (let [reply (core/<! (->mediator system-or-mediator)
+                        (DistributedPubSubMediator/getTopicsInstance) timeout-ms)]
+     (when reply
+       (into #{} (.getTopics ^DistributedPubSubMediator$CurrentTopics reply))))))
 
 (defn put
   "Register `actor-ref` with the mediator under its actor path so it can receive

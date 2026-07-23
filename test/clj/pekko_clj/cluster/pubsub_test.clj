@@ -163,3 +163,20 @@
         (is (eventually (do (pubsub/send-to-all sys path :broadcast)
                             (some #{:broadcast} @received)))))
       (finally (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; N19: mediator Count / GetTopics
+;; ---------------------------------------------------------------------------
+
+(deftest count-subscribers-and-get-topics-test
+  (let [sys (ts/create-cluster-system "pubsub-count")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [received (atom [])]
+        ;; No topics before anyone subscribes.
+        (is (= #{} (pubsub/get-topics sys)))
+        (pubsub/subscribe sys "news" (fn [m] (swap! received conj m)))
+        ;; Topic registration is async — wait for it to show up.
+        (is (eventually (contains? (pubsub/get-topics sys) "news")))
+        (is (pos? (pubsub/count-subscribers sys)) "the subscription is counted"))
+      (finally (ts/terminate-system sys)))))

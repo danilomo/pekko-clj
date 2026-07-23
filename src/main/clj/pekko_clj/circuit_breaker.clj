@@ -15,6 +15,8 @@
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.pattern CircuitBreaker]
            [java.time Duration]
+           [java.util Optional]
+           [java.util.function BiFunction]
            [java.util.concurrent Callable CompletionStage]))
 
 (defn- ->duration
@@ -29,29 +31,61 @@
    - :call-timeout  - per-call timeout; a number of ms or a java.time.Duration
                       (default 10000). A call exceeding it counts as a failure.
    - :reset-timeout - how long the breaker stays open before going half-open;
-                      ms or Duration (default 60000)"
+                      ms or Duration (default 60000)
+   - :max-reset-timeout - enable exponential backoff of the reset-timeout: it
+                      doubles on each failed trial call up to this cap (ms or
+                      Duration). Omit for a constant reset-timeout. (Pekko fixes
+                      the backoff factor at 2.0; it is not configurable here.)
+   - :random-factor - add up to this fraction (0.0-1.0) of jitter to each
+                      reset-timeout, to avoid a thundering herd of trial calls"
   (^CircuitBreaker [^ActorSystem system] (circuit-breaker system {}))
-  (^CircuitBreaker [^ActorSystem system {:keys [max-failures call-timeout reset-timeout]
+  (^CircuitBreaker [^ActorSystem system {:keys [max-failures call-timeout reset-timeout
+                                                max-reset-timeout random-factor]
                                          :or {max-failures 5
                                               call-timeout 10000
                                               reset-timeout 60000}}]
-   (CircuitBreaker/create (.scheduler system) (int max-failures)
-                          (->duration call-timeout) (->duration reset-timeout))))
+   (cond-> (CircuitBreaker/create (.scheduler system) (int max-failures)
+                                  (->duration call-timeout) (->duration reset-timeout))
+     max-reset-timeout (.withExponentialBackoff (->duration max-reset-timeout))
+     random-factor     (.withRandomFactor (double random-factor)))))
+
+(defn- ->failure-bifn
+  "Adapt a Clojure `failure-fn` of (result-or-nil, throwable-or-nil) -> truthy to
+   Pekko's BiFunction<Optional, Optional, Boolean> failure decider. `result` is the
+   call's value (nil when it threw); `error` is the Throwable (nil when it
+   succeeded); return truthy to count the call as a failure."
+  ^BiFunction [failure-fn]
+  (reify BiFunction
+    (apply [_ result-opt error-opt]
+      (boolean (failure-fn (.orElse ^Optional result-opt nil)
+                           (.orElse ^Optional error-opt nil))))))
 
 (defn call
   "Run 0-arg `f` through `breaker` SYNCHRONOUSLY (blocks the calling thread). While
    the breaker is open it throws `CircuitBreakerOpenException` immediately; an
    exception or timeout from `f` counts as a failure and is rethrown. Returns f's
-   value on success."
-  [^CircuitBreaker breaker f]
-  (.callWithSyncCircuitBreaker breaker (reify Callable (call [_] (f)))))
+   value on success.
+
+   With `failure-fn` — a fn of (result-or-nil, throwable-or-nil) -> truthy — a
+   *successful* result can also be counted as a failure (e.g. an HTTP 503 body),
+   in addition to thrown exceptions. It is called after each completed call."
+  ([^CircuitBreaker breaker f]
+   (.callWithSyncCircuitBreaker breaker (reify Callable (call [_] (f)))))
+  ([^CircuitBreaker breaker f failure-fn]
+   (.callWithSyncCircuitBreaker breaker (reify Callable (call [_] (f)))
+                                (->failure-bifn failure-fn))))
 
 (defn call-async
   "Run `f` (0-arg, returning a CompletionStage) through `breaker`; returns a
    CompletionStage that fails with `CircuitBreakerOpenException` when open, and
-   whose failure/timeout counts toward opening the breaker."
-  ^CompletionStage [^CircuitBreaker breaker f]
-  (.callWithCircuitBreakerCS breaker (reify Callable (call [_] (f)))))
+   whose failure/timeout counts toward opening the breaker.
+
+   With `failure-fn` (see `call`) a successful result can also count as a failure."
+  (^CompletionStage [^CircuitBreaker breaker f]
+   (.callWithCircuitBreakerCS breaker (reify Callable (call [_] (f)))))
+  (^CompletionStage [^CircuitBreaker breaker f failure-fn]
+   (.callWithCircuitBreakerCS breaker (reify Callable (call [_] (f)))
+                              (->failure-bifn failure-fn))))
 
 (defn succeed
   "Manually record a success (for use with externally-managed calls). Returns nil."

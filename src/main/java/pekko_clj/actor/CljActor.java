@@ -304,6 +304,13 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
     getContext().watch(actorRef);
   }
 
+  // Like watch, but delivers `message` (as-is) instead of a Terminated when the
+  // watched actor stops — Pekko's watchWith. The custom message flows through the
+  // normal receive path, so it is NOT translated to [:terminated actor-ref].
+  public void watchWith(ActorRef actorRef, Object message) {
+    getContext().watchWith(actorRef, message);
+  }
+
   public void unwatch(ActorRef actorRef) {
     getContext().unwatch(actorRef);
   }

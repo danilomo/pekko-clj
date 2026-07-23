@@ -89,7 +89,11 @@
     (is (= "pid-1" (:persistence-id m)))
     (is (= 3 (:sequence-nr m)))
     (is (= [:incremented] (:event m)))
-    (is (= {:type :sequence :value 3} (:offset m)))))
+    (is (= {:type :sequence :value 3} (:offset m)))
+    (is (nil? (:metadata m)) "no metadata on a plain envelope")
+    ;; N19: eventMetadata surfaces as :metadata when present
+    (is (= {:trace "abc"}
+           (:metadata (q/envelope->map (.withMetadata env {:trace "abc"})))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Queries against a live LevelDB journal

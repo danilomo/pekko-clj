@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.routing :as routing]
+            [pekko-clj.supervision :as supervision]
             [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorRef]
            [org.apache.pekko.routing Routees]
@@ -351,3 +352,57 @@
     ;; Remove 1 routee
     (routing/adjust-pool-size pool -1)
     (is (eventually (= 4 (.size (.getRoutees (deref (routing/get-routees pool) 5000 nil))))))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: N18 — group variants, pool supervisor-strategy, dispatcher
+;; ---------------------------------------------------------------------------
+
+(core/defactor stateful-boom-worker
+  "Counts :inc, throws on :boom, replies its count on :get."
+  (init [_] {:count 0})
+  (handle :inc (update state :count inc))
+  (handle :boom (throw (RuntimeException. "boom")))
+  (handle :get (core/reply (:count state))))
+
+(deftest scatter-gather-group-returns-first-response
+  (core/spawn *system* echo-worker nil {:name "sg-w1"})
+  (core/spawn *system* echo-worker nil {:name "sg-w2"})
+  (let [group (routing/spawn-scatter-gather-group *system* ["/user/sg-w1" "/user/sg-w2"]
+                                                  {:timeout-ms 5000})]
+    (is (= :pong (await-ask group :ping)))))
+
+(deftest scatter-gather-group-requires-timeout
+  (is (thrown? IllegalArgumentException
+        (routing/spawn-scatter-gather-group *system* ["/user/x"] {}))))
+
+(deftest tail-chopping-group-returns-response
+  (core/spawn *system* echo-worker nil {:name "tc-w1"})
+  (core/spawn *system* echo-worker nil {:name "tc-w2"})
+  (let [group (routing/spawn-tail-chopping-group *system* ["/user/tc-w1" "/user/tc-w2"]
+                                                 {:timeout-ms 5000 :interval-ms 100})]
+    (is (= :pong (await-ask group :ping)))))
+
+(deftest tail-chopping-group-requires-timeout-and-interval
+  (is (thrown? IllegalArgumentException
+        (routing/spawn-tail-chopping-group *system* ["/user/x"] {:timeout-ms 5000}))))
+
+(deftest pool-supervisor-strategy-resumes-routee
+  ;; A pool supervises its routees. With a :resume strategy, a routee that throws
+  ;; keeps its state instead of the failure escalating (which would restart the
+  ;; routee and reset the count).
+  (let [pool (routing/spawn-pool *system* stateful-boom-worker 1
+                                 {:supervisor-strategy
+                                  (supervision/one-for-one supervision/resume-decider)})]
+    (is (= 0 (await-ask pool :get)))
+    (core/! pool :inc)
+    (core/! pool :inc)
+    (is (= 2 (await-ask pool :get)))
+    (core/! pool :boom)                      ; routee throws
+    (is (= 2 (await-ask pool :get)) "resume kept the routee's state across the failure")))
+
+(deftest pool-dispatcher-option-routes
+  ;; :dispatcher names a configured dispatcher for the routees; the always-present
+  ;; default dispatcher is enough to prove the wiring spawns and routes.
+  (let [pool (routing/spawn-pool *system* echo-worker 2
+                                 {:dispatcher "pekko.actor.default-dispatcher"})]
+    (is (= :pong (await-ask pool :ping)))))

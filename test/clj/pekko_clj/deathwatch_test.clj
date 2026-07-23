@@ -138,6 +138,30 @@
     ;; Should NOT have received terminated
     (is (false? @terminated-received))))
 
+(deftest watch-with-custom-message-delivers-marker
+  ;; N19: (watch ref msg) is Pekko's watchWith — the watcher receives `msg` as-is
+  ;; (here a map marker) instead of a [:terminated ref] vector.
+  (let [received (promise)
+        watcher (core/new-actor
+                 *system*
+                 {:function (fn [this msg]
+                              (binding [core/*current-actor* this]
+                                (cond
+                                  (and (vector? msg) (= :watch (first msg)))
+                                  (do (core/watch (second msg) {:gone :my-marker})
+                                      (.reply this :watching)
+                                      nil)
+
+                                  (and (map? msg) (contains? msg :gone))
+                                  (do (deliver received msg) nil)
+
+                                  :else nil)))
+                  :state nil})
+        target (core/new-actor *system* {:function (fn [_ _] nil) :state nil})]
+    (is (= :watching (await-ask watcher [:watch target])))
+    (.tell target poison-pill no-sender)
+    (is (= {:gone :my-marker} (deref received 3000 :timeout)))))
+
 (deftest watch-multiple-actors
   (let [terminated-actors (atom #{})
         watcher (core/new-actor

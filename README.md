@@ -319,6 +319,13 @@ for combining, `divert-to` for routing elements out of the main flow, `limit`
 (like `take`, but going over the bound is an error), `dedupe` / `dedupe-by`,
 and empty-safe `sink-head-option` / `sink-last-option` / `sink-take-last`.
 
+For files and blocking I/O, `source-from-file` / `sink-to-file` read and write
+`ByteString` streams (materializing to an `IOResult`, `io-result->map` for
+`{:count :success? :error}`), `source-from-input-stream` / `sink-to-output-stream`
+and `sink-as-input-stream` / `source-as-output-stream` bridge `java.io.*Stream`s,
+and `(lines)` / `frame-delimiter` split a byte stream into lines/frames. Coerce
+with `->byte-string` and `byte-string->string`.
+
 ## Clustering
 
 Create cluster-enabled actor systems:

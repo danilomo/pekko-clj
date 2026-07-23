@@ -512,8 +512,10 @@
   "Convert ClusterShardingStats to a Clojure map.
 
    Returns:
-   - :regions - Map of region address to shard stats map
-     - Each shard stats map contains shard-id -> entity-count"
+   - :regions - Map of region address to a per-region map:
+     - :stats  - shard-id -> entity-count
+     - :failed - set of shard-ids the region failed to gather stats for
+       (empty in the common case)"
   [^ShardRegion$ClusterShardingStats stats]
   (let [regions (.getRegions stats)]
     {:regions
@@ -521,9 +523,10 @@
            (for [entry (seq regions)]
              (let [addr (key entry)
                    shard-stats ^ShardRegion$ShardRegionStats (val entry)]
-               [addr (into {}
-                           (for [shard-entry (seq (.getStats shard-stats))]
-                             [(key shard-entry) (val shard-entry)]))])))}))
+               [addr {:stats (into {}
+                                   (for [shard-entry (seq (.getStats shard-stats))]
+                                     [(key shard-entry) (val shard-entry)]))
+                      :failed (set (.getFailed shard-stats))}])))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Entity Passivation

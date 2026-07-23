@@ -126,13 +126,16 @@
       :persistence-id \"…\"
       :sequence-nr 3
       :event <payload>
-      :timestamp 1234567890}"
+      :timestamp 1234567890
+      :metadata <event metadata, or nil when the event carries none>}"
   [^EventEnvelope env]
-  {:offset (offset->clj (.offset env))
-   :persistence-id (.persistenceId env)
-   :sequence-nr (.sequenceNr env)
-   :event (.event env)
-   :timestamp (.timestamp env)})
+  (let [md (.getEventMetaData env)]
+    {:offset (offset->clj (.offset env))
+     :persistence-id (.persistenceId env)
+     :sequence-nr (.sequenceNr env)
+     :event (.event env)
+     :timestamp (.timestamp env)
+     :metadata (.orElse md nil)}))
 
 (defn- map-envelopes
   "Map a Source<EventEnvelope> to a Source of Clojure maps."

@@ -59,3 +59,28 @@
         (is (nil? (cb/fail b)))
         (is (eventually (cb/open? b))))
       (finally (core/shutdown-system sys)))))
+
+(deftest circuit-breaker-failure-fn-counts-results-as-failures-test
+  ;; N19: a *successful* result can be counted as a failure via failure-fn.
+  (let [sys (core/actor-system "cb-failfn")]
+    (try
+      (let [b (cb/circuit-breaker sys {:max-failures 2 :reset-timeout 60000})
+            bad? (fn [result _err] (= result :bad))]
+        ;; These calls SUCCEED (return :bad), but failure-fn counts them as failures.
+        (is (= :bad (cb/call b (fn [] :bad) bad?)))
+        (is (= :bad (cb/call b (fn [] :bad) bad?)))
+        (is (eventually (cb/open? b)) "two bad results tripped the breaker")
+        (is (thrown? CircuitBreakerOpenException (cb/call b (fn [] :ok) bad?))))
+      (finally (core/shutdown-system sys)))))
+
+(deftest circuit-breaker-backoff-and-random-factor-construct-test
+  ;; N19: :max-reset-timeout enables exponential backoff, :random-factor adds jitter.
+  (let [sys (core/actor-system "cb-backoff")]
+    (try
+      (let [b (cb/circuit-breaker sys {:max-failures 3
+                                       :reset-timeout 1000
+                                       :max-reset-timeout 30000
+                                       :random-factor 0.2})]
+        (is (instance? CircuitBreaker b))
+        (is (= 5 (cb/call b (fn [] 5)))))
+      (finally (core/shutdown-system sys)))))

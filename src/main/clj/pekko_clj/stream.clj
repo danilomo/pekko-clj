@@ -40,21 +40,24 @@
            (run-foreach println mat)))"
   (:refer-clojure :exclude [concat dedupe drop drop-while interleave mapcat take take-while merge distinct partition group-by])
   (:import [org.apache.pekko.stream Materializer OverflowStrategy
-            ActorAttributes Attributes CompletionStrategy KillSwitch
+            ActorAttributes Attributes CompletionStrategy IOResult KillSwitch
             KillSwitches RestartSettings SharedKillSwitch Supervision
             SystemMaterializer]
            [org.apache.pekko.stream.javadsl Source Flow Sink Keep RunnableGraph
             AsPublisher
             Broadcast Balance Merge Partition SubSource SubFlow
+            FileIO StreamConverters Framing FramingTruncation
             RestartSource RestartFlow RestartSink RetryFlow]
            [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.japi Pair]
            [org.apache.pekko.japi.pf PFBuilder FI$Apply]
            [org.apache.pekko.pattern StatusReply]
-           [org.apache.pekko.util Timeout]
+           [org.apache.pekko.util ByteString Timeout]
            [java.util.concurrent CompletionStage]
            [java.util Optional]
            [java.time Duration]
+           [java.io File]
+           [java.nio.file Path StandardOpenOption]
            [clojure.lang Reflector]
            [org.reactivestreams Publisher]))
 
@@ -1512,3 +1515,188 @@
   ([src parallelism actor-ref timeout]
    (-> (ask src parallelism actor-ref StatusReply timeout)
        (smap unwrap-status-reply))))
+
+;; ---------------------------------------------------------------------------
+;; N14: File & blocking-IO integration (FileIO, StreamConverters, framing)
+;; ---------------------------------------------------------------------------
+
+(defn ->byte-string
+  "Coerce to a Pekko ByteString — the element type of the file/IO streams below.
+
+   Accepts a String (encoded UTF-8), a byte-array, or an existing ByteString
+   (returned unchanged). Throws on anything else."
+  ^ByteString [x]
+  (cond
+    (instance? ByteString x) x
+    (string? x)              (ByteString/fromString ^String x)
+    (bytes? x)               (ByteString/fromArray ^bytes x)
+    :else (throw (IllegalArgumentException.
+                  (str "Cannot coerce to ByteString: " (pr-str x)
+                       " — expected a String, a byte-array or a ByteString.")))))
+
+(defn byte-string->string
+  "Decode a ByteString to a String (UTF-8) — the inverse of `->byte-string` on a
+   String."
+  ^String [^ByteString bs]
+  (.utf8String bs))
+
+(defn byte-string->bytes
+  "The raw contents of a ByteString as a byte-array."
+  ^bytes [^ByteString bs]
+  (.toArray bs))
+
+(defn io-result->map
+  "Convert an IOResult — the materialized value of the FileIO / StreamConverters
+   streams — to a map {:count <bytes>, :success? bool, :error <Throwable or nil>}.
+
+   `count` is the number of bytes read or written; `error` is nil on success."
+  [^IOResult result]
+  (let [ok (.wasSuccessful result)]
+    {:count    (.getCount result)
+     :success? ok
+     :error    (when-not ok (.getError result))}))
+
+(defn- ->path
+  "Coerce a String, java.io.File or java.nio.file.Path to a Path."
+  ^Path [p]
+  (cond
+    (instance? Path p) p
+    (instance? File p) (.toPath ^File p)
+    (string? p)        (.toPath (File. ^String p))
+    :else (throw (IllegalArgumentException.
+                  (str "Cannot coerce to a file Path: " (pr-str p)
+                       " — expected a String, java.io.File or java.nio.file.Path.")))))
+
+(defn- ->open-option
+  "Coerce a keyword or a java.nio.file.OpenOption to a StandardOpenOption."
+  [o]
+  (if (instance? java.nio.file.OpenOption o)
+    o
+    (case o
+      :append            StandardOpenOption/APPEND
+      :create            StandardOpenOption/CREATE
+      :create-new        StandardOpenOption/CREATE_NEW
+      :truncate-existing StandardOpenOption/TRUNCATE_EXISTING
+      :write             StandardOpenOption/WRITE
+      :read              StandardOpenOption/READ
+      :sync              StandardOpenOption/SYNC
+      :dsync             StandardOpenOption/DSYNC
+      (throw (IllegalArgumentException.
+              (str "Unknown open option: " (pr-str o)
+                   ". Valid options: :append, :create, :create-new, "
+                   ":truncate-existing, :write, :read, :sync, :dsync "
+                   "(or a java.nio.file.OpenOption)."))))))
+
+(defn source-from-file
+  "A Source that reads a file as a stream of ByteString chunks.
+
+   `file` is a String path, a java.io.File or a java.nio.file.Path. The stream's
+   materialized value is a CompletionStage<IOResult> (see `io-result->map`) that
+   completes with the number of bytes read; keep it with `run-mat`/`to-mat` and a
+   :left/:both Keep to observe it.
+
+   chunk-size: bytes per emitted ByteString (default 8192).
+
+   Example:
+     (-> (source-from-file \"/etc/hosts\")
+         (via (lines))
+         (run-to-seq sys))"
+  ([file] (FileIO/fromPath (->path file)))
+  ([file chunk-size] (FileIO/fromPath (->path file) (int chunk-size))))
+
+(defn sink-to-file
+  "A Sink that writes a stream of ByteString to a file, materializing to a
+   CompletionStage<IOResult> (see `io-result->map`) with the number of bytes
+   written.
+
+   `file` is a String path, a java.io.File or a java.nio.file.Path. With one
+   argument the file is created (or truncated) and written; the 2-arity takes a
+   collection of open options — keywords (:append, :create, :create-new,
+   :truncate-existing, :write, :read, :sync, :dsync) or java.nio.file.OpenOption
+   values — e.g. [:create :append] to append.
+
+   Example:
+     (run-with (source [(->byte-string \"line1\\n\") (->byte-string \"line2\\n\")])
+               (sink-to-file \"/tmp/out.txt\")
+               sys)"
+  ([file] (FileIO/toPath (->path file)))
+  ([file open-options]
+   (FileIO/toPath (->path file)
+                  ^java.util.Set (into #{} (map ->open-option) open-options))))
+
+(defn source-from-input-stream
+  "A Source of ByteString reading from a java.io.InputStream produced by `factory-fn`
+   (a no-arg fn, called once when the stream runs). Blocking reads run on the
+   dedicated blocking-IO dispatcher. Materializes to a CompletionStage<IOResult>.
+
+   chunk-size: bytes per emitted ByteString (default 8192).
+
+   Example:
+     (source-from-input-stream #(io/input-stream (io/resource \"data.bin\")))"
+  ([factory-fn]
+   (StreamConverters/fromInputStream
+    (reify org.apache.pekko.japi.function.Creator (create [_] (factory-fn)))))
+  ([factory-fn chunk-size]
+   (StreamConverters/fromInputStream
+    (reify org.apache.pekko.japi.function.Creator (create [_] (factory-fn)))
+    (int chunk-size))))
+
+(defn sink-to-output-stream
+  "A Sink writing ByteString elements to a java.io.OutputStream produced by
+   `factory-fn` (a no-arg fn, called once when the stream runs). Materializes to a
+   CompletionStage<IOResult>.
+
+   auto-flush?: flush the stream after each element (default false)."
+  ([factory-fn]
+   (StreamConverters/fromOutputStream
+    (reify org.apache.pekko.japi.function.Creator (create [_] (factory-fn)))))
+  ([factory-fn auto-flush?]
+   (StreamConverters/fromOutputStream
+    (reify org.apache.pekko.japi.function.Creator (create [_] (factory-fn)))
+    (boolean auto-flush?))))
+
+(defn sink-as-input-stream
+  "A Sink whose materialized value is a java.io.InputStream that pulls ByteString
+   elements from the stream as bytes — a blocking bridge OUT of a stream.
+
+   The optional read timeout is a java.time.Duration or milliseconds (default 5s);
+   a read blocks up to that long for the next element before failing."
+  ([] (StreamConverters/asInputStream))
+  ([read-timeout] (StreamConverters/asInputStream (->duration read-timeout))))
+
+(defn source-as-output-stream
+  "A Source whose materialized value is a java.io.OutputStream; bytes written to it
+   are emitted from the stream as ByteString — a blocking bridge INTO a stream.
+
+   The optional write timeout is a java.time.Duration or milliseconds (default 5s);
+   a write blocks up to that long for downstream demand before failing."
+  ([] (StreamConverters/asOutputStream))
+  ([write-timeout] (StreamConverters/asOutputStream (->duration write-timeout))))
+
+(defn frame-delimiter
+  "A framing Flow<ByteString, ByteString> that chunks a byte stream into frames
+   separated by `delimiter` (a String or ByteString), emitting each frame with the
+   delimiter stripped.
+
+   max-frame-length bounds a single frame; a longer one fails the stream.
+   allow-truncation? (default true) decides whether a final frame with no trailing
+   delimiter is emitted (true) or dropped as truncated (false)."
+  ([delimiter max-frame-length] (frame-delimiter delimiter max-frame-length true))
+  ([delimiter max-frame-length allow-truncation?]
+   (Framing/delimiter (->byte-string delimiter) (int max-frame-length)
+                      (if allow-truncation? FramingTruncation/ALLOW FramingTruncation/DISALLOW))))
+
+(defn lines
+  "A Flow<ByteString, String> that splits a byte stream into lines: it frames on
+   \\n (the newline is stripped) and decodes each frame as UTF-8.
+
+   Note: only \\n is treated as the separator, so a CRLF file leaves a trailing
+   \\r on each line — use `frame-delimiter` with \"\\r\\n\" for those.
+
+   max-line-length bounds a single line (default 65536).
+
+   Example:
+     (-> (source-from-file \"names.txt\") (via (lines)) (run-to-seq sys))"
+  ([] (lines 65536))
+  ([max-line-length]
+   (smap (frame-delimiter "\n" max-line-length) byte-string->string)))

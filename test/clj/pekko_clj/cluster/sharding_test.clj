@@ -358,10 +358,22 @@
         (sharding/tell region "entity-2" [:inc])
         (sharding/tell region "entity-3" [:inc])
         ;; Get stats once the region responds
-        (let [stats (ts/poll-until
-                     #(await-result (sharding/cluster-sharding-stats sys "StatsEntity" 5000)))]
-          (is (some? stats))
-          (is (contains? (sharding/stats->map stats) :regions))))
+        ;; Poll until the region stats actually report the active entities — the
+        ;; ClusterShardingStats gather is async, so an early reply has empty regions.
+        (let [m (ts/poll-until
+                 (fn []
+                   (let [mm (sharding/stats->map
+                             (await-result (sharding/cluster-sharding-stats sys "StatsEntity" 5000)))]
+                     (when (pos? (reduce + 0 (mapcat (comp vals :stats) (vals (:regions mm)))))
+                       mm)))
+                 15000)]
+          (is (some? m) "cluster sharding stats eventually report the entities")
+          (is (contains? m :regions))
+          ;; N19: each region value is {:stats {shard-id count} :failed #{}}
+          (let [region-vals (vals (:regions m))]
+            (is (every? #(and (map? (:stats %)) (set? (:failed %))) region-vals))
+            (is (<= 1 (reduce + 0 (mapcat (comp vals :stats) region-vals)))
+                "the entities show up in the per-shard counts"))))
       (finally
         (ts/terminate-system sys)))))
 
