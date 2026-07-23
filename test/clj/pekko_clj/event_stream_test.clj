@@ -41,6 +41,26 @@
         (is (not-any? #{:after} @received)))
       (finally (core/shutdown-system sys)))))
 
+(deftest unsubscribe-stops-internally-spawned-subscriber-test
+  ;; H12: subscribe passed a fn spawns an internal actor; unsubscribe used to
+  ;; only deregister it from the EventStream, leaking the actor forever.
+  (let [sys (core/actor-system "es-leak")]
+    (try
+      (let [sub (es/subscribe sys clojure.lang.Keyword (fn [_]))]
+        (is (nil? (es/unsubscribe sys sub)))
+        (is (ts/stopped-within? sys sub)))
+      (finally (core/shutdown-system sys)))))
+
+(deftest unsubscribe-does-not-stop-a-caller-supplied-ref-test
+  ;; A directly-passed ActorRef is the caller's to manage; unsubscribe must not
+  ;; stop it.
+  (let [sys (core/actor-system "es-no-leak")]
+    (try
+      (let [worker (core/spawn sys noop)]
+        (is (nil? (es/unsubscribe sys (es/subscribe sys clojure.lang.Keyword worker))))
+        (is (not (ts/stopped-within? sys worker 500))))
+      (finally (core/shutdown-system sys)))))
+
 (deftest dead-letters-test
   (let [sys (core/actor-system "es-dead")]
     (try

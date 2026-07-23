@@ -149,7 +149,9 @@
     (let [routes (routing/path "data"
                    (routing/method-get
                      (routing/path-end
-                       (routing/complete :ok (resp/json "{\"key\":\"value\"}")))))]
+                       ;; N15: a bare string is now encoded as a JSON string value,
+                       ;; so a pre-encoded body has to say so with raw-body.
+                       (routing/complete :ok (resp/json (marshal/raw-body "{\"key\":\"value\"}"))))))]
       (with-test-server routes
         (fn []
           (let [response (-> (client/GET *system* (str "http://127.0.0.1:" *port* "/data"))
@@ -636,3 +638,139 @@
                      (client/await-response 5000)))))
         (finally
           (stream/await-completion (http/unbind binding) 5000))))))
+
+;; ---------------------------------------------------------------------------
+;; N15: static content
+;; ---------------------------------------------------------------------------
+
+(defn- get-status+body
+  "GET url and return [status body]. (`get-body` above takes a response, not a url.)"
+  ([url] (get-status+body url {}))
+  ([url opts]
+   (let [response (-> (client/GET *system* url opts) (client/await-response 5000))]
+     [(client/response-status response)
+      (-> (client/response-body response *system*) (client/await-response 5000))])))
+
+(deftest from-resource-serves-a-classpath-file
+  (let [routes (routing/routes
+                 (routing/path "style.css" (routing/from-resource "public/css/app.css"))
+                 (routing/not-found "nope"))]
+    (with-test-server routes
+      (fn []
+        (let [[status body] (get-status+body (str "http://127.0.0.1:" *port* "/style.css"))]
+          (is (= 200 status))
+          (is (str/includes? body "rebeccapurple")))
+        ;; content type comes from the extension, not from us
+        (let [response (-> (client/GET *system* (str "http://127.0.0.1:" *port* "/style.css"))
+                           (client/await-response 5000))]
+          (is (str/includes? (str (.getContentType (.entity response))) "text/css")))))))
+
+(deftest from-resource-directory-resolves-the-unmatched-path
+  (let [routes (routing/routes
+                 (routing/path-prefix "assets" (routing/from-resource-directory "public"))
+                 (routing/not-found "nope"))]
+    (with-test-server routes
+      (fn []
+        (let [[status body] (get-status+body (str "http://127.0.0.1:" *port* "/assets/css/app.css"))]
+          (is (= 200 status) "nested path resolved inside the resource directory")
+          (is (str/includes? body "rebeccapurple")))
+        (let [[status _] (get-status+body (str "http://127.0.0.1:" *port* "/assets/missing.css"))]
+          (is (= 404 status)))))))
+
+(deftest from-directory-serves-filesystem-files
+  (let [dir (java.io.File. "target/n15-static")
+        _ (.mkdirs dir)
+        _ (spit (java.io.File. dir "note.txt") "from the filesystem")
+        routes (routing/routes
+                 (routing/path-prefix "files" (routing/from-directory (.getPath dir)))
+                 (routing/path "one" (routing/from-file (str (.getPath dir) "/note.txt")))
+                 (routing/not-found "nope"))]
+    (with-test-server routes
+      (fn []
+        (is (= [200 "from the filesystem"]
+               (get-status+body (str "http://127.0.0.1:" *port* "/files/note.txt"))))
+        (is (= [200 "from the filesystem"]
+               (get-status+body (str "http://127.0.0.1:" *port* "/one"))))
+        (is (= 404 (first (get-status+body (str "http://127.0.0.1:" *port* "/files/absent.txt")))))))))
+
+;; ---------------------------------------------------------------------------
+;; N15: authentication
+;; ---------------------------------------------------------------------------
+
+(def ^:private test-users {"ada" "lovelace" "alan" "turing"})
+
+(defn- basic-header [user pass]
+  {"Authorization"
+   (str "Basic " (.encodeToString (java.util.Base64/getEncoder)
+                                  (.getBytes (str user ":" pass) "UTF-8")))})
+
+(deftest basic-auth-accepts-rejects-and-challenges
+  (let [routes (routing/path "secret"
+                 (routing/basic-auth
+                  "test realm"
+                  (fn [user verify]
+                    (when-let [secret (get test-users user)]
+                      (when (verify secret) {:user user})))
+                  (fn [principal]
+                    (routing/complete (str "welcome " (:user principal))))))]
+    (with-test-server routes
+      (fn []
+        (is (= [200 "welcome ada"]
+               (get-status+body (str "http://127.0.0.1:" *port* "/secret")
+                                {:headers (basic-header "ada" "lovelace")})))
+        (is (= 401 (first (get-status+body (str "http://127.0.0.1:" *port* "/secret")
+                                           {:headers (basic-header "ada" "wrong")})))
+            "wrong password")
+        (is (= 401 (first (get-status+body (str "http://127.0.0.1:" *port* "/secret")
+                                           {:headers (basic-header "nobody" "x")})))
+            "unknown user")
+        ;; no credentials at all -> 401 with the challenge naming the realm
+        (let [response (-> (client/GET *system* (str "http://127.0.0.1:" *port* "/secret"))
+                           (client/await-response 5000))]
+          (is (= 401 (client/response-status response)))
+          (is (str/includes? (str (client/response-headers response)) "test realm")
+              "the realm reaches the WWW-Authenticate challenge"))))))
+
+(deftest bearer-token-extracts-or-passes-nil
+  (let [routes (routing/path "whoami"
+                 (routing/bearer-token
+                  (fn [token]
+                    (routing/complete (str "token=" (pr-str token))))))]
+    (with-test-server routes
+      (fn []
+        (is (= [200 "token=\"abc123\""]
+               (get-status+body (str "http://127.0.0.1:" *port* "/whoami")
+                                {:headers {"Authorization" "Bearer abc123"}})))
+        (is (= [200 "token=\"abc123\""]
+               (get-status+body (str "http://127.0.0.1:" *port* "/whoami")
+                                {:headers {"Authorization" "bearer abc123"}}))
+            "the scheme is matched case-insensitively")
+        (is (= [200 "token=nil"]
+               (get-status+body (str "http://127.0.0.1:" *port* "/whoami")))
+            "absent header")
+        (is (= [200 "token=nil"]
+               (get-status+body (str "http://127.0.0.1:" *port* "/whoami")
+                                {:headers (basic-header "ada" "lovelace")}))
+            "another scheme is not a bearer token")))))
+
+;; ---------------------------------------------------------------------------
+;; N15: the JSON-string marshalling decision
+;; ---------------------------------------------------------------------------
+
+(deftest json-string-bodies-are-encoded-not-passed-through
+  (let [routes (routing/routes
+                 (routing/path "greeting" (routing/complete-json "hello"))
+                 (routing/path "pre-encoded"
+                   (routing/complete-json (marshal/raw-body "{\"a\":1}")))
+                 (routing/not-found "nope"))]
+    (with-test-server routes
+      (fn []
+        ;; The decision: a bare string is a JSON *value*, so it comes back quoted
+        ;; and parses. It used to be emitted verbatim, which is invalid JSON.
+        (let [[status body] (get-status+body (str "http://127.0.0.1:" *port* "/greeting"))]
+          (is (= 200 status))
+          (is (= "\"hello\"" body))
+          (is (= "hello" (marshal/json-> body))))
+        (let [[status body] (get-status+body (str "http://127.0.0.1:" *port* "/pre-encoded"))]
+          (is (= 200 status))
+          (is (= "{\"a\":1}" body) "raw-body is emitted verbatim"))))))

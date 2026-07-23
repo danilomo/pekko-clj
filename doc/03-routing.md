@@ -20,7 +20,16 @@ Both Pool and Group routers can use different strategies to determine which rout
 | `:broadcast` | Sends every message to *all* routees. |
 | `:smallest-mailbox` | Sends the message to the routee with the fewest messages currently in its mailbox. |
 | `:balancing` | All routees share a single mailbox (work-stealing style). |
-| `:consistent-hash` | Distributes messages based on a hash of the message content, ensuring similar messages route to the same worker. |
+
+Consistent hashing isn't a `:strategy` value accepted by `spawn-pool`/`spawn-group` — it needs a hash function, so it has its own functions instead:
+
+```clojure
+(def hashed-pool
+  (routing/spawn-consistent-hash-pool sys worker 5
+    {:hash-fn (fn [msg] (:user-id msg))}))
+```
+
+`spawn-consistent-hash-group` is the group-router equivalent, taking a collection of paths in place of a size.
 
 ## Setting up a Pool Router
 
@@ -53,10 +62,36 @@ You can even create cluster-aware pools that deploy their workers across the dis
 
 ```clojure
 (def cluster-pool
-  (routing/spawn-cluster-pool sys worker 5
+  (routing/spawn-cluster-pool sys worker
     {:strategy :round-robin
-     :max-instances-per-node 2
-     :allow-local-routees true}))
+     :total-instances 10
+     :max-per-node 2
+     :allow-local true}))
+```
+
+## Named Actors and Group Routers
+
+A group router routes to actors at *known paths* — but until an actor has a
+name, its path is only knowable after spawning it (by reading back `.path`).
+`core/spawn` (and `core/spawn-props`) take an optional trailing opts map with
+`:name`, so you can pick the path upfront:
+
+```clojure
+(core/spawn sys worker {:id 1} {:name "w1"})
+(core/spawn sys worker {:id 2} {:name "w2"})
+
+(def group
+  (routing/spawn-group sys ["/user/w1" "/user/w2"] {:strategy :round-robin}))
+```
+
+Every `routing/spawn-*` function also accepts an `ActorRefFactory` (e.g.
+`(core/context)` inside an actor) in place of the `ActorSystem`, so a router
+can be a child of another actor instead of always top-level:
+
+```clojure
+(core/defactor supervisor
+  (init [_]
+    {:pool (routing/spawn-pool (core/context) worker 5)}))
 ```
 
 ### Contrast with Scala (Pekko Typed)
@@ -82,4 +117,4 @@ myPool ! "task-2"
 
 **Key Differences:**
 1. **API Topography**: In `pekko-clj`, routing feels like another mechanism alongside `spawn` (`spawn-pool`), configuring all settings seamlessly via a single map `{:strategy :round-robin}`. In Typed Scala, you mutate a base `Routers.pool` behavior using methods like `.withRoundRobinRouting()`.
-2. **Cluster Ease**: Converting a localized pool to a clustered pool in `pekko-clj` is as simple as switching to `spawn-cluster-pool` and passing mapping options like `:max-instances-per-node`. In Scala Typed, distributing workers requires integrating with the separate `ClusterRouting` extension context.
+2. **Cluster Ease**: Converting a localized pool to a clustered pool in `pekko-clj` is as simple as switching to `spawn-cluster-pool` and passing mapping options like `:max-per-node`. In Scala Typed, distributing workers requires integrating with the separate `ClusterRouting` extension context.

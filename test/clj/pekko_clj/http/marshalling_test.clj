@@ -21,8 +21,14 @@
   ;; out as {:a 1} under an application/json content type.
   (is (= "{\"a\":1}" (marshal/->json {:a 1})))
   (is (= "[1,\"two\"]" (marshal/->json [1 "two"])))
-  ;; An already-encoded string is never double-encoded
-  (is (= "{\"a\":1}" (marshal/->json "{\"a\":1}"))))
+  ;; N15: a bare string is a JSON *value*, so it is encoded like anything else —
+  ;; the old passthrough made `(->json "hello")` emit invalid JSON. A pre-encoded
+  ;; body says so explicitly with raw-body.
+  (is (= "\"hello\"" (marshal/->json "hello")))
+  (is (= "hello" (marshal/json-> (marshal/->json "hello"))) "and it round trips")
+  (is (= "{\"a\":1}" (marshal/->json (marshal/raw-body "{\"a\":1}"))))
+  (is (marshal/raw-body? (marshal/raw-body "x")))
+  (is (not (marshal/raw-body? {:raw "x"})) "an unqualified :raw key is not a marker"))
 
 (deftest json-malformed-throws-test
   (is (thrown? Exception (marshal/json-> "{not json"))))
@@ -34,7 +40,9 @@
 (deftest edn-round-trip-test
   (let [data {:name "ada" :ids [1 2 3] :set #{:x} :ratio 1/3}]
     (is (= data (marshal/edn-> (marshal/->edn data)))))
-  (is (= "{:a 1}" (marshal/->edn "{:a 1}")) "strings pass through"))
+  ;; N15: same rule as JSON — strings are encoded, raw-body opts out.
+  (is (= "\"hi\"" (marshal/->edn "hi")))
+  (is (= "{:a 1}" (marshal/->edn (marshal/raw-body "{:a 1}")))))
 
 (deftest edn-read-is-safe-test
   ;; clojure.edn/read-string does not eval, so reader-eval payloads are rejected
@@ -68,7 +76,7 @@
   (let [e (resp/json {:name "ada"})]
     (is (= "{\"name\":\"ada\"}" (entity-string e)))
     (is (= ContentTypes/APPLICATION_JSON (.getContentType e))))
-  (is (= "{\"raw\":true}" (entity-string (resp/json "{\"raw\":true}")))))
+  (is (= "{\"raw\":true}" (entity-string (resp/json (marshal/raw-body "{\"raw\":true}"))))))
 
 (deftest edn-entity-test
   (let [e (resp/edn {:name "ada" :ids [1 2]})]

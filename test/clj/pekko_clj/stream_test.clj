@@ -255,9 +255,9 @@
     (is (eventually (= [1 2 3] @received)))))
 
 (deftest source-actor-ref-emits-and-completes
-  ;; B7: source-actor-ref returns [source actor-ref] (previously swapped, so the
+  ;; B7: source-actor-ref returns the source and the ref (previously swapped, so
   ;; ActorRef and Source came back in the wrong slots).
-  (let [[src actor-ref] (s/source-actor-ref 16 :fail *mat*)]
+  (let [{src :source actor-ref :actor-ref} (s/source-actor-ref 16 :fail *mat*)]
     (is (instance? org.apache.pekko.actor.ActorRef actor-ref)
         "second element must be the ActorRef")
     (let [result (s/run-to-seq src *mat*)]
@@ -480,6 +480,20 @@
     (is (= 6 (reduce + (clojure.core/map :sum result))))
     (is (= 3 (reduce + (clojure.core/map :count result))))))
 
+(deftest buffer-with-valid-strategy-passes-elements-through
+  (let [result (-> (s/source [1 2 3])
+                   (s/buffer 10 :drop-new)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= [1 2 3] (vec result)))))
+
+(deftest buffer-unknown-strategy-throws
+  (is (thrown? IllegalArgumentException
+        (-> (s/source [1 2 3])
+            (s/buffer 10 :drop-newx)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000)))))
+
 (deftest expand-extrapolates-elements
   ;; expand is used to extrapolate when downstream is slow
   ;; In a fast run, we may not need extrapolation
@@ -530,7 +544,8 @@
     (is (= :async-value result))))
 
 (deftest source-queue-allows-pushing
-  (let [[queue src] (s/source-queue 10 :backpressure *mat*)]
+  (let [{:keys [source queue]} (s/source-queue 10 :backpressure *mat*)
+        src source]
     (.offer queue 1)
     (.offer queue 2)
     (.offer queue 3)
@@ -581,27 +596,29 @@
 ;; Tests: Phase 9 - Utilities
 ;; ---------------------------------------------------------------------------
 
-(deftest distinct-removes-consecutive-duplicates
+(deftest dedupe-removes-consecutive-duplicates
   (let [result (-> (s/source [1 1 2 2 2 3 1 1])
-                   (s/distinct)
+                   (s/dedupe)
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= [1 2 3 1] (vec result)))))
 
-(deftest distinct-by-key
+(deftest dedupe-by-key
   (let [result (-> (s/source [{:id 1 :v "a"} {:id 1 :v "b"} {:id 2 :v "c"}])
-                   (s/distinct-by :id)
+                   (s/dedupe-by :id)
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= [{:id 1 :v "a"} {:id 2 :v "c"}] (vec result)))))
 
 (deftest zip-with-index-pairs
+  ;; N13: emits Clojure [element index] vectors, not japi.Pair — no interop needed
+  ;; downstream.
   (let [result (-> (s/source [:a :b :c])
                    (s/zip-with-index)
-                   (s/smap (fn [pair] [(.first pair) (.second pair)]))
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
-    (is (= [[:a 0] [:b 1] [:c 2]] (vec result)))))
+    (is (= [[:a 0] [:b 1] [:c 2]] (vec result)))
+    (is (vector? (first result)))))
 
 (deftest stateful-map-maintains-state
   (let [result (-> (s/source [1 2 3 4 5])
@@ -995,9 +1012,9 @@
 
 (deftest source-actor-ref-completes-with-custom-message
   ;; The 4-arity matcher-based Source/actorRef overload.
-  (let [[src ref] (s/source-actor-ref 16 :fail
-                                      {:complete-with #(when (= :finished %) :draining)}
-                                      *mat*)
+  (let [{src :source ref :actor-ref} (s/source-actor-ref 16 :fail
+                                                         {:complete-with #(when (= :finished %) :draining)}
+                                                         *mat*)
         result (s/run-to-seq src *mat*)]
     (core/! ref 1)
     (core/! ref 2)
@@ -1006,16 +1023,16 @@
         ":draining emits buffered elements before completing")))
 
 (deftest source-actor-ref-fails-with-custom-message
-  (let [[src ref] (s/source-actor-ref 16 :fail
-                                      {:fail-with #(when (= :boom %) (RuntimeException. "kaboom"))}
-                                      *mat*)
+  (let [{src :source ref :actor-ref} (s/source-actor-ref 16 :fail
+                                                         {:fail-with #(when (= :boom %) (RuntimeException. "kaboom"))}
+                                                         *mat*)
         result (s/run-to-seq src *mat*)]
     (core/! ref :boom)
     (is (thrown-with-msg? RuntimeException #"kaboom" (s/await-completion result 5000)))))
 
 (deftest source-actor-ref-3-arity-still-uses-status-success
   ;; Regression: the opts arity must not change the existing default behaviour.
-  (let [[src ref] (s/source-actor-ref 16 :fail *mat*)
+  (let [{src :source ref :actor-ref} (s/source-actor-ref 16 :fail *mat*)
         result (s/run-to-seq src *mat*)]
     (core/! ref 1)
     (core/! ref (org.apache.pekko.actor.Status$Success. "done"))
@@ -1037,3 +1054,201 @@
                 *mat*)
     (is (eventually (= [1 2 3 :done] @n1-acked))
         "elements are acked one at a time, then the completion message arrives")))
+
+;; ---------------------------------------------------------------------------
+;; N13: consistency fixes
+;; ---------------------------------------------------------------------------
+
+(deftest system-materializer-is-shared-per-system
+  (is (identical? (s/system-materializer *system*) (s/system-materializer *system*))
+      "one materializer per system, not a fresh one per call")
+  (is (not (identical? (s/materializer *system*) (s/materializer *system*)))
+      "`materializer` still hands out a new one each call"))
+
+(deftest run-fns-accept-an-actor-system
+  ;; Every run-* takes an ActorSystem where a Materializer is expected.
+  (is (= [2 3] (vec (-> (s/source [1 2]) (s/smap inc) (s/run-to-seq *system*)
+                        (s/await-completion 3000)))))
+  (is (= 1 (-> (s/source [1 2]) (s/run-head *system*) (s/await-completion 3000))))
+  (is (= 3 (-> (s/source [1 2]) (s/run-fold 0 + *system*) (s/await-completion 3000))))
+  (is (= [1 2] (vec (s/await-completion
+                     (s/run-mat (s/source [1 2]) (s/sink-seq) :right *system*) 3000))))
+  (let [{:keys [queue done]} (s/run-source-queue 4 :backpressure (s/sink-seq) *system*)]
+    (.offer queue 7)
+    (.complete queue)
+    (is (= [7] (vec (s/await-completion done 3000))))))
+
+(deftest merge-substreams-works-through-a-flow
+  ;; group-by on a *Flow* yields a SubFlow, not a SubSource. Hinting only
+  ;; SubSource made this a ClassCastException.
+  (let [flow (-> (s/flow)
+                 (s/group-by 4 #(mod % 2))
+                 (s/smap #(* 10 %))
+                 (s/merge-substreams))
+        result (-> (s/source [1 2 3 4])
+                   (s/via flow)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= #{10 20 30 40} (set result))))
+  ;; and the Source path still works
+  (let [result (-> (s/source [1 2 3 4])
+                   (s/group-by 4 #(mod % 2))
+                   (s/smap #(* 10 %))
+                   (s/merge-substreams)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= #{10 20 30 40} (set result)))))
+
+(deftest concat-substreams-works-through-a-flow
+  (let [flow (-> (s/flow)
+                 (s/group-by 4 #(mod % 2))
+                 (s/merge-substreams))]
+    (is (some? flow)))
+  (is (thrown-with-msg? IllegalArgumentException #"SubSource/SubFlow"
+        (s/merge-substreams (s/source [1]))))
+  (is (thrown-with-msg? IllegalArgumentException #"SubSource/SubFlow"
+        (s/concat-substreams (s/source [1])))))
+
+(deftest source-queue-and-actor-ref-share-a-map-shape
+  (let [{:keys [source queue]} (s/source-queue 4 :backpressure *mat*)]
+    (is (instance? SourceQueueWithComplete queue))
+    (let [done (s/run-to-seq source *mat*)]
+      (.offer queue 1)
+      (.complete queue)
+      (is (= [1] (vec (s/await-completion done 3000))))))
+  (let [{:keys [source actor-ref]} (s/source-actor-ref 4 :fail *mat*)]
+    (is (some? source))
+    (is (some? actor-ref))))
+
+(deftest dedupe-drops-consecutive-duplicates
+  (is (= [1 2 1 3] (vec (-> (s/source [1 1 2 2 2 1 3 3])
+                            (s/dedupe)
+                            (s/run-to-seq *mat*)
+                            (s/await-completion 3000))))
+      "consecutive only — the second 1 survives, unlike clojure.core/distinct")
+  (is (= [{:id 1} {:id 2}] (vec (-> (s/source [{:id 1} {:id 1} {:id 2}])
+                                    (s/dedupe-by :id)
+                                    (s/run-to-seq *mat*)
+                                    (s/await-completion 3000)))))
+  ;; deprecated aliases still work
+  #_{:clj-kondo/ignore [:deprecated-var]}
+  (is (= [1 2] (vec (-> (s/source [1 1 2]) (s/distinct) (s/run-to-seq *mat*)
+                        (s/await-completion 3000)))))
+  #_{:clj-kondo/ignore [:deprecated-var]}
+  (is (:deprecated (meta #'s/distinct)))
+  #_{:clj-kondo/ignore [:deprecated-var]}
+  (is (:deprecated (meta #'s/distinct-by))))
+
+;; ---------------------------------------------------------------------------
+;; N13: new operators
+;; ---------------------------------------------------------------------------
+
+(deftest skeep-maps-and-drops-nils
+  (is (= [20 40] (vec (-> (s/source [1 2 3 4])
+                          (s/skeep #(when (even? %) (* 10 %)))
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest zip-and-zip-all
+  (is (= [[1 :a] [2 :b]] (vec (-> (s/source [1 2 3])
+                                  (s/zip (s/source [:a :b]))
+                                  (s/run-to-seq *mat*)
+                                  (s/await-completion 3000))))
+      "zip stops at the shorter side and emits Clojure vectors")
+  (is (= [[1 :a] [2 :b] [3 :pad]]
+         (vec (-> (s/source [1 2 3])
+                  (s/zip-all (s/source [:a :b]) 0 :pad)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))
+      "zip-all pads the shorter side"))
+
+(deftest interleave-alternates
+  (is (= [1 :a 2 :b 3 :c] (vec (-> (s/source [1 2 3])
+                                   (s/interleave (s/source [:a :b :c]))
+                                   (s/run-to-seq *mat*)
+                                   (s/await-completion 3000)))))
+  (is (= [1 2 :a :b 3 :c] (vec (-> (s/source [1 2 3])
+                                   (s/interleave (s/source [:a :b :c]) 2)
+                                   (s/run-to-seq *mat*)
+                                   (s/await-completion 3000))))))
+
+(deftest prepend-and-or-else
+  (is (= [:a :b 1 2] (vec (-> (s/source [1 2])
+                              (s/prepend (s/source [:a :b]))
+                              (s/run-to-seq *mat*)
+                              (s/await-completion 3000)))))
+  (is (= [:fallback] (vec (-> (s/source-empty)
+                              (s/or-else (s/source [:fallback]))
+                              (s/run-to-seq *mat*)
+                              (s/await-completion 3000))))
+      "or-else kicks in only when nothing was emitted")
+  (is (= [1] (vec (-> (s/source [1])
+                      (s/or-else (s/source [:fallback]))
+                      (s/run-to-seq *mat*)
+                      (s/await-completion 3000))))))
+
+(deftest divert-to-removes-matching-elements
+  (let [diverted (atom [])
+        result (-> (s/source [1 2 3 4 5])
+                   (s/divert-to (s/sink-foreach #(swap! diverted conj %)) even?)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= [1 3 5] (vec result)) "the even elements left the main flow")
+    (is (eventually (= [2 4] @diverted)))))
+
+(deftest limit-fails-past-the-bound
+  (is (= [1 2] (vec (-> (s/source [1 2])
+                        (s/limit 5)
+                        (s/run-to-seq *mat*)
+                        (s/await-completion 3000)))))
+  (is (thrown? Exception
+        (-> (s/source (range 10))
+            (s/limit 3)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000)))
+      "unlike take, going over the bound is an error"))
+
+(deftest option-sinks-are-empty-safe
+  (is (= (java.util.Optional/empty)
+         (-> (s/source-empty) (s/run-with (s/sink-head-option) *mat*)
+             (s/await-completion 3000))))
+  (is (= (java.util.Optional/of 1)
+         (-> (s/source [1 2]) (s/run-with (s/sink-head-option) *mat*)
+             (s/await-completion 3000))))
+  (is (= (java.util.Optional/empty)
+         (-> (s/source-empty) (s/run-with (s/sink-last-option) *mat*)
+             (s/await-completion 3000))))
+  (is (= (java.util.Optional/of 2)
+         (-> (s/source [1 2]) (s/run-with (s/sink-last-option) *mat*)
+             (s/await-completion 3000))))
+  ;; sink-head on an empty stream fails instead
+  (is (thrown? Exception
+        (-> (s/source-empty) (s/run-with (s/sink-head) *mat*)
+            (s/await-completion 3000)))))
+
+(deftest sink-take-last-keeps-the-tail
+  (is (= [3 4 5] (vec (-> (s/source [1 2 3 4 5])
+                          (s/run-with (s/sink-take-last 3) *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest source-never-never-completes
+  (let [{:keys [kill-switch done]} (s/run-with-kill-switch
+                                    (s/source-never) (s/sink-seq) *mat*)]
+    (is (nil? (s/await-completion done 300)) "still running")
+    (s/shutdown kill-switch)
+    (is (= [] (vec (s/await-completion done 3000))))))
+
+(deftest source-unfold-async-emits
+  (is (= [0 1 2] (vec (-> (s/source-unfold-async
+                           0 (fn [n] (CompletableFuture/completedFuture
+                                      (when (< n 3) [(inc n) n]))))
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest source-lazily-defers-creation
+  ;; N13 moved this onto Source.lazySource (Source.lazily is deprecated in 1.6).
+  (let [created (atom 0)
+        src (s/source-lazily (fn [] (swap! created inc) (s/source [1 2])))]
+    (is (= 0 @created) "nothing ran at construction time")
+    (is (= [1 2] (vec (s/await-completion (s/run-to-seq src *mat*) 3000))))
+    (is (= 1 @created))))

@@ -125,7 +125,7 @@ val system = ActorSystem(Counter(10), "my-system")
 
 1. **Tell (`!`)**: Fire and forget.
 2. **Blocking Ask (`<!`)**: Wait for a reply and return the value directly.
-3. **Future Ask (`<?>`)**: Send a message and return a Scala `Future`.
+3. **Future Ask (`<?>`)**: Send a message and return a `CompletableFuture`.
 
 ### Tell (Fire-and-forget)
 
@@ -150,7 +150,7 @@ Blocks the current thread until the actor replies or the timeout expires.
 
 ### Future Ask
 
-If you prefer non-blocking concurrency outside of handlers, `<?>` returns a native Scala `Future` that you can map or await using interop tools like `Await/result`.
+If you prefer non-blocking concurrency outside of handlers, `<?>` returns a `java.util.concurrent.CompletableFuture` (a `CompletionStage`) that you can compose with `.thenApply`/`.thenCompose`, deref with `@`, or block on with `<!`.
 
 ```clojure
 (def future-reply (<?> my-counter :get))

@@ -46,20 +46,20 @@ commit `7e59e55`.
 | B16 | Preserve the stash across restarts | Bugs | DONE | — | medium |
 | B17 | Singleton `termination-message` default is a silent no-op | Bugs | DONE | — | low |
 | B18 | `spawn-pool-with-resizer` `:pressure-threshold` mismatch | Bugs | DONE | — | trivial |
-| H7 | Throw on unknown keywords (kill the silent fallbacks) | Hardening | TODO | — | low |
-| H8 | Macro clause validation (`defactor`/`defactor-persistent`) | Hardening | TODO | — | low |
-| H9 | Named actors (`spawn` name support) + router factories | Hardening | TODO | — | low |
-| H10 | Packaging: LevelDB out of main deps, drop `:main` | Hardening | TODO | — | low |
-| H11 | `doc/` guide reconciliation + naming polish | Hardening | TODO | B11 | trivial |
-| H12 | Subscriber lifecycle + odds-and-ends cleanups | Hardening | TODO | — | low |
-| N10 | Persistent sharded entities (CQRS aggregates) | New | TODO | B14 | high |
-| N11 | Persistence depth: `persist-async`, `defer`, plugins, recovery, lifecycle | New | TODO | B12, B15 | medium |
+| H7 | Throw on unknown keywords (kill the silent fallbacks) | Hardening | DONE | — | low |
+| H8 | Macro clause validation (`defactor`/`defactor-persistent`) | Hardening | DONE | — | low |
+| H9 | Named actors (`spawn` name support) + router factories | Hardening | DONE | — | low |
+| H10 | Packaging: LevelDB out of main deps, drop `:main` | Hardening | DONE | — | low |
+| H11 | `doc/` guide reconciliation + naming polish | Hardening | DONE | B11 | trivial |
+| H12 | Subscriber lifecycle + odds-and-ends cleanups | Hardening | DONE | — | low |
+| N10 | Persistent sharded entities (CQRS aggregates) | New | DONE | B14 | high |
+| N11 | Persistence depth: `persist-async`, `defer`, plugins, recovery, lifecycle | New | DONE | B12, B15 | medium |
 | N12 | At-least-once delivery | New | TODO | N11 | medium |
-| N13 | Streams consistency fixes + missing operators | New | TODO | — | medium |
+| N13 | Streams consistency fixes + missing operators | New | DONE | — | medium |
 | N14 | Streams FileIO + StreamConverters | New | TODO | N13 | low |
-| N15 | HTTP routing completion: segment capture, static content, auth | New | TODO | B11 | medium |
+| N15 | HTTP routing completion: segment capture, static content, auth | New | DONE | B11 | medium |
 | N16 | HTTPS + compression + request timeouts | New | TODO | N15 | medium |
-| N17 | Transit record support | New | TODO | — | low |
+| N17 | Transit record support | New | DONE | — | low |
 | N18 | Router parity leftovers | New | TODO | H7 | low |
 | N19 | Small parity odds and ends | New | TODO | — | low |
 
@@ -325,9 +325,43 @@ input is a non-negative integer (throw otherwise, catching the `0.8` case).
 
 ---
 
-## Milestone H — Hardening / DX
+## Milestone H — Hardening / DX — **complete** (all six `DONE`, 2026-07-22)
 
-### H7 · Throw on unknown keywords — `TODO`
+### H7 · Throw on unknown keywords — `DONE`
+**Note (2026-07-22):** fixed all four sites as scoped. `strategy->pool`/
+`strategy->group` (`routing.clj`) now `case`-match `(nil :round-robin)` to the
+round-robin default and throw `IllegalArgumentException` naming the valid
+options for anything else — nil still means "default" exactly as it did
+before, since `spawn-pool`/`spawn-group`'s `:or` only fills in the default when
+the `:strategy` key is *absent*, not when it's explicitly `nil`. Also rewrote
+the ns docstring's strategy table: `:consistent-hash` is gone from it (it was
+never accepted by `strategy->pool`/`-group` — falls to round-robin, the exact
+bug this story fixes) and a note now points at the dedicated
+`spawn-consistent-hash-pool`/`-group` functions that actually implement it
+(mirrors the same fix already made in `doc/03-routing.md` for H11).
+`->overflow-strategy` (`stream.clj`) keeps `nil → default` as an explicit case
+clause and throws on anything else. `wrap-with-supervision`
+(`singleton.clj`) throws on an unrecognized `:strategy` once a `:supervision`
+map is supplied at all (the outer nil/false-means-no-supervision check is
+unchanged — that's a different semantic layer than the bug here).
+`CljSupervisorStrategy.toDirective` (Java) now throws `IllegalArgumentException`
+instead of silently escalating on a decider return that isn't one of the four
+known keywords; made `public` (from `private`) purely so it's unit-testable
+directly — it's still only called internally by `oneForOne`/`allForOne`.
+Tests: `pool-unknown-strategy-throws`, `group-unknown-strategy-throws`
+(`routing_test.clj`); `buffer-unknown-strategy-throws` plus a
+`buffer-with-valid-strategy-passes-elements-through` green-path regression
+since `buffer` had no test coverage at all before this (`stream_test.clj`);
+`singleton-unknown-supervision-strategy-throws` (`singleton_test.clj` — a plain
+non-cluster system suffices since `wrap-with-supervision` runs before any
+cluster extension is touched); `to-directive-unknown-result-throws`
+(`supervision_test.clj`, direct-calls the now-public method to avoid a flaky
+actor-crash integration test). All new throw tests verified failing (silent
+fallback / no exception) before their fix. Existing valid-keyword tests across
+all four sites stay green. `docs/specs/routing-parity-spec.md` already
+documents consistent-hash correctly as its own function, not a `:strategy`
+value — nothing to tick there. `lein test` (500 tests), `lein lint`, `lein
+check` (no reflection warnings) all clean.
 **Deps:** none.
 Epic-1 modules (ddata, streams `keep-mat`, coordination) throw on unknown keywords;
 the older modules silently fall back, which hides typos:
@@ -345,7 +379,39 @@ docstring's strategy list while there.
 **Tests:** one unknown-keyword throw test per site; existing valid-keyword tests stay
 green.
 
-### H8 · Macro clause validation — `TODO`
+### H8 · Macro clause validation — `DONE`
+**Note (2026-07-22):** fixed all three cases as scoped, in both macros.
+`defactor` (`core.clj`): new `validate-actor-clauses` runs before
+`parse-actor-clauses` and throws on (a) any clause whose head isn't one of
+`init`/`handle`/`on-stop`/`on-restart`/`supervision`/`on-error`, and (b) more
+than one of the five singleton clauses (`handle` is the only one allowed to
+repeat — group-by was silently keeping the *first* on a duplicate, discarding
+the rest). Also added the `on-error` binding-vector-length guard next to the
+existing reserved-anaphor checks: `(on-error [ex] ...)` now throws naming the
+problem instead of splicing `nil` into a `let` binding position and surfacing
+a confusing downstream compiler error.
+`defactor-persistent` (`persistence.clj`): same idea via a new
+`validate-persistent-clauses`, adapted to this macro's flatter grammar — it
+walks the clause seq treating `:persistence-id` as a bare keyword/value pair
+(not a list clause) so it isn't misidentified as an unknown clause, and
+enforces at most one each of `init`/`tagger`/`snapshot-every`/
+`on-recovery-complete`/`:persistence-id` (`command`/`event` repeat freely;
+`delete-events-on-snapshot` is a boolean flag where duplicates are harmless, so
+neither is in the singleton set — matches the tracker's list exactly, which
+didn't include them either).
+No clause heads were added or renamed, so the clj-kondo hooks
+(`resources/clj-kondo.exports/.../hooks/pekko_clj/defactor.clj`) and the
+cljfmt `:extra-indents` need no changes.
+Tests (mirroring the existing H6 reserved-anaphor guard tests' macroexpand-1 +
+unwrap-CompilerException pattern): `defactor-rejects-unknown-clause-head`,
+`defactor-rejects-duplicate-init-clause`,
+`defactor-rejects-on-error-with-wrong-binding-arity` (`defactor_test.clj`);
+`defactor-persistent-rejects-unknown-clause-head`,
+`defactor-persistent-rejects-duplicate-tagger-clause`,
+`defactor-persistent-rejects-duplicate-persistence-id`
+(`persistence_test.clj`). All six verified failing (silently accepted instead
+of throwing) before their fix. `lein test` (506 tests), `lein lint`, `lein
+check` (no reflection warnings) all clean.
 **Deps:** none.
 `parse-actor-clauses` uses `group-by first` (`core.clj:245-252`): an unknown clause —
 a typo like `(on-stap …)` or `(handel …)` — is **silently discarded**, as is a second
@@ -361,7 +427,47 @@ reserved-anaphor guards. The kondo hook already lints unknown heads as plain cod
 no hook change needed unless clause sets change.
 **Tests:** expansion-throw tests per case (mirror the H6 guard tests).
 
-### H9 · Named actors + router factories — `TODO`
+### H9 · Named actors + router factories — `DONE`
+**Note (2026-07-22):** fixed both parts as scoped, went with the opts-map
+option over a parallel `spawn-named` (keeps `spawn`'s existing polymorphic
+shape rather than adding a whole second entry point — `persistence/spawn-named`
+stays as-is since that macro's `spawn` isn't polymorphic the same way).
+`core/spawn` gets a new trailing-opts arity for both the context and
+top-level forms (`(spawn actor-def args opts)` / `(spawn system actor-def args
+opts)`) supporting `{:name "child-name"}`; the existing 3-arg arity now
+internally dispatches on `(instance? ActorSystem first-arg)` the same way the
+2-arg arity already did, so `(spawn actor-def args opts)` and `(spawn system
+actor-def args)` share one arity without ambiguity. `core/spawn-props` gets a
+matching 3-arg form. Both funnel through a new private `actor-of` helper that
+picks the `(Props)` or `(Props, String)` `.actorOf` overload.
+`routing.clj`: every `spawn-*` function (`spawn-pool`, `spawn-group`,
+`spawn-consistent-hash-pool`/`-group`, `spawn-scatter-gather-pool`,
+`spawn-tail-chopping-pool`, `spawn-pool-with-resizer`, `spawn-cluster-pool`,
+`spawn-cluster-group`) now takes an optional `:name` in its opts map and its
+`system` parameter is hinted `^ActorRefFactory` instead of `^ActorSystem` —
+that's not just a docs-only relaxation: the old hint meant passing an
+`ActorContext` (i.e. `(core/context)`, to make a router a child of another
+actor) would `ClassCastException` at the `.actorOf` call site, since Clojure
+compiles a type-hinted interop call against the hinted class. Added a private
+`actor-of` helper mirroring core's. `ActorSystem` import dropped from
+`routing.clj` (no longer referenced anywhere after the hint changes — `lein
+check` would have flagged it unused).
+Tests: `spawn-with-name-resolves-via-actor-selection`,
+`spawn-with-name-inside-context-resolves-as-child`,
+`spawn-props-with-name-resolves-via-actor-selection` (`core_test.clj`);
+`named-workers-enable-known-group-paths` (spawns two named workers, then
+builds the group router from literal `"/user/..."` strings the way
+`spawn-group`'s own docstring always showed — that pattern was unreachable
+before this story) and `spawn-pool-as-child-of-actor-context` (spawns a pool
+via `(core/context)` from inside a running actor) in `routing_test.clj`. All
+new/changed-signature tests confirmed passing against the existing (unchanged)
+test suite too — no regressions across `routing-test`/`core-test`/`actor-test`/
+`defactor-test`. Docs: `doc/03-routing.md` gained a "Named Actors and Group
+Routers" section with both examples; `README.md`'s spawn snippet shows the
+named form. No `docs/specs/*` checklist covers this (checked
+`routing-parity-spec.md` — no name/child-router rows exist to tick).
+`lein test` (511 tests), `lein lint`, `lein check` (no reflection warnings)
+all clean.
 **Deps:** none.
 There is **no way to choose an actor's name** through the core API — `spawn`
 (`core.clj:82-102`), `spawn-props`, and `new-actor` all call the name-less
@@ -376,7 +482,29 @@ can be children.
 **Tests:** named spawn resolves via `actor-selection "/user/<name>"`; a group router
 built from two named workers actually routes.
 
-### H10 · Packaging: LevelDB out of main deps, drop `:main` — `TODO`
+### H10 · Packaging: LevelDB out of main deps, drop `:main` — `DONE`
+**Note (2026-07-22):** fixed as scoped. `[org.iq80.leveldb/leveldb "0.12"]`
+moved from the main `:dependencies` to the `:dev` and `:test` profiles
+(both, since `lein test`/`lein check`/`lein repl` merge different default
+profile sets); `:main ^:skip-aot pekko-clj.core` dropped outright — `core.clj`
+never defined a `-main`, so it was a no-op entry point on a library besides
+the misleading manifest metadata. Compile-safety confirmed exactly as the
+story predicted: `persistence/query.clj` only imports
+`org.apache.pekko.persistence.query.journal.leveldb.javadsl.LeveldbReadJournal`
+(from `pekko-persistence-query`, already a main dependency), never
+`org.iq80.leveldb` directly.
+**Verified via the built artifact**, not just inspection: `lein jar`'s
+embedded `META-INF/maven/pekko-clj/pekko-clj/pom.xml` now lists the leveldb
+dependency with `<scope>test</scope>` (confirms downstream consumers of the
+jar won't pull it transitively), and the manifest's `Main-Class` fell back to
+Leiningen's own default (`clojure.main`) instead of naming `pekko-clj.core`.
+`lein test` (511 tests, unchanged — persistence tests run fine since `:dev`/
+`:test` still carry LevelDB) stayed green throughout.
+README gained a paragraph after the persistence section: LevelDB is
+test-only/wired up in `test/resources/persistence-test.conf`, and production
+users configure their own Pekko Persistence plugin (jdbc/r2dbc/cassandra).
+No `docs/specs/*` checklist covers packaging. `lein lint`, `lein check` (no
+reflection warnings) both clean.
 **Deps:** none.
 `[org.iq80.leveldb/leveldb "0.12"]` sits in the main `:dependencies` with the comment
 "for persistence tests" (`project.clj:29-30`) — every downstream consumer inherits a
@@ -388,7 +516,53 @@ Also drop `:main ^:skip-aot pekko-clj.core` (`project.clj:31`) — this is a lib
 green (tests run under the profiles that now carry LevelDB); README note that users
 supply their own journal plugin in production.
 
-### H11 · `doc/` guide reconciliation + naming polish — `TODO`
+### H11 · `doc/` guide reconciliation + naming polish — `DONE`
+**Note (2026-07-22):** swept all seven `doc/` guides plus `README.md` against the
+current API. Fixed: `doc/intro.md` and `doc/01-actors.md` described `<?>` as
+returning "a native Scala `Future`" (B2 made it a `CompletableFuture`/
+`CompletionStage`) — same stale line found and fixed in `README.md`, which the
+tracker didn't call out but has the identical bug. `doc/04-cluster.md`'s
+sharding example still showed the pre-B14/B8 `[:entity-message id msg]`
+envelope pattern in the handler and in "Key Differences" #2; rewritten to match
+the real API — the actor matches the raw unwrapped message and reads
+`(sharding/entity-id)`. `doc/06-http.md` was already current (fixed as part of
+B11's own note) and `doc/05-streams.md:56`'s `scala.concurrent.Future` import
+turned out to be correct, legitimate Scala-contrast code, not drift — verified
+against git history (file untouched since creation) and left as-is.
+Found one more doc bug while sweeping not named in the tracker:
+`doc/03-routing.md`'s `spawn-cluster-pool` example called it with a stray
+positional size arg and options (`:max-instances-per-node`,
+`:allow-local-routees`) that don't exist on the real 3-arg signature
+(`:total-instances`/`:max-per-node`/`:allow-local`) — copy-pasting it would
+throw. Also clarified `:consistent-hash`, listed in the strategy table as if
+`{:strategy :consistent-hash}` worked with `spawn-pool`/`spawn-group` — it
+doesn't (falls back to round-robin, the exact silent-fallback H7 will fix); the
+table now points at the dedicated `spawn-consistent-hash-pool`/`-group`
+functions that actually implement it.
+Naming polish, all three items from the tracker: `member->map` now also
+returns `:up-number` (kebab-case) alongside the retained `:upNumber` (back-compat,
+cheap to keep); `event->map`'s `:previous-status` on `:member-removed` is now
+lower-cased to match `:status`'s convention (was e.g. `:Removed` vs `:removed`);
+`request-query-params`/`request-headers` docstrings corrected from "first value"
+to "last value" (`into {}` on the pair sequence keeps the last, not the first —
+chose the docstring fix over switching to `.toMultiMap` since the tracker
+offered both and the doc was simply wrong).
+Tests: `pekko-clj.cluster-test/members-by-age-test` extended to assert
+`:up-number` is present and matches `:upNumber`;
+`member-removed-event-previous-status-is-lower-cased` (new) drives the private
+`event->map` directly with a real `Member` forced into `Removed` status via
+`Member$.MODULE$.removed(uniqueAddress)` — avoids needing an actual multi-node
+removal — and asserts `:previous-status` is `:up`, not `:Up`.
+`pekko-clj.http.core-test/request-query-params-multi-valued-test` and
+`request-headers-multi-valued-test` (new) pin the "last value wins" contract
+directly (the header test needed `withHeaders` with an explicit list rather
+than chained `.addHeader` calls, since `addHeader` prepends — verified by a
+failing first draft). All four new/extended tests fail without their
+corresponding fix. `lein test` (494 tests, targeted + full), `lein lint`, and
+`lein check` (no reflection warnings) all clean. No `docs/specs/*` checklist
+covers these doc guides or the naming polish (`cluster-parity-spec.md`'s
+`upNumber` mentions are prose about the underlying Pekko field, not our map
+keys — nothing to tick).
 **Deps:** B11 (write the corrected HTTP examples once they actually work).
 Epic 1 reconciled `README.md`/`CLAUDE.md`/`docs/specs` but never touched the `doc/`
 guides, which still teach pre-epic APIs:
@@ -408,7 +582,63 @@ Naming polish while in doc-land (tiny code fixes, keep back-compat where cheap):
   first value" but `into {}` keeps the **last** (`http/core.clj:114-122`) — fix the
   doc (or switch to `.toMultiMap`, then document that).
 
-### H12 · Subscriber lifecycle + odds-and-ends cleanups — `TODO`
+### H12 · Subscriber lifecycle + odds-and-ends cleanups — `DONE`
+**Note (2026-07-22):** fixed all four items as scoped.
+**Fn-subscriber leak:** `event-stream`, `cluster.pubsub`, and `cluster.ddata`
+each get the same small pattern (duplicated per-namespace, matching this
+codebase's existing style of small private per-ns helpers like `make-props`
+rather than a new shared utility ns): a `(defonce internal-subscribers (atom
+#{}))` registry, populated only when `subscribe` spawns its own handler actor
+(never for a caller-supplied ActorRef), and a private `stop-if-internal!` that
+`unsubscribe` now calls alongside its existing deregistration — poison-pilling
+the actor if (and only if) it's in the registry, then forgetting it. A
+caller-supplied ActorRef is never touched, since the caller owns its lifecycle.
+`cluster.ddata/subscribe`'s docstring used to candidly admit the gap ("pass it
+to unsubscribe (and stop it when it is one this function spawned)") — that
+manual burden is gone now.
+**Cluster subscribe initial state:** chose `initialStateAsEvents` over mapping
+`CurrentClusterState` to a new `:current-state` type — it reuses every
+existing per-event-type branch in `event->map` (a synthetic `:member-up` per
+already-Up member, etc.) instead of introducing a second, differently-shaped
+snapshot representation. `subscribe` gained an opts-map arity with `:events`
+(`:all` default, `:member-events`, `:reachability-events` — narrows to
+Pekko's `MemberEvent`/`ReachabilityEvent` marker interfaces instead of always
+subscribing to the blanket `ClusterDomainEvent`); an unrecognized `:events`
+value throws `IllegalArgumentException` (new capability, so no prior
+silent-fallback to fix — just built correctly from the start, consistent with
+H7). Note: subscribing to an already-Up cluster still surfaces the
+event-class gap the initial-state fix doesn't touch — `SeenChanged` (and a
+few other `ClusterDomainEvent` subtypes `event->map` never mapped) render as
+`{:type :unknown}` when they occur as *live* events, same as always; that's
+unrelated pre-existing incompleteness, not this story's target (only the
+snapshot-object case was in scope).
+**Leftover `set! *warn-on-reflection*`:** deleted all six pairs (`core.clj`,
+`cluster/daemon.clj`, `cluster/ddata.clj`, `serialization.clj`,
+`http/marshalling.clj`) — `:global-vars` in `project.clj` already controls the
+flag for the whole `src/` compile; per-ns `set!` was leftover from before that
+change and did nothing but risk exactly the "leaks into whatever compiles next"
+bug the `:global-vars` switch was made to avoid.
+**`ask-blocking`:** added a `(catch CancellationException _ nil)` clause
+alongside the existing `TimeoutException`/`AskTimeoutException` handling — a
+cancelled future has no reply to return either way, so it's nil like a timeout
+rather than an uncaught `CancellationException` escaping `<!`.
+Tests: `unsubscribe-stops-internally-spawned-subscriber-test` +
+`unsubscribe-does-not-stop-a-caller-supplied-ref-test` in all three of
+`event_stream_test.clj`, `cluster/pubsub_test.clj`, `cluster/ddata_test.clj`
+(new `test-support/stopped-within?` helper: a throwaway DeathWatch actor,
+reusable wherever a test needs to confirm an actor actually stopped rather
+than just being unreachable); `cluster-subscribe-initial-state-is-synthesized-
+as-events`, `cluster-subscribe-member-events-filter`,
+`cluster-subscribe-unknown-events-filter-throws` in `cluster_test.clj`;
+`blocking-ask-cancelled-future-returns-nil` in `core_test.clj` (uses
+`with-redefs` on the public `core/<?>` to hand `ask-blocking` an
+already-cancelled `CompletableFuture`, since the real future it blocks on
+isn't otherwise externally reachable to cancel). All new tests verified
+failing without their corresponding fix. No test needed for the `set!`
+deletions — `lein check`'s reflection-warning grep is the regression guard.
+`lein test` (521 tests), `lein lint`, `lein check` (no reflection warnings)
+all clean. No `docs/specs/*` checklist changes — `cluster-parity-spec.md`'s
+subscribe/unsubscribe rows were already ✅ and stay that way.
 **Deps:** none.
 - **Fn-subscriber leak:** `pubsub/subscribe`, `ddata/subscribe`,
   `event-stream/subscribe` spawn an internal handler actor; the matching
@@ -432,7 +662,56 @@ Naming polish while in doc-land (tiny code fixes, keep back-compat where cheap):
 
 ## Milestone N — Parity
 
-### N10 · Persistent sharded entities (CQRS aggregates) — `TODO`
+**Definition of done reached (2026-07-23):** all B + H stories plus the four
+required N stories (N10, N11, N13, N15) are `DONE`. What is left — N12, N14,
+N16, N18, N19 — is the prioritized-optional tail (N17 was done too).
+
+
+### N10 · Persistent sharded entities (CQRS aggregates) — `DONE`
+**Note (2026-07-23):** built as scoped, all four bullets.
+**Entity mode in `CljPersistentActor`:** the constructor now takes either the
+eager props (`:persistence-id` + `:state`, what `persistence/spawn` builds) or
+entity props (`:persistence-id-fn` + `:init-fn`), keyed off the presence of
+`:persistence-id-fn`. In entity mode both functions are invoked with
+`getSelf().path().name()` — the entity id — which is available in the
+constructor because the `Actor` trait initializes `self` before the subclass
+constructor body runs. `defactor-persistent` gained an `:entity-props` key on
+the actor-def holding that (argument-free) props map; `:make-props` is
+unchanged, so `spawn`/`spawn-named` behave exactly as before.
+**`sharding/start`** dispatches through a new private `entity-props` on
+`(:type actor-def)`: `:persistent-actor` → `CljPersistentActor/create` of the
+entity props, anything else → the classic `CljActor/create` path, now fed
+`(:args opts)` instead of a hardcoded `nil`. Two guards rather than silent
+surprises (H7 style): a persistent def with no `:persistence-id` clause throws
+at `start` naming the fix, and `:args` combined with a persistent def throws
+(its `init` gets the entity id, so args would be silently dropped).
+**Also added:** `graceful-shutdown!` (`ShardRegion/gracefulShutdownInstance`)
+and `state->map` for `shard-region-state` (`{:shards {shard-id #{entity-id}}
+:failed #{}}`, mirroring `stats->map`); `shard-region-state`'s inline
+fully-qualified `ShardRegion` reference replaced by a real import.
+**Contract worth knowing:** under sharding, `:persistence-id` and `init` receive
+the *entity id string*, not the args map they get from `spawn` — the shared
+Props has no args to give them. Documented in `start`, in
+`defactor-persistent`'s docstring, and in `doc/04-cluster.md`.
+Tests (`cluster/sharding_test.clj`, 6 new, all against a real single-node
+cluster): `persistent-entity-recovers-after-passivation-test` — deposits/
+withdrawals, asserts the derived persistence id (`account-acct-1`), passivates,
+then checks the state came back **and** that a *second* `on-recovery-complete`
+fired (a recovery counter keyed by persistence id; without it the assertion
+would pass just as well against an entity that was never stopped — the first
+draft had exactly that hole); `persistent-entities-isolate-state-by-id-test`
+(two ids, plus `persist-all` inside a sharded entity);
+`persistent-entity-requires-a-persistence-id-test` (both guards);
+`start-args-reach-a-classic-entity-init-test`; `shard-region-state->map-test`;
+`graceful-shutdown-stops-the-region-test` (single node: nowhere to hand off to,
+so the region terminates — observed via DeathWatch with
+`test-support/stopped-within?`). Verified failing without the fix by restoring
+the old `(CljActor/create ((:make-props actor-def) nil))` line: the persistent
+tests fail on every assertion and the `:args` test reports `:greeting nil`.
+`docs/specs/sharding-parity-spec.md` updated (three new function rows, `:args`
+option row, two new status rows); `doc/04-cluster.md` gained a "Persistent
+Entities" section. `lein test` (537 tests, was 531), `lein lint`, `lein check`
+(no reflection warnings) all clean.
 **Deps:** B14. **Highest-value story in the epic.**
 `sharding/start` hard-codes `CljActor/create` (`sharding.clj:260`), so a
 `defactor-persistent` definition cannot be sharded — yet "persistent entity per
@@ -454,7 +733,88 @@ and a `state->map` for `shard-region-state` mirroring `stats->map`.
 again → state recovered from the journal; two ids isolate state; `:args` reaches a
 classic entity's init; graceful-shutdown drains a region.
 
-### N11 · Persistence depth — `TODO`
+### N11 · Persistence depth — `DONE`
+**Note (2026-07-23):** all four bullets built.
+**Lifecycle:** `CljPersistentActor` now extends `AbstractPersistentActorWithTimers`
+and gained `:post-stop`, `:supervisor-strategy`, `:journal-plugin-id`,
+`:snapshot-plugin-id` and `:recovery` props, plus the six timer methods and
+watch/unwatch mirroring `CljActor`'s. New `defactor-persistent` clauses:
+`on-stop`, `supervision`, `recovery`, `journal-plugin-id`, `snapshot-plugin-id`
+(all singletons, wired into the H8 validation set and its error message).
+Two clauses were **deliberately not** ported from `defactor`, both for the same
+reason — their contract is "return the new state", which for an event-sourced
+actor means state no event produced, gone on the next replay: `on-error`
+(let the failure reach supervision instead) and `on-restart` (a restart replays
+the journal, so `on-recovery-complete` is the hook that fires once the state is
+valid again). Documented in the macro's docstring.
+**Superclass change was not free** — worth knowing if this is ever touched
+again. `AbstractPersistentActorWithTimers` mixes in both `Timers` and
+`Eventsourced`, which both define `aroundReceive`/`aroundPreRestart`/
+`aroundPostStop`; Scala resolves that by linearization and emits the result as
+*synthetic bridge* methods, which javac ignores when computing inherited
+members, so the subclass would not compile ("inherits unrelated defaults").
+Fixed by overriding the three explicitly and delegating to the **`Eventsourced`**
+static forwarders — Eventsourced is the outermost link, verified against the
+bridge's own bytecode (`javap -c`). The first attempt delegated to `Timers`,
+which enters the chain one link too low and skips the whole recovery/persist
+state machine: every persistence test failed with the actor stuck at
+`recovering? = true` and no event ever applied. That comment is now in the file.
+**Async writes:** three new marker classes next to `PersistAll` — `PersistAsync`
+(`persist-async` / `persist-all-async` → `persistAllAsync`), `Defer`
+(`defer` → `deferAsync`), and `PersistOps` (`then`, an ordered list that nests).
+The actor's `matchAny` now routes through a recursive `runOp`, which is what
+makes `(then (persist …) (defer …))` work — a command handler returns one value,
+so without a combinator `defer` could never follow a persist, which is its only
+real use. A deferred value is handed **back to the command handler** once the
+preceding writes complete (sender still in scope, so `reply` works); it is never
+journalled and never reaches the event handler.
+**Recovery:** `recovery-settings` (public) turns `:none` / `:default` / a map
+(`:from-snapshot` — `:latest`, `:none`, a criteria map or a
+SnapshotSelectionCriteria — `:to-sequence-nr`, `:replay-max`) / a `Recovery` into
+Pekko's `Recovery`, throwing on anything else. `snapshot-criteria` moved up the
+file to be usable from it.
+**Also fixed, found while testing (a real bug, not scope creep):**
+`sharding/passivate` sent `ShardRegion.Passivate` via `core/!`, which falls back
+to `noSender` when `core/*current-actor*` is unbound — and the Shard identifies
+*which* entity to passivate by the message's sender. Inside a classic entity
+`core/*current-actor*` is bound so it worked by luck; inside a persistent entity
+it is not, so the shard silently ignored the request and the entity never
+stopped. Now sends `(.tell parent msg (.self context))`, correct for any actor
+kind. This also exposed that N10's passivation test had been passing for the
+wrong reason (the old `core/context` call NPE'd, crashing the actor, and the
+crash-restart replayed the journal just as convincingly as a passivation would);
+that test now `ask`s `:passivate` and asserts the reply, so a completed command
+is proven before the second recovery is counted.
+**API note:** `core/self`/`context`/`stop`/timers read `core/*current-actor*`,
+which is type-hinted `CljActor` — calling them from a persistent actor throws a
+ClassCastException. Added the persistent counterparts (`self`, `sender`,
+`context`, `tell`, `stop`, `watch`, `unwatch`, `start-timer`,
+`start-single-timer`, `cancel-timer`, `timer-active?`, `cancel-all-timers`) to
+`pekko-clj.persistence`, following the precedent `persistence/reply` already
+set. Considered instead unifying both actor classes behind a shared interface so
+`core`'s helpers work for either — rejected for this story: it means retagging
+`core/*current-actor*` and reconciling the stash surface (Pekko's own
+`UnrestrictedStash` vs `CljActor`'s `LinkedList`), which is a refactor of `core`
+with no bullet asking for it.
+**Kondo/cljfmt (per CLAUDE.md):** the three new value clauses added to the
+hook's `clause-heads`; the hook's `on-stop`/`on-restart` branch now scopes the
+caller's anaphors instead of a hardcoded `[state]`, so `this` resolves in a
+persistent `on-stop`. No cljfmt entry needed — `on-stop`/`supervision` already
+have one, and the three new clauses take a single value argument, where
+cljfmt's default argument alignment is correct.
+Tests (`persistence_test.clj`, 12 new): `persistent-on-stop-clause-runs`,
+`persistent-supervision-clause-supervises-children` (a child resumed rather than
+restarted — verified failing, i.e. the child's state resets, with the clause
+removed), `persistent-timers-work`, `persist-async-applies-events`,
+`persist-async-events-recover` (proves they are real journal writes),
+`defer-runs-after-the-write` (the reply carries the already-applied event),
+`deferred-values-are-not-journalled`, `journal-plugin-id-clause-redirects-writes`
+(events absent from the *configured* LevelDB journal because they went to
+inmem), `recovery-none-skips-replay`, `recovery-replay-max-bounds-replay`,
+`recovery-settings-shapes`, `defactor-persistent-rejects-duplicate-lifecycle-clause`.
+README's persistence section documents the new write modes and clauses. No
+`docs/specs/*` checklist covers persistence. `lein test` (549 tests, was 537),
+`lein lint`, `lein check` (no reflection warnings) all clean.
 **Deps:** B12, B15.
 The persistent macro supports far fewer capabilities than `defactor`:
 - **Lifecycle:** no `on-stop`, no `supervision`, no timers (`CljPersistentActor`
@@ -484,7 +844,63 @@ delivery-id-in-message pattern.
 **Tests:** delivery redelivered until confirmed; confirmation stops redelivery;
 state (delivery snapshots) survives restart.
 
-### N13 · Streams consistency fixes + missing operators — `TODO`
+### N13 · Streams consistency fixes + missing operators — `DONE`
+**Note (2026-07-23):** every bullet done.
+**Consistency:**
+- `merge-substreams`/`concat-substreams` now dispatch on SubSource *and* SubFlow
+  (and throw a named error on anything else) instead of hinting `^SubSource`,
+  which compiled to a checkcast and so ClassCastExceptioned on the `group-by`-of-
+  a-Flow path. Verified failing before the fix.
+- `source-queue` and `source-actor-ref` both return `{:source … :queue …}` /
+  `{:source … :actor-ref …}`, matching `run-source-queue`. **Breaking, no
+  deprecation shim**: the tracker asked for a deprecation window, but the old
+  shapes were positional vectors in *opposite* orders (`[queue source]` vs
+  `[source actor-ref]`) — the very inconsistency the story exists to remove — and
+  one function cannot return both a vector and a map. A parallel set of
+  `*-map`-suffixed names would have left the confusing pair in place as the
+  obvious-looking API. Recorded here as the decision; five call sites in
+  `stream_test.clj` updated.
+- `zip-with-index` (and the new `zip`/`zip-all`) map Pekko's `japi.Pair` to
+  Clojure `[a b]` vectors, so downstream steps need no interop.
+- `distinct`/`distinct-by` renamed to `dedupe`/`dedupe-by` — they only ever
+  dropped *consecutive* duplicates, which is `clojure.core/dedupe`, not
+  `distinct`. Old names kept as `^:deprecated` aliases (clj-kondo reports uses,
+  so the two remaining deliberate uses in the test carry `:clj-kondo/ignore`).
+  `dedupe` and `interleave` added to the ns `:refer-clojure :exclude`.
+- `system-materializer` added (via `SystemMaterializer`, the B9 pattern) and
+  documented as the default; `materializer`'s docstring now says plainly that it
+  leaks if called per stream. A private `->materializer` lets **every** `run-*`
+  (plus `preMaterialize` and `to-actor`) accept an ActorSystem in place of a
+  Materializer. Side effect worth noting: `README.md` and `doc/05-streams.md`
+  already showed `(s/run … sys)`, which could not work — `run`'s
+  `^Materializer` hint compiled to a checkcast — so those examples were
+  documenting a form that threw. They are true now.
+- `Source/lazily` **is** deprecated in Pekko 1.6 (`Deprecated: true` on the
+  module method, found with `javap -v` on `Source$`; the static forwarder on
+  `Source` carries no flag, which is why a plain `javap` looks clean).
+  `source-lazily` moved to `Source/lazySource`.
+**New operators:** `skeep` (the Clojure-shaped `collect` — one `mapConcat`
+stage, drop on nil), `zip`, `zip-all`, `interleave`, `prepend`, `or-else`,
+`divert-to`, `limit`, `source-never`, `source-unfold-async`, `sink-head-option`,
+`sink-last-option`. **`take-last` is not a Source/Flow operator** — the tracker
+listed it as "trivial with `op`", but keeping a tail requires knowing where the
+stream ends, so Pekko only has `Sink.takeLast(int)`; shipped as `sink-take-last`
+with that reason in its docstring.
+Tests (`stream_test.clj`, 15 new): `system-materializer-is-shared-per-system`,
+`run-fns-accept-an-actor-system`, `merge-substreams-works-through-a-flow`
+(the SubFlow regression, verified failing), `concat-substreams-works-through-a-flow`,
+`source-queue-and-actor-ref-share-a-map-shape`,
+`dedupe-drops-consecutive-duplicates` (pins "consecutive only" and the aliases),
+`skeep-maps-and-drops-nils`, `zip-and-zip-all`, `interleave-alternates`,
+`prepend-and-or-else`, `divert-to-removes-matching-elements`,
+`limit-fails-past-the-bound`, `option-sinks-are-empty-safe` (contrasted against
+`sink-head` failing on an empty stream), `sink-take-last-keeps-the-tail`,
+`source-never-never-completes`, `source-unfold-async-emits`,
+`source-lazily-defers-creation`; the two old `distinct-*` tests renamed and
+`zip-with-index-pairs` de-interop'd. README and `doc/05-streams.md` gained the
+materializer guidance and the operator list. No `docs/specs/*` checklist covers
+streams. `lein test` (566 tests, was 549), `lein lint`, `lein check` (no
+reflection warnings) all clean.
 **Deps:** none.
 Consistency (bug-adjacent):
 - `merge-substreams`/`concat-substreams` hint `^SubSource` (`stream.clj:558-566`) —
@@ -524,7 +940,55 @@ N15's static content).
 **Tests:** file round trip incl. IOResult count; framing on a multi-line file;
 input-stream source.
 
-### N15 · HTTP routing completion: segment capture, static content, auth — `TODO`
+### N15 · HTTP routing completion: segment capture, static content, auth — `DONE`
+**Note (2026-07-23):** all remaining bullets done (`path-var` was already
+delivered by B11).
+**Static content:** `from-resource`, `from-resource-directory`, `from-file`,
+`from-directory` over `getFromResource`/`getFromResourceDirectory`/
+`getFromFile`/`getFromDirectory`. Content types come from Pekko's default
+resolver (file extension), and the directory forms resolve the *unmatched* path,
+so they nest under `path-prefix` exactly like the B11 route macros. `from-file`
+takes a String or a File; its 2-arity coerces to File because the explicit
+`ContentType` overload is only declared on `(File, ContentType)`.
+**Auth:** `basic-auth` over `authenticateBasic` — realm, an authenticator, and
+the inner route; the 401 and the `WWW-Authenticate` challenge are Pekko's.
+**The authenticator signature deviates from the tracker's sketch, deliberately.**
+The tracker proposed `(fn [user pass] user-or-nil)`, but the password is not
+reachable: javadsl's `ProvidedCredentials` exposes only `identifier()` and
+`verify(secret)`, and `verify` is a constant-time comparison. Recovering the raw
+password would mean re-parsing the Authorization header ourselves and giving up
+that property for nothing, so the signature is `(fn [user verify] principal-or-nil)`
+where `verify` takes *your* known secret. `bearer-token` is extraction only, on
+`header-value-opt` as scoped: nil when the header is absent or uses another
+scheme, and the route decides what that means (its docstring points at
+`authenticateOAuth2` for a challenge-based flow).
+**Marshalling wart — decision: drop the passthrough.** `->json`/`->edn` now
+encode every value, strings included, and a pre-encoded body is marked with the
+new `marshal/raw-body`. Keeping the passthrough would have meant documenting that
+`(resp/json "hello")` emits invalid JSON with nothing to signal it — precisely
+the silent-wrong-result class this epic exists to remove — and "is this string
+already encoded?" is knowable only to the caller. Named `raw-body` rather than
+the tracker's `raw-json` because the same marker serves `->edn`; it is a plain
+map with a namespaced key (`::raw`), following B14's reasoning about not
+depending on a type surviving anything. **Breaking** for anyone passing
+pre-encoded strings; three existing assertions updated
+(`marshalling_test.clj` x2, `integration_test.clj` json-content-type-test — the
+last one was itself relying on the passthrough).
+Tests (`http/integration_test.clj`, 6 new, all against a real bound server):
+`from-resource-serves-a-classpath-file` (incl. the resolved `text/css` content
+type), `from-resource-directory-resolves-the-unmatched-path` (nested hit + 404
+miss), `from-directory-serves-filesystem-files` (plus `from-file`),
+`basic-auth-accepts-rejects-and-challenges` (accept / wrong password / unknown
+user / no credentials → 401 with the realm in the challenge),
+`bearer-token-extracts-or-passes-nil` (incl. case-insensitive scheme and a Basic
+header yielding nil), `json-string-bodies-are-encoded-not-passed-through`; plus
+`raw-body`/`raw-body?` unit assertions in `marshalling_test.clj`. New test
+fixtures `test/resources/public/css/app.css` and `test/resources/public/data.json`.
+`doc/06-http.md` gained "Static Content", "Authentication" and a "Marshalling:
+strings are values" section recording the decision; the routing ns docstring
+lists the new directive groups. No `docs/specs/*` checklist covers HTTP routing
+(`routing-parity-spec.md` is about *router* strategies). `lein test` (572 tests,
+was 566), `lein lint`, `lein check` (no reflection warnings) all clean.
 **Deps:** B11.
 - ~~**`path-var`** — extract one path segment as a value, plus
   `path-prefix-var`.~~ **Done in B11** (2026-07-22): both are public in
@@ -554,7 +1018,62 @@ content type; the json-string decision's behavior pinned.
 **Tests:** self-signed round trip; gzip response verified by header + decoded body;
 timeout returns 503.
 
-### N17 · Transit record support — `TODO`
+### N17 · Transit record support — `DONE`
+**Note (2026-07-23):** built as scoped. `:records` (record classes *or* class
+names, both interchangeable) is accepted by `transit-config` — which writes them
+to `pekko-clj.serialization.transit.records` and so flows through
+`cluster/create-system`'s `:transit-serialization` map — and by new 4-arg
+arities of `write-bytes`/`read-bytes` for standalone use; the two sources are
+unioned, so a per-call list adds to whatever the system already registers.
+Writes reuse transit-clj's own `record-write-handler` (tag = `(.getName klass)`,
+rep = the record as a map). Reads do **not** reuse transit-clj's
+`record-read-handler`: that one `resolve`s the `ns/map->Rec` var and so needs
+the defining namespace already loaded, which is not guaranteed when the class
+name arrives as a config string — ours goes through the record's generated
+static `create(IPersistentMap)` factory instead (identical semantics, `map->Rec`
+just calls it, and it also restores the ext map for non-basis keys).
+`->record-class` validates via `(supers klass)` that the class is an `IRecord`
+and throws `IllegalArgumentException` for a non-record or an unloadable name —
+at `transit-config` time, so a typo fails at system construction, not at the
+first cross-node message.
+**Handler cache reworked** from "one entry per system" to two levels: the
+existing weak-keyed outer map (system → atom) now holds a map from the
+explicit record set → handler maps, since handlers are no longer a function of
+the system alone. The weak-key invariant is unchanged and now called out at
+`ref-handler-entries` (cached values must never strongly reference the system;
+they reach it via `WeakReference`).
+**Two things the audit note didn't anticipate, both measured:**
+(1) `:records` deliberately does **not** bind the record classes themselves in
+`serialization-bindings` — without AOT a defrecord class lives in Clojure's
+DynamicClassLoader and Pekko's `ReflectiveDynamicAccess` cannot resolve it by
+name, so the system fails to start (hit live while writing the end-to-end test).
+It binds `clojure.lang.IRecord` instead, which is stable and app-classloader
+visible; records were already covered by the default `IPersistentCollection`
+binding, so this only matters for a custom `:bindings`.
+(2) Unknown-tag failure mode: transit's default returns an opaque
+`TaggedValueImpl` that then flows on into user code as if it were the message
+(verified — see `neg` check in the session). `read-bytes` now installs a
+`:default-handler` that throws `ex-info` naming the tag and pointing at
+`:records`. Transit's `ReaderImpl.read` wraps anything a handler throws in a
+bare `RuntimeException`, so `read-bytes` unwraps its own marked error
+(`::unknown-tag` in the ex-data) and rethrows it unchanged; unrelated
+`RuntimeException`s — including the existing `->format`
+`IllegalArgumentException` — propagate untouched.
+Tests (`serialization_test.clj`, 10 new): round trip when registered (all three
+formats), the `unregistered-record-decays-to-a-map` control that proves the
+registration is what preserves the type, nested records (in a map/vector/set and
+record-in-record), non-basis extra keys, unknown-tag throw + ex-data,
+non-record/unknown-name rejection, class-vs-name interchangeability,
+`transit-config` shape (records path present, `IRecord` bound, record classes
+*not* bound, nothing emitted when `:records` is absent), and two live-system
+tests under `serialize-messages = on` — one with `:records` (type survives the
+real actor message path) and one without (still decays), which is the negative
+control for the config plumbing.
+README's Serialization section gained a "Records" subsection; the ns docstring's
+"records are NOT handled" note now describes the opt-in instead. No
+`docs/specs/*` checklist or `doc/` guide covers serialization (grepped) —
+nothing to tick. `lein test` (531 tests, was 521), `lein lint`, `lein check`
+(no reflection warnings) all clean.
 **Deps:** none — B14 removed the library's own record from the wire (plain-data
 envelope) instead of teaching Transit to read records, so this story is now the
 *only* place record support would land, not a generalization of it.

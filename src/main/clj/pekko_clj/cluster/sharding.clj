@@ -38,18 +38,21 @@
    `passivation-settings`) or on request (`passivate`). For always-on workers that
    are not addressed by entity id, see `pekko-clj.cluster.daemon`."
   (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
+  (:import [org.apache.pekko.actor ActorSystem ActorRef Props]
            [org.apache.pekko.cluster.sharding ClusterSharding ClusterShardingSettings
             ClusterShardingSettings$PassivationStrategySettings
             ClusterShardingSettings$PassivationStrategySettings$LeastRecentlyUsedSettings
             ClusterShardingSettings$PassivationStrategySettings$LeastFrequentlyUsedSettings
+            ShardRegion
             ShardRegion$MessageExtractor
             ShardRegion$HashCodeMessageExtractor
             ShardRegion$Passivate
             ShardRegion$GetClusterShardingStats
             ShardRegion$ClusterShardingStats
-            ShardRegion$ShardRegionStats]
-           [pekko_clj.actor CljActor]
+            ShardRegion$ShardRegionStats
+            ShardRegion$CurrentShardRegionState
+            ShardRegion$ShardState]
+           [pekko_clj.actor CljActor CljPersistentActor]
            [com.typesafe.config Config ConfigFactory]
            [java.time Duration]
            [scala.concurrent.duration FiniteDuration]
@@ -227,6 +230,27 @@
                           passivation-opts
                           (passivation-settings passivation-opts))))))
 
+(defn- entity-props
+  "The Props every entity of a sharded type is created from.
+
+   Dispatches on the actor definition: a `defactor-persistent` def becomes a
+   CljPersistentActor whose persistence id and initial state are derived from the
+   entity id, a plain `defactor` def becomes a CljActor built from `:args`."
+  ^Props [actor-def opts]
+  (if (= :persistent-actor (:type actor-def))
+    (let [props-map (:entity-props actor-def)]
+      (when-not (:persistence-id-fn props-map)
+        (throw (IllegalArgumentException.
+                (str "A sharded persistent entity needs a :persistence-id clause — it is "
+                     "called with the entity id, e.g. "
+                     ":persistence-id (fn [id] (str \"order-\" id))"))))
+      (when (contains? opts :args)
+        (throw (IllegalArgumentException.
+                (str ":args does not apply to a persistent entity — its `init` clause and "
+                     ":persistence-id function receive the entity id instead"))))
+      (CljPersistentActor/create props-map))
+    (CljActor/create ((:make-props actor-def) (:args opts)))))
+
 (defn start
   "Start cluster sharding for an entity type.
 
@@ -254,11 +278,27 @@
                           :eventsourced remember-entities store
      - :stop-message - Message sent to an entity to stop it gracefully during shard
                           rebalance/hand-off (default: Pekko's PoisonPill)
+     - :args - Init args every entity of this type is created with (classic
+                          `defactor` entities only; default nil)
 
    Returns the ShardRegion ActorRef.
 
-   Entity actors are all created from the same Props (their init receives nil
-   args); an entity reads its own id at runtime with (entity-id).
+   Entity actors are all created from the same Props, so nothing per-entity can be
+   baked into it. An entity reads its own id at runtime with (entity-id).
+
+   `actor-def` may come from `defactor` or from `defactor-persistent` — a
+   persistent entity is the canonical sharding pattern (one event-sourced
+   aggregate per id, recovered from the journal whenever it is recreated after a
+   passivation or a rebalance). For a persistent entity, its `:persistence-id`
+   function and its `init` clause are called with the **entity id** rather than
+   with spawn args, since there are none:
+
+     (persistence/defactor-persistent order
+       :persistence-id (fn [id] (str \"order-\" id))
+       (init [id] {:id id :items []})
+       ...)
+
+     (sharding/start sys order {:type-name \"Order\"})
 
    Example:
      (sharding/start sys order-actor
@@ -271,9 +311,7 @@
   [^ActorSystem system actor-def opts]
   (let [{:keys [type-name num-shards stop-message]
          :or {num-shards 100}} opts
-        ;; Create a Props - entity-id will be extracted from messages
-        ;; and passed via the message extractor
-        props (CljActor/create ((:make-props actor-def) nil))
+        props (entity-props actor-def opts)
         settings (sharding-settings system opts)
         ^ShardRegion$MessageExtractor extractor (create-message-extractor num-shards)
         sharding (ClusterSharding/get system)]
@@ -348,10 +386,45 @@
   (.shardRegion (ClusterSharding/get system) type-name))
 
 (defn shard-region-state
-  "Get the current state of a shard region.
-   Sends GetShardRegionState message and returns a future."
+  "Get the current state of a shard region — which shards it hosts and which
+   entities live in each.
+
+   Returns a future of a CurrentShardRegionState; pass it to `state->map`."
   [shard-region]
-  (core/<?> shard-region (org.apache.pekko.cluster.sharding.ShardRegion/getShardRegionStateInstance)))
+  (core/<?> shard-region (ShardRegion/getShardRegionStateInstance)))
+
+(defn state->map
+  "Convert a CurrentShardRegionState (from `shard-region-state`) to a Clojure map.
+
+   Returns:
+   - :shards - map of shard id -> set of the entity ids that shard hosts
+   - :failed - set of shard ids that did not answer the state query
+
+   Example:
+     (-> (shard-region-state region) deref state->map :shards)
+     ;; => {\"3\" #{\"order-1\"} \"7\" #{\"order-2\" \"order-9\"}}"
+  [^ShardRegion$CurrentShardRegionState state]
+  {:shards (into {}
+                 (map (fn [^ShardRegion$ShardState s]
+                        [(.shardId s) (set (.getEntityIds s))]))
+                 (.getShards state))
+   :failed (set (.getFailed state))})
+
+(defn graceful-shutdown!
+  "Hand off every shard this region hosts and stop it.
+
+   The region stops accepting new work, moves its shards to the other regions of
+   the type (buffering messages for them meanwhile) and then terminates. This is
+   what you want before taking a node out of the cluster: entities are stopped
+   with the type's stop-message rather than killed with the JVM. On a single-node
+   cluster there is nowhere to hand off to, so the shards simply stop.
+
+   Fire-and-forget — watch the region ActorRef to learn when it is gone.
+
+   Example:
+     (sharding/graceful-shutdown! region)"
+  [shard-region]
+  (core/! shard-region (ShardRegion/gracefulShutdownInstance)))
 
 ;; ---------------------------------------------------------------------------
 ;; EntityRef - Direct Entity Access
@@ -481,8 +554,14 @@
          state))"
   ([stop-message] (passivate (core/context) stop-message))
   ([^org.apache.pekko.actor.ActorContext context stop-message]
-   (let [parent (.parent context)]
-     (core/! parent (ShardRegion$Passivate. stop-message)))))
+   ;; The Shard identifies which entity to passivate by the *sender* of Passivate,
+   ;; so this must go out as the entity, not as noSender. Taking both the parent
+   ;; and self from the context keeps that true for any actor kind — `core/!`
+   ;; would fall back to noSender inside a persistent entity, where
+   ;; `core/*current-actor*` is not bound, and the shard would silently ignore it.
+   (.tell ^ActorRef (.parent context)
+          (ShardRegion$Passivate. stop-message)
+          ^ActorRef (.self context))))
 
 ;; ---------------------------------------------------------------------------
 ;; Health Checks

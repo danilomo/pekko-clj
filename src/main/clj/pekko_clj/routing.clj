@@ -6,20 +6,22 @@
    Pool routers: Create and manage a pool of routee actors
    Group routers: Route to a group of existing actors at specified paths
 
-   Strategies:
-   - :round-robin       - Rotates through routees sequentially
+   Strategies (spawn-pool / spawn-group / spawn-cluster-pool / spawn-cluster-group):
+   - :round-robin       - Rotates through routees sequentially (default)
    - :random            - Randomly selects a routee
    - :broadcast         - Sends to all routees
    - :smallest-mailbox  - Sends to routee with fewest queued messages (pool only)
-   - :balancing         - All routees share a single mailbox (work-stealing)
-   - :consistent-hash   - Routes based on message hash key
+   - :balancing         - All routees share a single mailbox (pool only, work-stealing)
+
+   Consistent hashing is not a :strategy value here — it needs a hash function,
+   so it has its own functions: spawn-consistent-hash-pool / -group.
 
    Additional routers:
    - scatter-gather     - Send to all, return first response
    - tail-chopping      - Latency reduction via speculative sends
    - cluster-pool/group - Cluster-aware routers across nodes"
   (:require [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem Props]
+  (:import [org.apache.pekko.actor ActorRef ActorRefFactory Props]
            [org.apache.pekko.routing Pool Group
             RoundRobinPool RoundRobinGroup
             RandomPool RandomGroup
@@ -43,29 +45,45 @@
   ^Props [actor-def args]
   (CljActor/create ((:make-props actor-def) args)))
 
+(defn- actor-of
+  "actorOf via the (Props) or (Props, String) overload, depending on whether
+   name is given. factory is an ActorSystem for a top-level router, or an
+   ActorRefFactory (e.g. (core/context) inside an actor) to spawn it as a child."
+  ^ActorRef [^ActorRefFactory factory ^Props props name]
+  (if name
+    (.actorOf factory props ^String name)
+    (.actorOf factory props)))
+
 (defn- strategy->pool
-  "Convert a strategy keyword to a Pool router."
+  "Convert a strategy keyword to a Pool router. `nil` selects the default,
+   :round-robin; any other unrecognized keyword throws."
   ^Pool [strategy size]
   (let [n (int size)]
     (case strategy
-      :round-robin (RoundRobinPool. n)
+      (nil :round-robin) (RoundRobinPool. n)
       :random (RandomPool. n)
       :broadcast (BroadcastPool. n)
       :smallest-mailbox (SmallestMailboxPool. n)
       :balancing (BalancingPool. n)
-      ;; Default to round-robin
-      (RoundRobinPool. n))))
+      (throw (IllegalArgumentException.
+              (str "Unknown pool strategy: " (pr-str strategy)
+                   ". Valid options: :round-robin, :random, :broadcast, "
+                   ":smallest-mailbox, :balancing (or nil for the default, "
+                   ":round-robin)."))))))
 
 (defn- strategy->group
-  "Convert a strategy keyword to a Group router."
+  "Convert a strategy keyword to a Group router. `nil` selects the default,
+   :round-robin; any other unrecognized keyword throws."
   ^Group [strategy paths]
   (let [path-list (java.util.ArrayList. ^java.util.Collection paths)]
     (case strategy
-      :round-robin (RoundRobinGroup. path-list)
+      (nil :round-robin) (RoundRobinGroup. path-list)
       :random (RandomGroup. path-list)
       :broadcast (BroadcastGroup. path-list)
-      ;; Default to round-robin
-      (RoundRobinGroup. path-list))))
+      (throw (IllegalArgumentException.
+              (str "Unknown group strategy: " (pr-str strategy)
+                   ". Valid options: :round-robin, :random, :broadcast "
+                   "(or nil for the default, :round-robin)."))))))
 
 (defn- role-set
   "The role set Pekko's cluster router settings take — empty when no role given."
@@ -98,12 +116,14 @@
   "Create a pool router that spawns and manages N worker actors.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - actor-def: Actor definition created with defactor
    - size: Number of worker instances to create
    - opts: Options map (optional)
      - :strategy - Routing strategy (:round-robin, :random, :broadcast, :smallest-mailbox)
      - :args - Arguments to pass to each worker's init
+     - :name - Name for the router actor, so it's addressable by path
 
    Returns an ActorRef for the router.
 
@@ -113,20 +133,23 @@
      (! pool :work) ; Routes to one worker"
   ([system actor-def size]
    (spawn-pool system actor-def size {}))
-  ([system actor-def size {:keys [strategy args] :or {strategy :round-robin args nil}}]
+  ([^ActorRefFactory system actor-def size {:keys [strategy args name]
+                                            :or {strategy :round-robin args nil}}]
    (let [props (make-props actor-def args)
          router (strategy->pool strategy size)
          router-props (.props router props)]
-     (.actorOf ^ActorSystem system router-props))))
+     (actor-of system router-props name))))
 
 (defn spawn-group
   "Create a group router that routes to existing actors at specified paths.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - paths: Collection of actor paths (strings like \"/user/worker1\")
    - opts: Options map (optional)
      - :strategy - Routing strategy (:round-robin, :random, :broadcast)
+     - :name - Name for the router actor, so it's addressable by path
 
    Returns an ActorRef for the router.
 
@@ -138,10 +161,10 @@
      (! group :work) ; Routes to existing workers"
   ([system paths]
    (spawn-group system paths {}))
-  ([system paths {:keys [strategy] :or {strategy :round-robin}}]
+  ([^ActorRefFactory system paths {:keys [strategy name] :or {strategy :round-robin}}]
    (let [router (strategy->group strategy paths)
          props (.props router)]
-     (.actorOf ^ActorSystem system props))))
+     (actor-of system props name))))
 
 (defn broadcast
   "Send a message to all routees via a broadcast router.
@@ -180,20 +203,22 @@
    This is essential for stateful routing patterns.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - actor-def: Actor definition
    - size: Number of routees
    - opts: Options map
      - :hash-fn - Function (msg) -> hash-key (required)
      - :virtual-nodes - Virtual nodes per routee (default: 10)
      - :args - Arguments for actor init
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-consistent-hash-pool sys worker-actor 5
        {:hash-fn (fn [msg] (:user-id msg))
         :virtual-nodes 100})"
-  [system actor-def size {:keys [hash-fn virtual-nodes args]
-                          :or {virtual-nodes 10}}]
+  [^ActorRefFactory system actor-def size {:keys [hash-fn virtual-nodes args name]
+                                           :or {virtual-nodes 10}}]
   (when-not hash-fn
     (throw (IllegalArgumentException. ":hash-fn is required for consistent-hash-pool")))
   (let [props (make-props actor-def args)
@@ -202,7 +227,7 @@
                  (.withVirtualNodesFactor virtual-nodes)
                  (.withHashMapper mapper))
         router-props (.props pool props)]
-    (.actorOf ^ActorSystem system router-props)))
+    (actor-of system router-props name)))
 
 (defn spawn-consistent-hash-group
   "Create a group router with consistent hashing.
@@ -210,17 +235,19 @@
    Routes to existing actors at specified paths using consistent hashing.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - paths: Collection of actor paths
    - opts: Options map
      - :hash-fn - Function (msg) -> hash-key (required)
      - :virtual-nodes - Virtual nodes per routee (default: 10)
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-consistent-hash-group sys [\"/user/w1\" \"/user/w2\"]
        {:hash-fn (fn [msg] (:session-id msg))})"
-  [system paths {:keys [hash-fn virtual-nodes]
-                 :or {virtual-nodes 10}}]
+  [^ActorRefFactory system paths {:keys [hash-fn virtual-nodes name]
+                                  :or {virtual-nodes 10}}]
   (when-not hash-fn
     (throw (IllegalArgumentException. ":hash-fn is required for consistent-hash-group")))
   (let [path-list (java.util.ArrayList. ^java.util.Collection paths)
@@ -229,7 +256,7 @@
                   (.withVirtualNodesFactor virtual-nodes)
                   (.withHashMapper mapper))
         props (.props group)]
-    (.actorOf ^ActorSystem system props)))
+    (actor-of system props name)))
 
 ;; ---------------------------------------------------------------------------
 ;; Scatter-Gather Router
@@ -242,24 +269,26 @@
    received within the timeout.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - actor-def: Actor definition
    - size: Number of routees
    - opts: Options map
      - :timeout-ms - Timeout for gathering responses (required)
      - :args - Arguments for actor init
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-scatter-gather-pool sys search-actor 3
        {:timeout-ms 5000})"
-  [system actor-def size {:keys [timeout-ms args]}]
+  [^ActorRefFactory system actor-def size {:keys [timeout-ms args name]}]
   (when-not timeout-ms
     (throw (IllegalArgumentException. ":timeout-ms is required for scatter-gather-pool")))
   (let [props (make-props actor-def args)
         timeout (FiniteDuration/create (long timeout-ms) TimeUnit/MILLISECONDS)
         pool (ScatterGatherFirstCompletedPool. (int size) timeout)
         router-props (.props pool props)]
-    (.actorOf ^ActorSystem system router-props)))
+    (actor-of system router-props name)))
 
 ;; ---------------------------------------------------------------------------
 ;; Tail-Chopping Router
@@ -272,19 +301,21 @@
    if no response. Returns first response received.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - actor-def: Actor definition
    - size: Number of routees
    - opts: Options map
      - :timeout-ms - Overall timeout (required)
      - :interval-ms - Interval between sends (required)
      - :args - Arguments for actor init
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-tail-chopping-pool sys worker-actor 3
        {:timeout-ms 5000
         :interval-ms 100})"
-  [system actor-def size {:keys [timeout-ms interval-ms args]}]
+  [^ActorRefFactory system actor-def size {:keys [timeout-ms interval-ms args name]}]
   (when-not (and timeout-ms interval-ms)
     (throw (IllegalArgumentException. ":timeout-ms and :interval-ms are required for tail-chopping-pool")))
   (let [props (make-props actor-def args)
@@ -292,7 +323,7 @@
         interval (FiniteDuration/create (long interval-ms) TimeUnit/MILLISECONDS)
         pool (TailChoppingPool. (int size) timeout interval)
         router-props (.props pool props)]
-    (.actorOf ^ActorSystem system router-props)))
+    (actor-of system router-props name)))
 
 ;; ---------------------------------------------------------------------------
 ;; Pool with Resizer
@@ -305,7 +336,8 @@
    scales down when idle.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - actor-def: Actor definition
    - opts: Options map
      - :strategy - Routing strategy (default: :round-robin)
@@ -321,23 +353,24 @@
      - :backoff-rate - Rate to remove routees (default: 0.1)
      - :messages-per-resize - Messages between resize checks (default: 10)
      - :args - Arguments for actor init
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-pool-with-resizer sys worker-actor
        {:min-size 2
         :max-size 10
         :pressure-threshold 1})"
-  [system actor-def {:keys [strategy min-size max-size pressure-threshold
-                            rampup-rate backoff-threshold backoff-rate
-                            messages-per-resize args]
-                     :or {strategy :round-robin
-                          min-size 1
-                          max-size 10
-                          pressure-threshold 1
-                          rampup-rate 0.2
-                          backoff-threshold 0.3
-                          backoff-rate 0.1
-                          messages-per-resize 10}}]
+  [^ActorRefFactory system actor-def {:keys [strategy min-size max-size pressure-threshold
+                                             rampup-rate backoff-threshold backoff-rate
+                                             messages-per-resize args name]
+                                      :or {strategy :round-robin
+                                           min-size 1
+                                           max-size 10
+                                           pressure-threshold 1
+                                           rampup-rate 0.2
+                                           backoff-threshold 0.3
+                                           backoff-rate 0.1
+                                           messages-per-resize 10}}]
   (when-not (and (integer? pressure-threshold) (not (neg? pressure-threshold)))
     (throw (IllegalArgumentException.
             (str "spawn-pool-with-resizer :pressure-threshold must be a "
@@ -352,7 +385,7 @@
                                  (int messages-per-resize))
         pool (pool-with-resizer strategy min-size resizer)
         router-props (.props pool props)]
-    (.actorOf ^ActorSystem system router-props)))
+    (actor-of system router-props name)))
 
 ;; ---------------------------------------------------------------------------
 ;; Cluster-Aware Routers
@@ -364,7 +397,8 @@
    Deploys routees across cluster nodes based on configuration.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - actor-def: Actor definition
    - opts: Options map
      - :strategy - Local routing strategy (default: :round-robin)
@@ -373,16 +407,17 @@
      - :role - Only deploy to nodes with this role (optional)
      - :allow-local - Allow routees on local node (default: true)
      - :args - Arguments for actor init
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-cluster-pool sys worker-actor
        {:total-instances 10
         :max-per-node 3
         :role \"compute\"})"
-  [system actor-def {:keys [strategy total-instances max-per-node
-                            role allow-local args]
-                     :or {strategy :round-robin
-                          allow-local true}}]
+  [^ActorRefFactory system actor-def {:keys [strategy total-instances max-per-node
+                                             role allow-local args name]
+                                      :or {strategy :round-robin
+                                           allow-local true}}]
   (when-not (and total-instances max-per-node)
     (throw (IllegalArgumentException.
             ":total-instances and :max-per-node are required for cluster-pool")))
@@ -394,7 +429,7 @@
                                              (role-set role))
         cluster-pool (ClusterRouterPool. local-pool settings)
         router-props (.props cluster-pool props)]
-    (.actorOf ^ActorSystem system router-props)))
+    (actor-of system router-props name)))
 
 (defn spawn-cluster-group
   "Create a cluster-aware group router.
@@ -402,19 +437,21 @@
    Routes to actors at specified paths across cluster nodes.
 
    Arguments:
-   - system: ActorSystem
+   - system: ActorSystem, or an ActorRefFactory (e.g. (core/context) inside an
+     actor) to spawn the router as a child instead of top-level
    - paths: Collection of actor paths (relative to each node)
    - opts: Options map
      - :strategy - Routing strategy (default: :round-robin)
      - :role - Only route to nodes with this role (optional)
      - :allow-local - Allow routing to local node (default: true)
+     - :name - Name for the router actor, so it's addressable by path
 
    Example:
      (spawn-cluster-group sys [\"/user/worker\"]
        {:role \"compute\"})"
-  [system paths {:keys [strategy role allow-local]
-                 :or {strategy :round-robin
-                      allow-local true}}]
+  [^ActorRefFactory system paths {:keys [strategy role allow-local name]
+                                  :or {strategy :round-robin
+                                       allow-local true}}]
   (let [path-list (java.util.ArrayList. ^java.util.Collection paths)
         local-group (strategy->group strategy paths)
         settings (ClusterRouterGroupSettings. (int Integer/MAX_VALUE)
@@ -423,7 +460,7 @@
                                               (role-set role))
         cluster-group (ClusterRouterGroup. local-group settings)
         props (.props cluster-group)]
-    (.actorOf ^ActorSystem system props)))
+    (actor-of system props name)))
 
 ;; ---------------------------------------------------------------------------
 ;; Dynamic Routee Management

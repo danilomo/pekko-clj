@@ -312,6 +312,41 @@
             (throw (.getCause e)))))))
 
 ;; ---------------------------------------------------------------------------
+;; Tests: clause validation (H8) — typos and duplicate singleton clauses used
+;; to be silently discarded by parse-actor-clauses' group-by
+;; ---------------------------------------------------------------------------
+
+(deftest defactor-rejects-unknown-clause-head
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown clause"
+        (try
+          (macroexpand-1 '(pekko-clj.core/defactor typo-actor
+                            (init [_] nil)
+                            (on-stap nil)
+                            (handle :ping nil)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+(deftest defactor-rejects-duplicate-init-clause
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only one `init`"
+        (try
+          (macroexpand-1 '(pekko-clj.core/defactor dup-init-actor
+                            (init [_] {:a 1})
+                            (init [_] {:b 2})
+                            (handle :ping nil)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+(deftest defactor-rejects-on-error-with-wrong-binding-arity
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"2-element"
+        (try
+          (macroexpand-1 '(pekko-clj.core/defactor bad-on-error-actor
+                            (init [_] nil)
+                            (handle :ping nil)
+                            (on-error [ex] nil)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+;; ---------------------------------------------------------------------------
 ;; Tests: unhandled-message parity (B3) — no catch-all must not crash the actor
 ;; ---------------------------------------------------------------------------
 

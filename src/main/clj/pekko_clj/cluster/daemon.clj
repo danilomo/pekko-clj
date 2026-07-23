@@ -36,8 +36,6 @@
            [java.util Optional]
            [java.util.function IntFunction]))
 
-(set! *warn-on-reflection* true)
-
 (defn- ->duration
   ^Duration [d]
   (if (instance? Duration d) d (Duration/ofMillis (long d))))
@@ -95,5 +93,3 @@
      (.init daemon Object name (int n) behaviors cfg
             (Optional/ofNullable stop-message))
      nil)))
-
-(set! *warn-on-reflection* false)

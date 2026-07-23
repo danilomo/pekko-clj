@@ -6,7 +6,8 @@
            [pekko_clj.actor CljActor BecomeResult]
            [com.typesafe.config Config]
            [java.time Duration]
-           [java.util.concurrent TimeUnit ExecutionException TimeoutException CompletableFuture]))
+           [java.util.concurrent TimeUnit ExecutionException TimeoutException
+            CancellationException CompletableFuture]))
 
 (def ^{:dynamic true :tag CljActor} *current-actor*
   "Bound to the current CljActor instance during message handling.
@@ -79,16 +80,28 @@
   (^Props [actor-def] (make-props actor-def nil))
   (^Props [actor-def args] (make-props actor-def args)))
 
+(defn- actor-of
+  "actorOf via the (Props) or (Props, String) overload, depending on whether
+   name is given."
+  ^ActorRef [^ActorRefFactory factory ^Props props name]
+  (if name
+    (.actorOf factory props ^String name)
+    (.actorOf factory props)))
+
 (defn spawn
-  "Spawn a new actor.
+  "Spawn a new actor. An optional trailing opts map supports {:name \"child-name\"}
+   to give the actor a stable path (e.g. \"/user/child-name\"), which is what lets
+   actor-selection and group routers address it directly.
 
    Inside actor context:
      (spawn actor-def)
      (spawn actor-def args)
+     (spawn actor-def args opts)
 
    Top-level:
      (spawn system actor-def)
-     (spawn system actor-def args)"
+     (spawn system actor-def args)
+     (spawn system actor-def args opts)"
   ([actor-def]
    (spawn actor-def nil))
   ([first-arg second-arg]
@@ -96,17 +109,24 @@
      ;; (spawn system actor-def) — top-level, no args
      (spawn first-arg second-arg nil)
      ;; (spawn actor-def args) — inside actor context
-     (let [props (make-props first-arg second-arg)]
-       (.actorOf ^ActorContext (.getContext *current-actor*) props))))
-  ([^ActorSystem system actor-def args]
-   (.actorOf system (make-props actor-def args))))
+     (actor-of (.getContext *current-actor*) (make-props first-arg second-arg) nil)))
+  ([first-arg second-arg third-arg]
+   (if (instance? ActorSystem first-arg)
+     ;; (spawn system actor-def args) — top-level
+     (actor-of first-arg (make-props second-arg third-arg) nil)
+     ;; (spawn actor-def args opts) — inside actor context, optionally named
+     (actor-of (.getContext *current-actor*) (make-props first-arg second-arg) (:name third-arg))))
+  ([^ActorSystem system actor-def args opts]
+   (actor-of system (make-props actor-def args) (:name opts))))
 
 (defn spawn-props
   "Spawn an actor from a raw Pekko `Props` (e.g. one from `actor-props` decorated
    with `.withMailbox`/`.withDispatcher`). With one argument, spawns a child of the
-   current actor; otherwise pass an ActorSystem or ActorContext."
-  ([^Props props] (.actorOf (context) props))
-  ([^ActorRefFactory factory ^Props props] (.actorOf factory props)))
+   current actor; otherwise pass an ActorSystem or ActorContext. An optional
+   trailing opts map supports {:name \"child-name\"}."
+  ([^Props props] (actor-of (context) props nil))
+  ([^ActorRefFactory factory ^Props props] (actor-of factory props nil))
+  ([^ActorRefFactory factory ^Props props opts] (actor-of factory props (:name opts))))
 
 (def ^:dynamic *timeout* 30000)
 
@@ -129,7 +149,9 @@
    completing exceptionally with anything other than an AskTimeoutException — e.g.
    a Status/Failure reply) is rethrown unwrapped, so callers see the real error
    instead of a nil that looks like a timeout. A timeout (no reply within the
-   window → AskTimeoutException, or the block guard elapsing) returns nil."
+   window → AskTimeoutException, or the block guard elapsing) returns nil, and so
+   does a cancelled future (CancellationException) — there's no reply to return
+   either way, so it's treated the same as a timeout rather than escaping raw."
   [target msg timeout]
   (try
     ;; The ask has its own timeout, so it always completes; the +1000 block guard
@@ -140,7 +162,8 @@
         (if (instance? AskTimeoutException cause)
           nil
           (throw cause))))
-    (catch TimeoutException _ nil)))
+    (catch TimeoutException _ nil)
+    (catch CancellationException _ nil)))
 
 (defn <!
   "Blocking ask: send msg and block for the reply, returning it. BLOCKS the calling
@@ -242,6 +265,34 @@
   (or (= pattern :else)
       (symbol? pattern)))
 
+(def ^:private actor-clause-heads
+  '#{init handle on-stop on-restart supervision on-error})
+
+(def ^:private actor-singleton-clause-heads
+  "Clauses that may appear at most once; handle is the only clause allowed to
+   repeat, so it's excluded here."
+  '#{init on-stop on-restart supervision on-error})
+
+(defn- validate-actor-clauses
+  "Throw at macro-expansion for common defactor authoring mistakes that
+   `parse-actor-clauses`'s `group-by` would otherwise silently swallow: an
+   unknown clause head (a typo like `(on-stap ...)` or `(handel ...)`), or a
+   duplicate of a clause that may only appear once."
+  [name body]
+  (doseq [clause body]
+    (let [head (first clause)]
+      (when-not (contains? actor-clause-heads head)
+        (throw (ex-info (str "defactor " name ": unknown clause `" (pr-str clause)
+                             "` — expected one of init, handle, on-stop, on-restart, "
+                             "supervision, on-error")
+                        {:clause head})))))
+  (let [grouped (group-by first body)]
+    (doseq [head actor-singleton-clause-heads]
+      (let [n (count (get grouped head))]
+        (when (> n 1)
+          (throw (ex-info (str "defactor " name ": only one `" head "` clause is allowed, found " n)
+                          {:clause head :count n})))))))
+
 (defn- parse-actor-clauses [body]
   (let [clauses (group-by first body)]
     {:init        (first (get clauses 'init))
@@ -287,6 +338,7 @@
   (let [;; optional docstring
         docstring (when (string? (first body)) (first body))
         clauses   (if docstring (rest body) body)
+        _         (validate-actor-clauses name clauses)
         parsed    (parse-actor-clauses clauses)
 
         ;; destructure init clause: (init [args] body...)
@@ -355,6 +407,11 @@
       (throw (ex-info (str "defactor " name ": `state` is a reserved binding (the "
                            "current state) — rename the on-restart binding")
                       {:clause 'on-restart :binding 'state})))
+    (when (and on-error-clause
+               (not (and (vector? on-error-params) (= 2 (count on-error-params)))))
+      (throw (ex-info (str "defactor " name ": (on-error [ex msg] ...) needs a 2-element "
+                           "binding vector, got " (pr-str on-error-params))
+                      {:clause 'on-error :binding on-error-params})))
 
     `(def ~(if docstring (vary-meta name assoc :doc docstring) name)
        (let [receive-fn#
@@ -532,6 +589,3 @@
   []
   (.clearStash *current-actor*)
   nil)
-
-;; Reset so the flag doesn't leak into namespaces compiled after this one.
-(set! *warn-on-reflection* false)

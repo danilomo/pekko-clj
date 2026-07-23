@@ -14,6 +14,8 @@
 | `ask` | Ask via envelope | ✅ Complete |
 | `get-shard-region` | `shardRegion(typeName)` | ✅ Complete |
 | `shard-region-state` | `GetShardRegionState` | ✅ Complete |
+| `state->map` | `CurrentShardRegionState` → Clojure map | ✅ Complete |
+| `graceful-shutdown!` | `ShardRegion.gracefulShutdownInstance` | ✅ Complete |
 | `entity-message` | Envelope (plain map, `::entity-id`/`::message`) | ✅ Complete |
 
 ### Implemented Options
@@ -29,6 +31,7 @@
 | `:remember-entities-store` | `remember-entities-store` config | ✅ |
 | `:journal-plugin-id` / `:snapshot-plugin-id` | `withJournalPluginId` / `withSnapshotPluginId` | ✅ |
 | `:stop-message` | `start(…, allocationStrategy, handOffStopMessage)` | ✅ |
+| `:args` | Shared init args for classic entities | ✅ |
 
 ---
 
@@ -340,6 +343,8 @@ dependency; nothing user-facing becomes typed.
 | Advanced passivation | ✅ Implemented | `passivation-settings`, `start` `:passivation` |
 | Remember-entities store | ✅ Implemented | `:remember-entities-store`, `sharding-settings` |
 | Hand-off stop message | ✅ Implemented | `start` `:stop-message` |
+| Persistent entities | ✅ Implemented | `start` takes a `defactor-persistent` def; id/init get the entity id |
+| Region graceful shutdown | ✅ Implemented | `graceful-shutdown!` |
 | Sharded daemon process | ✅ Implemented | `pekko-clj.cluster.daemon/start` (typed shim) |
 | External allocation | ❌ Not implemented | Kafka co-location use case |
 | Custom allocation | ❌ Not implemented | Advanced use case |

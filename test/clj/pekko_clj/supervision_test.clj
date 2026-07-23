@@ -2,8 +2,9 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
             [pekko-clj.supervision :as sup])
-  (:import [org.apache.pekko.actor SupervisorStrategy
+  (:import [org.apache.pekko.actor SupervisorStrategy SupervisorStrategy$Directive
             OneForOneStrategy AllForOneStrategy]
+           [pekko_clj.actor CljSupervisorStrategy]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -231,3 +232,12 @@
 
 (deftest escalate-decider-returns-escalate
   (is (= :escalate (sup/escalate-decider (Exception. "test")))))
+
+(deftest to-directive-unknown-result-throws
+  ;; A decider must return :resume/:restart/:stop/:escalate; anything else used
+  ;; to silently escalate. Direct-call the translation to avoid an
+  ;; actor-crash integration test.
+  (is (instance? SupervisorStrategy$Directive
+                 (CljSupervisorStrategy/toDirective :restart)))
+  (is (thrown? IllegalArgumentException
+        (CljSupervisorStrategy/toDirective :bogus-directive))))

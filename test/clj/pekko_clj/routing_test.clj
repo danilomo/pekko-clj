@@ -101,6 +101,14 @@
     (is (eventually (= 3 (count @process-log))))
     (is (every? #(= :hello (:data %)) @process-log))))
 
+(deftest pool-unknown-strategy-throws
+  (is (thrown? IllegalArgumentException
+        (routing/spawn-pool *system* echo-worker 3 {:strategy :round-robbin}))))
+
+(deftest group-unknown-strategy-throws
+  (is (thrown? IllegalArgumentException
+        (routing/spawn-group *system* ["/user/w1"] {:strategy :round-robbin}))))
+
 (deftest pool-smallest-mailbox-strategy
   (let [pool (routing/spawn-pool *system* echo-worker 3 {:strategy :smallest-mailbox})]
     ;; Should work without error
@@ -147,6 +155,37 @@
     ;; All three workers received it
     (is (eventually (= 3 (count @process-log))))
     (is (= #{1 2 3} (set (map :id @process-log))))))
+
+(deftest named-workers-enable-known-group-paths
+  ;; H9: spawn-group's own docstring shows literal "/user/w1"-style paths, which
+  ;; used to be unreachable — spawn had no way to name an actor. Named spawn
+  ;; makes the documented pattern actually work: no need to spawn first and
+  ;; read back .path, the paths are known upfront.
+  (reset! process-log [])
+  (core/spawn *system* logging-worker {:id 1} {:name "h9-w1"})
+  (core/spawn *system* logging-worker {:id 2} {:name "h9-w2"})
+  (let [group (routing/spawn-group *system* ["/user/h9-w1" "/user/h9-w2"]
+                                   {:strategy :broadcast})]
+    (core/! group [:process :known-paths])
+    (is (eventually (= 2 (count @process-log))))
+    (is (= #{1 2} (set (map :id @process-log))))))
+
+(deftest spawn-pool-as-child-of-actor-context
+  ;; H9: routing/spawn-* now accept an ActorRefFactory (an ActorContext), not
+  ;; just an ActorSystem, so a router can be a child instead of top-level.
+  (let [spawner-handler
+        (fn [this msg]
+          (binding [core/*current-actor* this]
+            (case msg
+              :spawn-pool
+              (let [pool (routing/spawn-pool (core/context) echo-worker 3)]
+                (.reply this pool)
+                nil)
+              nil)))
+        parent (core/new-actor *system* spawner-handler nil)
+        pool (await-ask parent :spawn-pool)]
+    (is (instance? ActorRef pool))
+    (is (= :pong (await-ask pool :ping)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Broadcast helper

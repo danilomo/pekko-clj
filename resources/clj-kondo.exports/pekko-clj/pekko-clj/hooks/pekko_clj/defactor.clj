@@ -109,13 +109,16 @@
         (scoped-body '[state] [] (cons arg1 more)))
 
       (on-stop on-restart)
-      ;; (on-restart [reason] ...) has an optional binding vector.
+      ;; (on-restart [reason] ...) has an optional binding vector. These bodies see
+      ;; the macro's own anaphors — `state` in defactor, `this` and `state` in
+      ;; defactor-persistent — so scope whichever set the caller passed.
       (if (binding-vector? arg1)
         (api/list-node
-         (list* (api/token-node 'fn) arg1 [(scoped-body '[state] [] more)]))
-        (scoped-body '[state] [] (cons arg1 more)))
+         (list* (api/token-node 'fn) arg1 [(scoped-body anaphors [] more)]))
+        (scoped-body anaphors [] (cons arg1 more)))
 
-      ;; supervision, snapshot-every, delete-events-on-snapshot, unknown clauses
+      ;; supervision, snapshot-every, delete-events-on-snapshot, recovery,
+      ;; journal-plugin-id, snapshot-plugin-id, unknown clauses
       (api/list-node (list* (api/token-node 'do) (cons arg1 more))))))
 
 (defn- rewrite
@@ -127,7 +130,8 @@
         body      (if docstring (rest body) body)
         clause-heads #{'init 'handle 'command 'event 'on-stop 'on-restart
                        'supervision 'on-error 'tagger 'snapshot-every
-                       'delete-events-on-snapshot 'on-recovery-complete}
+                       'delete-events-on-snapshot 'on-recovery-complete
+                       'recovery 'journal-plugin-id 'snapshot-plugin-id}
         {clauses true others false} (group-by #(clause? clause-heads %) body)]
     {:node
      (api/list-node

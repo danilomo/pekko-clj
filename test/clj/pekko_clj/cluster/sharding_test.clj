@@ -3,6 +3,7 @@
             [pekko-clj.core :as core]
             [pekko-clj.cluster :as cluster]
             [pekko-clj.cluster.sharding :as sharding]
+            [pekko-clj.persistence :as persistence]
             [pekko-clj.serialization :as serialization]
             [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.cluster.sharding ClusterShardingSettings
@@ -413,5 +414,176 @@
         (is (= {:id "e-2" :count 7}
                (await-result (sharding/ask region "e-2" [:get] 10000)))
             "entities stay isolated across the serialized envelope"))
+      (finally
+        (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Persistent sharded entities (N10)
+;; ---------------------------------------------------------------------------
+
+;; The canonical Pekko sharding pattern: one event-sourced aggregate per entity
+;; id, recovered from the journal whenever the entity is recreated. Both the
+;; :persistence-id function and `init` receive the *entity id* — the shared Props
+;; carries no per-entity args.
+;; Counts how many times each persistence id has finished recovery, so a test can
+;; tell "the entity was recreated and replayed its journal" apart from "the entity
+;; was never stopped and still had the state in memory".
+(def recoveries (atom {}))
+
+(persistence/defactor-persistent account-entity
+  "Event-sourced account, sharded by account id."
+  :persistence-id (fn [id] (str "account-" id))
+
+  (init [id] {:id id :balance 0 :history []})
+
+  (on-recovery-complete [this]
+    (swap! recoveries update
+           (.persistenceId ^pekko_clj.actor.CljPersistentActor this) (fnil inc 0)))
+
+  (command [:deposit n]
+    (persistence/persist [:deposited n]))
+  (command [:withdraw n]
+    (persistence/persist [:withdrawn n]))
+  (command [:deposit-twice n]
+    (persistence/persist-all [[:deposited n] [:deposited n]]))
+  (command :get
+    (persistence/reply {:id (:id state) :balance (:balance state)})
+    nil)
+  (command :get-persistence-id
+    (persistence/reply (.persistenceId ^pekko_clj.actor.CljPersistentActor this))
+    nil)
+  ;; Note the persistence/* context helpers: core/self and core/context read
+  ;; core/*current-actor*, which is a CljActor and is not bound here.
+  (command :passivate
+    (sharding/passivate (persistence/context) :stop-now)
+    (persistence/reply :passivating)
+    nil)
+  (command :stop-now
+    (persistence/stop (persistence/self))
+    nil)
+
+  (event [:deposited n] (-> state
+                            (update :balance + n)
+                            (update :history conj [:deposited n])))
+  (event [:withdrawn n] (-> state
+                            (update :balance - n)
+                            (update :history conj [:withdrawn n]))))
+
+(deftest persistent-entity-recovers-after-passivation-test
+  (let [sys (ts/create-cluster-system "sharded-persistent-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (reset! recoveries {})
+      (let [region (sharding/start sys account-entity {:type-name "Account"
+                                                       :num-shards 10})]
+        ;; init got the entity id, not nil args
+        (sharding/tell region "acct-1" [:deposit 100])
+        (sharding/tell region "acct-1" [:withdraw 30])
+        (is (eventually (= {:id "acct-1" :balance 70}
+                           (await-result (sharding/ask region "acct-1" :get)))))
+        ;; the persistence id is derived from the entity id
+        (is (= "account-acct-1" (await-result (sharding/ask region "acct-1" :get-persistence-id))))
+        (is (= 1 (get @recoveries "account-acct-1")) "recovered once, on creation")
+        ;; passivate: the entity actor stops, its journal does not. Ask rather
+        ;; than tell — a reply proves the command ran to completion, so a second
+        ;; recovery below means "passivated and recreated", not "crashed and
+        ;; restarted" (which would replay the journal just as convincingly).
+        (is (= :passivating (await-result (sharding/ask region "acct-1" :passivate))))
+        ;; the next message recreates it and it replays its events
+        (is (eventually (= {:id "acct-1" :balance 70}
+                           (await-result (sharding/ask region "acct-1" :get))))
+            "state came back from the journal, not from a fresh init")
+        (is (eventually (= 2 (get @recoveries "account-acct-1")))
+            "a second recovery ran — the entity really was stopped and replayed")
+        ;; and it keeps accumulating on top of the recovered state
+        (sharding/tell region "acct-1" [:deposit 5])
+        (is (eventually (= {:id "acct-1" :balance 75}
+                           (await-result (sharding/ask region "acct-1" :get))))))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest persistent-entities-isolate-state-by-id-test
+  (let [sys (ts/create-cluster-system "sharded-persistent-isolation-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys account-entity {:type-name "IsolatedAccount"
+                                                       :num-shards 10})]
+        (sharding/tell region "a" [:deposit 10])
+        (sharding/tell region "b" [:deposit 7])
+        (sharding/tell region "b" [:deposit-twice 1])
+        (is (eventually (= {:id "a" :balance 10}
+                           (await-result (sharding/ask region "a" :get)))))
+        (is (eventually (= {:id "b" :balance 9}
+                           (await-result (sharding/ask region "b" :get))))
+            "persist-all inside a sharded entity applies both events")
+        (is (= "account-b" (await-result (sharding/ask region "b" :get-persistence-id)))))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest persistent-entity-requires-a-persistence-id-test
+  ;; Without :persistence-id there is nothing to derive an entity's journal from;
+  ;; fail at start rather than when the first entity is created on some node.
+  (let [bad {:type :persistent-actor :entity-props {:command-handler identity}}]
+    (is (thrown-with-msg? IllegalArgumentException #":persistence-id"
+          (sharding/start nil bad {:type-name "Bad"}))))
+  ;; :args belongs to classic entities — a persistent one gets the entity id.
+  (is (thrown-with-msg? IllegalArgumentException #":args does not apply"
+        (sharding/start nil account-entity {:type-name "Bad" :args {:x 1}}))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: :args for classic entities, region state, graceful shutdown (N10)
+;; ---------------------------------------------------------------------------
+
+(core/defactor configured-entity
+  "Classic entity whose init reads shared args passed at region start."
+  (init [args] {:greeting (:greeting args) :n 0})
+  (handle [:get] (core/reply {:id (sharding/entity-id) :greeting (:greeting state)})))
+
+(deftest start-args-reach-a-classic-entity-init-test
+  (let [sys (ts/create-cluster-system "sharding-args-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys configured-entity
+                                   {:type-name "Configured"
+                                    :num-shards 10
+                                    :args {:greeting "hello"}})]
+        (is (eventually (= {:id "c-1" :greeting "hello"}
+                           (await-result (sharding/ask region "c-1" [:get])))))
+        (is (= {:id "c-2" :greeting "hello"}
+               (await-result (sharding/ask region "c-2" [:get])))
+            "every entity of the type shares the args"))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest shard-region-state->map-test
+  (let [sys (ts/create-cluster-system "region-state-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys counter-entity {:type-name "StateEntity"
+                                                       :num-shards 10})]
+        (sharding/tell region "s-1" [:inc])
+        (sharding/tell region "s-2" [:inc])
+        (is (eventually (= 1 (await-result (sharding/ask region "s-1" [:get])))))
+        (let [m (ts/poll-until
+                 #(let [m (sharding/state->map (await-result (sharding/shard-region-state region)))]
+                    (when (= #{"s-1" "s-2"} (reduce into #{} (vals (:shards m)))) m)))]
+          (is (some? m) "both entities show up in the region state")
+          (is (set? (:failed m)))
+          (is (every? string? (keys (:shards m))) "shard ids key the map")))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest graceful-shutdown-stops-the-region-test
+  (let [sys (ts/create-cluster-system "graceful-shutdown-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys counter-entity {:type-name "Draining"
+                                                       :num-shards 10})]
+        (sharding/tell region "g-1" [:inc])
+        (is (eventually (= 1 (await-result (sharding/ask region "g-1" [:get])))))
+        ;; Single node: there is nowhere to hand off to, so the shards stop and
+        ;; the region terminates.
+        (sharding/graceful-shutdown! region)
+        (is (ts/stopped-within? sys region 15000) "the region actor terminates"))
       (finally
         (ts/terminate-system sys)))))

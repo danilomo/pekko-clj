@@ -177,6 +177,16 @@
                               nil)]
     (is (nil? (core/<! actor :go 300)))))
 
+(deftest blocking-ask-cancelled-future-returns-nil
+  ;; H12: a cancelled future surfaces as CancellationException from .get, not
+  ;; ExecutionException/TimeoutException — treated the same as a timeout (nil)
+  ;; since there's no reply to return either way, rather than escaping raw.
+  (let [actor (core/new-actor *system* (fn [_ _] nil) nil) ; never replies
+        cancelled-future (doto (java.util.concurrent.CompletableFuture.)
+                           (.cancel true))]
+    (with-redefs [core/<?> (fn [& _] cancelled-future)]
+      (is (nil? (core/<! actor :go 300))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: become
 ;; ---------------------------------------------------------------------------
@@ -310,6 +320,36 @@
         child        (await-ask parent-actor :spawn-child)]
     (is (instance? ActorRef child))
     (is (= :echo (await-ask child :echo)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: named actors (H9) — spawn's/spawn-props' trailing opts {:name ...}
+;; ---------------------------------------------------------------------------
+
+(deftest spawn-with-name-resolves-via-actor-selection
+  (let [actor (core/spawn *system* echo-actor-def nil {:name "h9-named-top"})
+        sel (core/actor-selection *system* "/user/h9-named-top")]
+    (is (= actor @(core/identify sel 3000)))
+    (is (= :hello (await-ask actor :hello)))))
+
+(deftest spawn-with-name-inside-context-resolves-as-child
+  (let [spawner-handler
+        (fn [this msg]
+          (binding [core/*current-actor* this]
+            (case msg
+              :spawn-child (let [child (core/spawn echo-actor-def nil {:name "h9-named-child"})]
+                             (.reply this child)
+                             nil)
+              nil)))
+        parent-actor (core/new-actor *system* spawner-handler nil)
+        child (await-ask parent-actor :spawn-child)
+        sel (core/actor-selection *system* (str (.path ^ActorRef parent-actor) "/h9-named-child"))]
+    (is (= child @(core/identify sel 3000)))))
+
+(deftest spawn-props-with-name-resolves-via-actor-selection
+  (let [props (core/actor-props echo-actor-def)
+        actor (core/spawn-props *system* props {:name "h9-named-props"})
+        sel (core/actor-selection *system* "/user/h9-named-props")]
+    (is (= actor @(core/identify sel 3000)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: DX polish (H5) — context, stop, poison-pill, graceful-stop,

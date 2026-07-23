@@ -28,7 +28,9 @@
   (:import [org.apache.pekko Done]
            [org.apache.pekko.actor ActorSystem ActorRef AddressFromURIString
             CoordinatedShutdown CoordinatedShutdown$Reason]
-           [org.apache.pekko.cluster Cluster Member ClusterEvent$ClusterDomainEvent
+           [org.apache.pekko.cluster Cluster Member ClusterEvent
+            ClusterEvent$ClusterDomainEvent ClusterEvent$MemberEvent
+            ClusterEvent$ReachabilityEvent
             ClusterEvent$MemberUp ClusterEvent$MemberRemoved
             ClusterEvent$MemberExited ClusterEvent$MemberDowned
             ClusterEvent$MemberWeaklyUp ClusterEvent$MemberLeft
@@ -319,6 +321,8 @@
    :status (keyword (str/lower-case (str (.status m))))
    :roles (set (seq (.getRoles m)))
    :unique-address (.uniqueAddress m)
+   :up-number (.upNumber m)
+   ;; kept for back-compat; prefer :up-number
    :upNumber (.upNumber m)})
 
 (defn members
@@ -423,7 +427,7 @@
     (instance? ClusterEvent$MemberRemoved event)
     {:type :member-removed
      :member (member->map (.member ^ClusterEvent$MemberRemoved event))
-     :previous-status (keyword (str (.previousStatus ^ClusterEvent$MemberRemoved event)))}
+     :previous-status (keyword (str/lower-case (str (.previousStatus ^ClusterEvent$MemberRemoved event))))}
 
     (instance? ClusterEvent$MemberDowned event)
     {:type :member-downed :member (member->map (.member ^ClusterEvent$MemberDowned event))}
@@ -465,6 +469,14 @@
       (handler (event->map msg)))
     state))
 
+(def ^:private cluster-event-filters
+  "Keyword -> event-class filter for cluster/subscribe's :events opt. :all
+   matches every ClusterDomainEvent (the default); the others narrow to a
+   Pekko marker interface so a handler isn't woken for events it ignores."
+  {:all ClusterEvent$ClusterDomainEvent
+   :member-events ClusterEvent$MemberEvent
+   :reachability-events ClusterEvent$ReachabilityEvent})
+
 (defn subscribe
   "Subscribe to cluster events.
 
@@ -472,6 +484,20 @@
    - :type - Event type keyword (:member-up, :member-removed, etc.)
    - :member - Member map (for member events)
    - :leader - Leader address (for leader events)
+   - :previous-status - Status the member held before removal, lower-cased
+     to match :status's convention (for :member-removed only)
+
+   The handler's first message(s) reflect the *current* cluster state as if it
+   had just happened — e.g. a :member-up for every already-Up member — rather
+   than a raw CurrentClusterState snapshot object (Pekko's
+   `initialStateAsEvents` subscription mode), so every message ever delivered
+   has the same, documented shape.
+
+   opts (optional):
+   - :events - Which events to receive: :all (default), :member-events (member
+     lifecycle only: joined/up/weakly-up/left/exited/downed/removed/
+     preparing-for-shutdown), or :reachability-events (unreachable/reachable
+     only)
 
    Returns the subscriber ActorRef (can be used to unsubscribe).
 
@@ -481,11 +507,17 @@
    - :unreachable, :reachable
    - :leader-changed, :role-leader-changed
    - :cluster-shutting-down"
-  [system handler]
-  (let [^ActorRef subscriber (core/spawn system cluster-event-subscriber {:handler handler})
-        ^"[Ljava.lang.Class;" event-classes (into-array Class [ClusterEvent$ClusterDomainEvent])]
-    (.subscribe (cluster system) subscriber event-classes)
-    subscriber))
+  ([system handler] (subscribe system handler {}))
+  ([system handler {:keys [events] :or {events :all}}]
+   (let [event-class (get cluster-event-filters events ::not-found)
+         _ (when (= ::not-found event-class)
+             (throw (IllegalArgumentException.
+                     (str "Unknown cluster/subscribe :events filter: " (pr-str events)
+                          ". Valid options: " (keys cluster-event-filters)))))
+         ^ActorRef subscriber (core/spawn system cluster-event-subscriber {:handler handler})
+         ^"[Ljava.lang.Class;" event-classes (into-array Class [event-class])]
+     (.subscribe (cluster system) subscriber (ClusterEvent/initialStateAsEvents) event-classes)
+     subscriber)))
 
 (defn unsubscribe
   "Unsubscribe an actor from cluster events."

@@ -41,7 +41,10 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- wrap-with-supervision
-  "Wrap actor Props with backoff supervision if configured."
+  "Wrap actor Props with backoff supervision if configured.
+
+   supervision nil/false means no supervision wrapper; otherwise its :strategy
+   must be :restart-with-backoff or :restart-with-stop — anything else throws."
   ^Props [^Props props supervision]
   (if supervision
     (let [{:keys [strategy min-backoff-ms max-backoff-ms random-factor]
@@ -67,8 +70,9 @@
                             (double random-factor))]
           (BackoffSupervisor/props backoff-opts))
 
-        ;; Default: no supervision wrapper
-        props))
+        (throw (IllegalArgumentException.
+                (str "Unknown supervision :strategy: " (pr-str strategy)
+                     ". Valid options: :restart-with-backoff, :restart-with-stop.")))))
     props))
 
 ;; ---------------------------------------------------------------------------

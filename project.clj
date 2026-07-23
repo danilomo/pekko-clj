@@ -25,10 +25,7 @@
                  [org.apache.pekko/pekko-http_3 "1.3.0"]
                  ;; TestKit — powers the pekko-clj.test companion namespace
                  [org.apache.pekko/pekko-testkit_3 "1.6.0"]
-                 [org.apache.pekko/pekko-stream-testkit_3 "1.6.0"]
-                 ;; LevelDB Java port for persistence tests
-                 [org.iq80.leveldb/leveldb "0.12"]]
-  :main ^:skip-aot pekko-clj.core
+                 [org.apache.pekko/pekko-stream-testkit_3 "1.6.0"]]
   :java-source-paths ["src/main/java"]
   :source-paths ["src/main/clj"]
 
@@ -115,8 +112,13 @@
                        :jvm-opts ["-Dclojure.compiler.direct-linking=true"]}
              ;; Test code does plenty of ad-hoc interop where reflection is
              ;; irrelevant; warning there would bury the run in noise and dilute
-             ;; the signal from src/.
+             ;; the signal from src/. LevelDB is a test-only journal/snapshot
+             ;; store (see test/resources/persistence-test.conf) — production
+             ;; users supply their own journal plugin (see README), so it has
+             ;; no place in the published jar's main :dependencies.
              :dev  {:resource-paths ["test/resources"]
+                    :dependencies [[org.iq80.leveldb/leveldb "0.12"]]
                     :global-vars {*warn-on-reflection* false}}
              :test {:resource-paths ["test/resources"]
+                    :dependencies [[org.iq80.leveldb/leveldb "0.12"]]
                     :global-vars {*warn-on-reflection* false}}})

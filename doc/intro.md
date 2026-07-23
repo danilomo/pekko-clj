@@ -116,7 +116,7 @@ pekko-clj provides three messaging patterns:
 ;; Tell (fire-and-forget)
 (! actor-ref :some-message)
 
-;; Ask (non-blocking, returns a Scala Future)
+;; Ask (non-blocking, returns a java.util.concurrent.CompletableFuture)
 (<?> actor-ref :get-value)
 
 ;; Ask (blocking, returns the value directly)

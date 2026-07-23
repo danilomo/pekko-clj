@@ -90,6 +90,20 @@
       ((:handler state) msg))
     state))
 
+;; ActorRefs of topic-subscriber actors subscribe spawned internally (passed a
+;; fn, not an ActorRef) — tracked so unsubscribe can also stop them: telling
+;; the mediator to Unsubscribe never stops the actor, so without this it runs
+;; forever.
+(defonce ^:private internal-subscribers (atom #{}))
+
+(defn- stop-if-internal!
+  "Poison-pill ref and forget it, if (and only if) it's in the internal-refs
+   registry — never touches a caller-supplied ActorRef."
+  [internal-refs ^ActorRef ref]
+  (when (contains? @internal-refs ref)
+    (swap! internal-refs disj ref)
+    (core/poison-pill ref)))
+
 ;; ---------------------------------------------------------------------------
 ;; Topic pub-sub
 ;; ---------------------------------------------------------------------------
@@ -105,8 +119,10 @@
    With `group`, the subscriber joins that group of the topic; a `publish` with
    :one-per-group true then delivers one copy per group (consumer-group semantics).
 
-   Requires an ActorSystem (a subscriber actor may need to be spawned). Returns the
-   subscriber ActorRef — pass it to `unsubscribe`."
+   Requires an ActorSystem (a subscriber actor may need to be spawned). Returns
+   the subscriber ActorRef — pass it to `unsubscribe`, which also stops it when
+   it's one this function spawned (a directly-passed ActorRef is left running;
+   the caller owns it)."
   ([^ActorSystem system topic subscriber-or-fn]
    (subscribe system topic nil subscriber-or-fn))
   ([^ActorSystem system topic group subscriber-or-fn]
@@ -117,14 +133,18 @@
                  (DistributedPubSubMediator$Subscribe. ^String topic ^ActorRef ref))]
        (core/! (mediator system) msg)
        ref)
-     (core/spawn system topic-subscriber {:mediator (mediator system)
-                                          :topic topic
-                                          :group group
-                                          :handler subscriber-or-fn}))))
+     (let [ref (core/spawn system topic-subscriber {:mediator (mediator system)
+                                                    :topic topic
+                                                    :group group
+                                                    :handler subscriber-or-fn})]
+       (swap! internal-subscribers conj ref)
+       ref))))
 
 (defn unsubscribe
   "Remove `subscriber-ref`'s subscription to `topic` (optionally within `group`).
-   `system-or-mediator` is an ActorSystem or a mediator ActorRef."
+   `system-or-mediator` is an ActorSystem or a mediator ActorRef. If
+   `subscriber-ref` is an internal actor `subscribe` spawned, it is also
+   stopped."
   ([system-or-mediator topic ^ActorRef subscriber-ref]
    (unsubscribe system-or-mediator topic nil subscriber-ref))
   ([system-or-mediator topic group ^ActorRef subscriber-ref]
@@ -132,6 +152,7 @@
            (if group
              (DistributedPubSubMediator$Unsubscribe. ^String topic ^String group subscriber-ref)
              (DistributedPubSubMediator$Unsubscribe. ^String topic subscriber-ref)))
+   (stop-if-internal! internal-subscribers subscriber-ref)
    nil))
 
 (defn publish

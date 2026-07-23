@@ -85,6 +85,49 @@
       (finally
         (ts/terminate-system sys)))))
 
+(deftest cluster-subscribe-initial-state-is-synthesized-as-events
+  ;; H12: subscribing to an already-Up cluster used to deliver a raw
+  ;; CurrentClusterState snapshot as the very *first* message, which
+  ;; event->map couldn't map ({:type :unknown, :event #<CurrentClusterState>}).
+  ;; initialStateAsEvents synthesizes a :member-up for each already-Up member
+  ;; instead, so the first message is a properly-typed event.
+  (let [sys (ts/create-cluster-system "subscribe-initial-state-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [events (atom [])
+            self-addr (.selfAddress (cluster/cluster sys))]
+        (cluster/subscribe sys (fn [event] (swap! events conj event)))
+        (is (eventually (seq @events)))
+        (is (= :member-up (:type (first @events))))
+        (is (= self-addr (:address (:member (first @events))))))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest cluster-subscribe-member-events-filter
+  ;; :member-events narrows the subscription to member-lifecycle events only.
+  (let [sys (ts/create-cluster-system "subscribe-member-filter-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [events (atom [])]
+        (cluster/subscribe sys (fn [event] (swap! events conj event))
+                           {:events :member-events})
+        (is (eventually (seq @events)))
+        (is (every? #(#{:member-joined :member-up :member-weakly-up :member-left
+                        :member-exited :member-removed :member-downed
+                        :member-preparing-for-shutdown}
+                      (:type %))
+                    @events)))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest cluster-subscribe-unknown-events-filter-throws
+  (let [sys (ts/create-cluster-system "subscribe-bad-filter-test")]
+    (try
+      (is (thrown? IllegalArgumentException
+            (cluster/subscribe sys (fn [_]) {:events :bogus-filter})))
+      (finally
+        (ts/terminate-system sys)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: create-system config + join (B5)
 ;; ---------------------------------------------------------------------------
@@ -331,7 +374,25 @@
           (let [member (first members)]
             (is (contains? member :address))
             (is (contains? member :status))
-            (is (contains? member :upNumber))))
+            (is (contains? member :upNumber))
+            (is (contains? member :up-number))
+            (is (= (:upNumber member) (:up-number member)))))
+        (finally
+          (ts/terminate-system sys))))))
+
+(deftest member-removed-event-previous-status-is-lower-cased
+  (testing "event->map's :previous-status matches :status's lower-case convention"
+    (let [sys (ts/create-cluster-system "removed-status-test")]
+      (try
+        (is (ts/wait-for-cluster-up sys))
+        (let [unique-address (.uniqueAddress (cluster/self-member sys))
+              removed-member (.removed org.apache.pekko.cluster.Member$/MODULE$ unique-address)
+              previous-status (.up org.apache.pekko.cluster.MemberStatus$/MODULE$)
+              event (org.apache.pekko.cluster.ClusterEvent$MemberRemoved. removed-member previous-status)
+              event->map (var-get (resolve 'pekko-clj.cluster/event->map))
+              event-map (event->map event)]
+          (is (= :member-removed (:type event-map)))
+          (is (= :up (:previous-status event-map))))
         (finally
           (ts/terminate-system sys))))))
 

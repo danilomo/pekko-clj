@@ -27,12 +27,25 @@ import java.util.Set;
  * - Snapshot support, with optional retention (keep-snapshots /
  *   delete-events-on-snapshot)
  * - Recovery
+ *
+ * <p>Two ways to supply the persistence id and initial state:
+ * <ul>
+ *   <li><b>Eager</b> — {@code :persistence-id} and {@code :state} are computed by the caller
+ *       (from the spawn args) and baked into the Props. This is what
+ *       {@code persistence/spawn} does.</li>
+ *   <li><b>Entity</b> — {@code :persistence-id-fn} (and optionally {@code :init-fn}) are
+ *       invoked with this actor's entity id at construction time. Cluster sharding creates
+ *       every entity of a type from one shared Props, so nothing per-entity can be baked in;
+ *       Pekko names each entity actor by its entity id, which is what these functions get.</li>
+ * </ul>
  */
-public class CljPersistentActor extends AbstractPersistentActor implements IDeref {
+public class CljPersistentActor extends AbstractPersistentActorWithTimers implements IDeref {
 
   private static final String NS = null;
   private static final Keyword STATE = RT.keyword(NS, "state");
   private static final Keyword PERSISTENCE_ID = RT.keyword(NS, "persistence-id");
+  private static final Keyword PERSISTENCE_ID_FN = RT.keyword(NS, "persistence-id-fn");
+  private static final Keyword INIT_FN = RT.keyword(NS, "init-fn");
   private static final Keyword COMMAND_HANDLER = RT.keyword(NS, "command-handler");
   private static final Keyword EVENT_HANDLER = RT.keyword(NS, "event-handler");
   private static final Keyword SNAPSHOT_EVERY = RT.keyword(NS, "snapshot-every");
@@ -41,6 +54,11 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
     RT.keyword(NS, "delete-events-on-snapshot");
   private static final Keyword TAGGER = RT.keyword(NS, "tagger");
   private static final Keyword ON_RECOVERY_COMPLETE = RT.keyword(NS, "on-recovery-complete");
+  private static final Keyword POST_STOP = RT.keyword(NS, "post-stop");
+  private static final Keyword SUPERVISOR_STRATEGY = RT.keyword(NS, "supervisor-strategy");
+  private static final Keyword JOURNAL_PLUGIN_ID = RT.keyword(NS, "journal-plugin-id");
+  private static final Keyword SNAPSHOT_PLUGIN_ID = RT.keyword(NS, "snapshot-plugin-id");
+  private static final Keyword RECOVERY = RT.keyword(NS, "recovery");
 
   private Object state;
   private final String persistenceId;
@@ -51,6 +69,11 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
   private final boolean deleteEventsOnSnapshot;
   private final IFn tagger;
   private final IFn onRecoveryComplete;
+  private final IFn postStop;
+  private final SupervisorStrategy supervisorStrategy;
+  private final String journalPluginId;
+  private final String snapshotPluginId;
+  private final Recovery recovery;
   private long eventsSinceSnapshot = 0;
   private boolean recovering = true;
   private LoggingAdapter log;
@@ -60,8 +83,22 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
   }
 
   public CljPersistentActor(ILookup props) {
-    this.state = props.valAt(STATE, null);
-    this.persistenceId = (String) props.valAt(PERSISTENCE_ID);
+    IFn persistenceIdFn = (IFn) props.valAt(PERSISTENCE_ID_FN, null);
+    if (persistenceIdFn != null) {
+      // Entity mode (cluster sharding). Every entity of a sharded type is created
+      // from the same Props, so neither the persistence id nor the initial state
+      // can be baked into it: both are derived from the entity id, which Pekko uses
+      // as the entity actor's path name. self() is already available here — the
+      // Actor trait initializes it before this constructor body runs.
+      Object entityId = getSelf().path().name();
+      Object id = persistenceIdFn.invoke(entityId);
+      this.persistenceId = id == null ? null : id.toString();
+      IFn initFn = (IFn) props.valAt(INIT_FN, null);
+      this.state = initFn != null ? initFn.invoke(entityId) : null;
+    } else {
+      this.state = props.valAt(STATE, null);
+      this.persistenceId = (String) props.valAt(PERSISTENCE_ID);
+    }
     this.commandHandler = (IFn) props.valAt(COMMAND_HANDLER);
     this.eventHandler = (IFn) props.valAt(EVENT_HANDLER);
     Object snapshotEveryVal = props.valAt(SNAPSHOT_EVERY, null);
@@ -71,6 +108,11 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
     this.deleteEventsOnSnapshot = RT.booleanCast(props.valAt(DELETE_EVENTS_ON_SNAPSHOT, false));
     this.tagger = (IFn) props.valAt(TAGGER, null);
     this.onRecoveryComplete = (IFn) props.valAt(ON_RECOVERY_COMPLETE, null);
+    this.postStop = (IFn) props.valAt(POST_STOP, null);
+    this.supervisorStrategy = (SupervisorStrategy) props.valAt(SUPERVISOR_STRATEGY, null);
+    this.journalPluginId = (String) props.valAt(JOURNAL_PLUGIN_ID, null);
+    this.snapshotPluginId = (String) props.valAt(SNAPSHOT_PLUGIN_ID, null);
+    this.recovery = (Recovery) props.valAt(RECOVERY, null);
 
     if (persistenceId == null) {
       throw new IllegalArgumentException("persistence-id is required");
@@ -83,9 +125,87 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Scala trait linearization, spelled out for javac
+  // ---------------------------------------------------------------------------
+  //
+  // AbstractPersistentActorWithTimers mixes in both Timers and Eventsourced, and both define
+  // aroundPreRestart / aroundPostStop / aroundReceive. Scala resolves that by linearization and
+  // emits the resolution as *synthetic bridge* methods on the class; javac ignores synthetic
+  // methods when deciding what a subclass inherits, so to it the two interface defaults are simply
+  // unrelated and the class does not compile ("inherits unrelated defaults").
+  //
+  // Eventsourced is mixed in last, so it is the outermost link: its implementation drives the
+  // recovery/persist state machine and then calls its own super, which the superclass wires to
+  // Timers, which in turn calls Actor's. Delegating to the Eventsourced static forwarders
+  // reproduces that chain exactly — verified against the bridge's own bytecode
+  // (`javap -c AbstractPersistentActorWithTimers`), which invokes Eventsourced.aroundReceive$.
+  //
+  // Do NOT delegate to Timers here: that enters the chain one link too low and skips Eventsourced
+  // entirely, so recovery never completes and no command ever persists. (Measured: every
+  // persistence test failed with the actor stuck in `recovering?` = true.) Do not "simplify" these
+  // to super.aroundX() either — that resolves to the synthetic bridge.
+
+  @Override
+  public void aroundPreRestart(Throwable reason, scala.Option<Object> message) {
+    Eventsourced.aroundPreRestart$(this, reason, message);
+  }
+
+  @Override
+  public void aroundPostStop() {
+    Eventsourced.aroundPostStop$(this);
+  }
+
+  @Override
+  public void aroundReceive(scala.PartialFunction<Object, scala.runtime.BoxedUnit> receive,
+                            Object msg) {
+    Eventsourced.aroundReceive$(this, receive, msg);
+  }
+
   @Override
   public String persistenceId() {
     return persistenceId;
+  }
+
+  /**
+   * Journal plugin for this actor only. Pekko reads {@code ""} as "use the plugin configured under
+   * {@code pekko.persistence.journal.plugin}", which is the default when no id is given.
+   */
+  @Override
+  public String journalPluginId() {
+    return journalPluginId == null ? "" : journalPluginId;
+  }
+
+  /** Snapshot-store plugin for this actor only. See {@link #journalPluginId()}. */
+  @Override
+  public String snapshotPluginId() {
+    return snapshotPluginId == null ? "" : snapshotPluginId;
+  }
+
+  /**
+   * Recovery strategy: which snapshot to start from, how far to replay, or {@code Recovery.none()}
+   * for an actor that only writes (commands-only, no replay on start).
+   */
+  @Override
+  public Recovery recovery() {
+    return recovery == null ? Recovery.create() : recovery;
+  }
+
+  @Override
+  public SupervisorStrategy supervisorStrategy() {
+    return supervisorStrategy != null ? supervisorStrategy : super.supervisorStrategy();
+  }
+
+  @Override
+  public void postStop() throws Exception {
+    // Runs on stop, and (via the default preRestart) on restart. Powers the
+    // defactor-persistent `on-stop` clause. There is no `on-restart` counterpart:
+    // a restarted persistent actor rebuilds its state by replaying the journal, so
+    // `on-recovery-complete` is the hook that fires once the state is valid again.
+    if (postStop != null) {
+      postStop.invoke(this);
+    }
+    super.postStop();
   }
 
   @Override
@@ -130,27 +250,49 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
                          persistenceId, msg.cause().getMessage()))
       .match(DeleteSnapshotsSuccess.class, msg -> {})
       .match(DeleteMessagesSuccess.class, msg -> {})
-      .matchAny(command -> {
-        // Call command handler: (fn [this command] ...) -> event, (persist-all ...)
-        // marker, or nil. No shape inspection: a returned value is a single event
-        // whatever its shape unless it is an explicit PersistAll marker, which
-        // removes the "vector of vectors" ambiguity of the old heuristic.
-        Object result = commandHandler.invoke(this, command);
-
-        if (result == null) {
-          // No event to persist.
-          return;
-        }
-
-        if (result instanceof PersistAll) {
-          // Multiple events (from persist-all) - one atomic journal write, applied in order.
-          persistAllEvents(((PersistAll) result).events);
-        } else {
-          // Any other value is a single event, whatever its shape.
-          persistEvent(result);
-        }
-      })
+      .matchAny(this::handleCommand)
       .build();
+  }
+
+  /**
+   * Run the command handler and carry out whatever it asked for.
+   *
+   * <p>Also the entry point for a deferred value, which is why it is factored out of {@link
+   * #createReceive()}: a {@link Defer} hands its value back here once the writes issued before it
+   * have completed.
+   */
+  private void handleCommand(Object command) {
+    // (fn [this command] ...) -> an event, a marker, or nil.
+    runOp(commandHandler.invoke(this, command));
+  }
+
+  /**
+   * Carry out one persist operation returned by a command handler.
+   *
+   * <p>No shape inspection: a returned value is a single event whatever its shape unless it is one
+   * of the explicit markers, which removes the "vector of vectors" ambiguity a heuristic would
+   * have. {@link PersistOps} nests, so operations compose in order.
+   */
+  private void runOp(Object op) {
+    if (op == null) {
+      // Nothing to persist.
+      return;
+    }
+    if (op instanceof PersistOps) {
+      for (ISeq s = ((PersistOps) op).ops; s != null; s = s.next()) {
+        runOp(s.first());
+      }
+    } else if (op instanceof PersistAll) {
+      // Multiple events (from persist-all) - one atomic journal write, applied in order.
+      persistAllEvents(((PersistAll) op).events);
+    } else if (op instanceof PersistAsync) {
+      persistAsyncEvents(((PersistAsync) op).events);
+    } else if (op instanceof Defer) {
+      deferValue(((Defer) op).value);
+    } else {
+      // Any other value is a single event, whatever its shape.
+      persistEvent(op);
+    }
   }
 
   private void persistEvent(Object event) {
@@ -175,6 +317,33 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
     }
     if (batch.isEmpty()) return;
     persistAll(batch, (Object e) -> handlePersistedEvent(e));
+  }
+
+  /**
+   * Persist a batch of events without stashing incoming commands.
+   *
+   * <p>{@code persistAllAsync} lets the actor keep processing commands while the write is in
+   * flight — higher throughput, at the cost of the event handler (and therefore the state) lagging
+   * behind the command that produced the event. Not atomic: unlike {@link
+   * #persistAllEvents(ISeq)} these are ordinary async writes.
+   */
+  private void persistAsyncEvents(ISeq events) {
+    List<Object> batch = new ArrayList<>();
+    for (ISeq s = events; s != null; s = s.next()) {
+      batch.add(withTags(s.first()));
+    }
+    if (batch.isEmpty()) return;
+    persistAllAsync(batch, (Object e) -> handlePersistedEvent(e));
+  }
+
+  /**
+   * Hand {@code value} back to the command handler once every persist issued before it has
+   * completed. The value is never written to the journal, so it does not survive a restart and
+   * never reaches the event handler; the sender is still in scope, which is what makes it the
+   * place to reply from.
+   */
+  private void deferValue(Object value) {
+    deferAsync(value, (Object v) -> handleCommand(v));
   }
 
   /**
@@ -283,6 +452,44 @@ public class CljPersistentActor extends AbstractPersistentActor implements IDere
 
   public boolean isRecovering() {
     return recovering;
+  }
+
+  // Timer methods (from the Timers trait) — same surface as CljActor's, so
+  // pekko-clj.core's timer functions work inside a persistent actor too.
+
+  public void startTimer(Object key, java.time.Duration interval, Object message) {
+    timers().startTimerAtFixedRate(key, message, interval);
+  }
+
+  public void startTimerWithInitialDelay(Object key, java.time.Duration initialDelay,
+                                         java.time.Duration interval, Object message) {
+    timers().startTimerAtFixedRate(key, message, initialDelay, interval);
+  }
+
+  public void startSingleTimer(Object key, java.time.Duration delay, Object message) {
+    timers().startSingleTimer(key, message, delay);
+  }
+
+  public void cancelTimer(Object key) {
+    timers().cancel(key);
+  }
+
+  public boolean isTimerActive(Object key) {
+    return timers().isTimerActive(key);
+  }
+
+  public void cancelAllTimers() {
+    timers().cancelAll();
+  }
+
+  // DeathWatch, mirroring CljActor's.
+
+  public void watch(ActorRef actorRef) {
+    getContext().watch(actorRef);
+  }
+
+  public void unwatch(ActorRef actorRef) {
+    getContext().unwatch(actorRef);
   }
 
   public long getLastSequenceNr() {

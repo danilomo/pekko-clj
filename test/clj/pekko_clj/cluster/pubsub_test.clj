@@ -100,6 +100,29 @@
         (is (not-any? #{:after} @received)))
       (finally (ts/terminate-system sys)))))
 
+(deftest unsubscribe-stops-internally-spawned-subscriber-test
+  ;; H12: subscribe passed a fn spawns an internal topic-subscriber actor;
+  ;; unsubscribe used to only tell the mediator to remove the registration,
+  ;; leaking the actor forever.
+  (let [sys (ts/create-cluster-system "pubsub-leak")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [sub (pubsub/subscribe sys "leaky-topic" (fn [_]))]
+        (is (nil? (pubsub/unsubscribe sys "leaky-topic" sub)))
+        (is (ts/stopped-within? sys sub)))
+      (finally (ts/terminate-system sys)))))
+
+(deftest unsubscribe-does-not-stop-a-caller-supplied-ref-test
+  (let [sys (ts/create-cluster-system "pubsub-no-leak")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [received (atom [])
+            worker (core/spawn sys collector {:sink received})
+            sub (pubsub/subscribe sys "own-ref-topic" worker)]
+        (is (nil? (pubsub/unsubscribe sys "own-ref-topic" sub)))
+        (is (not (ts/stopped-within? sys worker 500))))
+      (finally (ts/terminate-system sys)))))
+
 (deftest topic-groups-deliver-test
   (let [sys (ts/create-cluster-system "pubsub-groups")]
     (try

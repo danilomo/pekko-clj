@@ -1,7 +1,8 @@
 (ns pekko-clj.http.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [pekko-clj.http.core :as http])
-  (:import [org.apache.pekko.http.javadsl.model HttpRequest]))
+  (:import [org.apache.pekko.http.javadsl.model HttpRequest]
+           [org.apache.pekko.http.javadsl.model.headers RawHeader]))
 
 ;; ---------------------------------------------------------------------------
 ;; Path Matching Tests
@@ -49,6 +50,18 @@
   (testing "Query parameter extraction"
     (let [req (HttpRequest/GET "http://example.com/users?page=1&limit=10")]
       (is (= {"page" "1" "limit" "10"} (http/request-query-params req))))))
+
+(deftest request-query-params-multi-valued-test
+  (testing "A repeated query param name keeps the last value, per the docstring"
+    (let [req (HttpRequest/GET "http://example.com/search?tag=a&tag=b")]
+      (is (= {"tag" "b"} (http/request-query-params req))))))
+
+(deftest request-headers-multi-valued-test
+  (testing "A repeated header name keeps the last value, per the docstring"
+    (let [headers [(RawHeader/create "X-Tag" "a") (RawHeader/create "X-Tag" "b")]
+          req (.withHeaders (HttpRequest/GET "http://example.com/users")
+                            (java.util.ArrayList. ^java.util.Collection headers))]
+      (is (= "b" (get (http/request-headers req) "x-tag"))))))
 
 (deftest path-segments-test
   (testing "Path segment splitting"

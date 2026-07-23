@@ -38,13 +38,14 @@
            (smap inc)
            (sfilter even?)
            (run-foreach println mat)))"
-  (:refer-clojure :exclude [concat drop drop-while mapcat take take-while merge distinct partition group-by])
+  (:refer-clojure :exclude [concat dedupe drop drop-while interleave mapcat take take-while merge distinct partition group-by])
   (:import [org.apache.pekko.stream Materializer OverflowStrategy
             ActorAttributes Attributes CompletionStrategy KillSwitch
-            KillSwitches RestartSettings SharedKillSwitch Supervision]
+            KillSwitches RestartSettings SharedKillSwitch Supervision
+            SystemMaterializer]
            [org.apache.pekko.stream.javadsl Source Flow Sink Keep RunnableGraph
             AsPublisher
-            Broadcast Balance Merge Partition SubSource
+            Broadcast Balance Merge Partition SubSource SubFlow
             RestartSource RestartFlow RestartSink RetryFlow]
            [org.apache.pekko.actor ActorSystem ActorRef]
            [org.apache.pekko.japi Pair]
@@ -90,8 +91,8 @@
   (if (instance? Duration d) d (Duration/ofMillis (long d))))
 
 (defn- ->overflow-strategy
-  "Coerce an overflow-strategy keyword to an OverflowStrategy, falling back to
-   `default` (itself a keyword) when the strategy is nil or unrecognized.
+  "Coerce an overflow-strategy keyword to an OverflowStrategy. `nil` selects
+   `default` (itself a keyword); any other unrecognized keyword throws.
 
    Note: not every operator accepts every strategy — `Source/actorRef` rejects
    :backpressure, for instance. Pekko validates at materialization."
@@ -103,17 +104,48 @@
     :drop-new     (OverflowStrategy/dropNew)
     :fail         (OverflowStrategy/fail)
     :backpressure (OverflowStrategy/backpressure)
-    (->overflow-strategy default nil)))
+    nil (->overflow-strategy default nil)
+    (throw (IllegalArgumentException.
+            (str "Unknown overflow strategy: " (pr-str strategy)
+                 ". Valid options: :drop-head, :drop-tail, :drop-buffer, "
+                 ":drop-new, :fail, :backpressure (or nil for the default).")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Materializer
 ;; ---------------------------------------------------------------------------
 
+(defn system-materializer
+  "The ActorSystem's own Materializer — one per system, created on first use and
+   shut down with the system.
+
+   This is the one to use. `materializer` creates a *fresh* materializer every
+   call, and each one owns actors that live until it is explicitly shut down, so
+   calling it per stream leaks.
+
+   Every `run-*` function also accepts an ActorSystem directly in place of a
+   Materializer, which resolves to this."
+  ^Materializer [^ActorSystem system]
+  (.materializer (SystemMaterializer/get system)))
+
 (defn materializer
-  "Create a Materializer from an ActorSystem.
-   The materializer is used to run streams."
-  [^ActorSystem system]
+  "Create a **new** Materializer from an ActorSystem.
+
+   Prefer `system-materializer` (or just pass the ActorSystem to the `run-*`
+   functions): each materializer created here owns actors that are only released
+   when it is shut down, so one per stream leaks them. Use this only when a stream
+   needs materializer settings or a lifetime of its own."
+  ^Materializer [^ActorSystem system]
   (Materializer/createMaterializer system))
+
+(defn- ->materializer
+  "Coerce an ActorSystem to its Materializer; pass a Materializer through.
+
+   Lets every `run-*` take either, so the common case never has to name a
+   materializer at all."
+  ^Materializer [m]
+  (if (instance? ActorSystem m)
+    (system-materializer m)
+    m))
 
 ;; ---------------------------------------------------------------------------
 ;; Sources
@@ -166,11 +198,40 @@
 
 (defn source-lazily
   "Create a Source that is lazily created when the stream is run.
-   f is a no-arg function that returns a Source."
+   f is a no-arg function that returns a Source.
+
+   Built on `Source.lazySource`; `Source.lazily` carries a Deprecated attribute in
+   Pekko 1.6 (checked with javap -v) and is only an alias for it."
   [f]
-  (Source/lazily
+  (Source/lazySource
    (reify org.apache.pekko.japi.function.Creator
      (create [_] (f)))))
+
+(defn source-never
+  "Create a Source that never emits and never completes.
+
+   Useful as a placeholder branch, or to keep a merge open."
+  []
+  (Source/never))
+
+(defn source-unfold-async
+  "Like `source-unfold`, but `f` returns a CompletionStage of [next-state element]
+   (or of nil to complete) — so each step can do asynchronous work.
+
+   Example:
+     (source-unfold-async 0 (fn [n] (CompletableFuture/completedFuture
+                                      (when (< n 3) [(inc n) n]))))"
+  [initial-state f]
+  (Source/unfoldAsync
+   initial-state
+   (reify org.apache.pekko.japi.function.Function
+     (apply [_ state]
+       (.thenApply ^CompletionStage (f state)
+                   (reify java.util.function.Function
+                     (apply [_ result]
+                       (if-let [[next-state element] result]
+                         (Optional/of (Pair. next-state element))
+                         (Optional/empty)))))))))
 
 (defn source-range
   "Create a Source that emits integers from start (inclusive) to end (exclusive)."
@@ -322,6 +383,26 @@
   []
   (Sink/last))
 
+(defn sink-head-option
+  "Create a Sink returning a CompletionStage<Optional> of the first element —
+   empty rather than failed when the stream had no elements, unlike `sink-head`."
+  []
+  (Sink/headOption))
+
+(defn sink-last-option
+  "Create a Sink returning a CompletionStage<Optional> of the last element —
+   empty rather than failed when the stream had no elements, unlike `sink-last`."
+  []
+  (Sink/lastOption))
+
+(defn sink-take-last
+  "Create a Sink collecting the last `n` elements into a List.
+
+   This lives on Sink, not on Source/Flow: keeping the tail needs to know where the
+   stream ends, so there is no streaming `take-last` operator."
+  [n]
+  (Sink/takeLast (int n)))
+
 (defn sink-seq
   "Create a Sink that collects all elements into a sequence."
   []
@@ -371,16 +452,16 @@
 
 (defn run
   "Run a stream with a Sink, returning a CompletionStage of the materialized value."
-  [src ^Sink sink ^Materializer materializer]
+  [src ^Sink sink materializer]
   ;; Bound to a hinted local rather than hinting the form: `op` expands to a
   ;; `cond`, and the hint would not survive the expansion.
   (let [^RunnableGraph graph (op src toMat sink (Keep/right))]
-    (.run graph materializer)))
+    (.run graph (->materializer materializer))))
 
 (defn run-with
   "Run a stream with a Sink, returning a CompletionStage of the materialized value."
-  [^Source src ^Sink sink ^Materializer materializer]
-  (.runWith src sink materializer))
+  [^Source src ^Sink sink materializer]
+  (.runWith src sink (->materializer materializer)))
 
 (defn run-foreach
   "Run a stream, applying f to each element. Returns a CompletionStage<Done>."
@@ -422,7 +503,9 @@
 
 (defn source-actor-ref
   "Create a Source backed by an actor that you can send messages to.
-   Returns [source actor-ref].
+
+   Returns {:source Source, :actor-ref ActorRef} — the same map shape
+   `source-queue` and `run-source-queue` use.
 
    buffer-size: size of the buffer
    overflow-strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail
@@ -439,9 +522,11 @@
    - :fail-with      fn of message -> a Throwable, or nil to not fail
 
    Example:
-     (source-actor-ref 8 :fail {:complete-with #(when (= :done %) :immediately)
-                               :fail-with     #(when (= :boom %) (RuntimeException. \"boom\"))}
-                       mat)"
+     (let [{:keys [source actor-ref]}
+           (source-actor-ref 8 :fail {:complete-with #(when (= :done %) :immediately)
+                                      :fail-with     #(when (= :boom %) (RuntimeException. \"boom\"))}
+                             sys)]
+       ...)"
   ([buffer-size overflow-strategy materializer]
    (source-actor-ref buffer-size overflow-strategy nil materializer))
   ([buffer-size overflow-strategy opts materializer]
@@ -463,18 +548,17 @@
                    overflow)
                   (Source/actorRef (int buffer-size) overflow))
          ;; preMaterialize returns a Pair (materialized-value, source): .first is
-         ;; the ActorRef, .second is the reusable Source (same convention as
-         ;; source-queue). Return [source actor-ref] per the docstring.
-         ^Pair pair (.preMaterialize ^Source source ^Materializer materializer)]
-     [(.second pair) (.first pair)])))
+         ;; the ActorRef, .second is the reusable Source.
+         ^Pair pair (.preMaterialize ^Source source (->materializer materializer))]
+     {:source (.second pair) :actor-ref (.first pair)})))
 
 (defn to-actor
   "Connect a Source to an actor, sending each element as a message.
    complete-msg: message to send when stream completes
    Note: Returns NotUsed, not a CompletionStage. The stream runs asynchronously."
-  [src ^ActorRef actor-ref complete-msg ^Materializer materializer]
+  [src ^ActorRef actor-ref complete-msg materializer]
   (let [^RunnableGraph graph (op src to (sink-actor-ref actor-ref complete-msg))]
-    (.run graph materializer)))
+    (.run graph (->materializer materializer))))
 
 ;; ---------------------------------------------------------------------------
 ;; Utility functions
@@ -556,14 +640,29 @@
         (apply [_ x] (key-fn x)))))
 
 (defn merge-substreams
-  "Merge sub-streams back into a single stream."
-  [^SubSource subsource]
-  (.mergeSubstreams subsource))
+  "Merge sub-streams back into a single stream.
+
+   Takes whatever `group-by` returned: a SubSource (from a Source) or a SubFlow
+   (from a Flow). Hinting only SubSource would ClassCastException on the Flow
+   case, so this dispatches the same way the `op` macro does."
+  [sub]
+  (cond
+    (instance? SubSource sub) (.mergeSubstreams ^SubSource sub)
+    (instance? SubFlow sub)   (.mergeSubstreams ^SubFlow sub)
+    :else (throw (IllegalArgumentException.
+                  (str "merge-substreams expects the SubSource/SubFlow group-by returns, got "
+                       (class sub))))))
 
 (defn concat-substreams
-  "Concatenate sub-streams sequentially."
-  [^SubSource subsource]
-  (.concatSubstreams subsource))
+  "Concatenate sub-streams sequentially. Takes a SubSource or a SubFlow — see
+   `merge-substreams`."
+  [sub]
+  (cond
+    (instance? SubSource sub) (.concatSubstreams ^SubSource sub)
+    (instance? SubFlow sub)   (.concatSubstreams ^SubFlow sub)
+    :else (throw (IllegalArgumentException.
+                  (str "concat-substreams expects the SubSource/SubFlow group-by returns, got "
+                       (class sub))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Phase 3: Error Handling
@@ -731,14 +830,20 @@
 
 (defn source-queue
   "Create a Source backed by a queue for dynamic pushing.
-   Returns [queue source] where queue is a SourceQueueWithComplete.
+
+   Returns {:source Source, :queue SourceQueueWithComplete} — the same map shape
+   `run-source-queue` and `source-actor-ref` use. Offer elements with
+   (.offer queue x), finish with (.complete queue) or (.fail queue ex).
 
    buffer-size: size of the buffer
-   overflow-strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail, :backpressure"
+   overflow-strategy: :drop-head, :drop-tail, :drop-buffer, :drop-new, :fail, :backpressure
+
+   Example:
+     (let [{:keys [source queue]} (source-queue 8 :backpressure sys)] ...)"
   [buffer-size overflow-strategy materializer]
   (let [source (Source/queue (int buffer-size) (->overflow-strategy overflow-strategy :backpressure))
-        ^Pair pair (.preMaterialize ^Source source ^Materializer materializer)]
-    [(.first pair) (.second pair)]))
+        ^Pair pair (.preMaterialize ^Source source (->materializer materializer))]
+    {:source (.second pair) :queue (.first pair)}))
 
 (defn source-cycle
   "Create a Source that infinitely cycles through a collection."
@@ -816,8 +921,12 @@
   [src sink]
   (op src alsoTo sink))
 
-(defn distinct
-  "Remove consecutive duplicate elements."
+(defn dedupe
+  "Drop **consecutive** duplicate elements, like clojure.core/dedupe.
+
+   (Named `distinct` before N13, which was a misnomer: clojure.core/distinct drops
+   every repeat, not just adjacent ones. `distinct`/`distinct-by` remain as
+   deprecated aliases.)"
   [src]
   (op src statefulMapConcat
       (reify org.apache.pekko.japi.function.Creator
@@ -830,8 +939,8 @@
                   (do (reset! prev x)
                       [x])))))))))
 
-(defn distinct-by
-  "Remove consecutive duplicate elements by a key function."
+(defn dedupe-by
+  "Drop consecutive elements with the same key. See `dedupe`."
   [src key-fn]
   (op src statefulMapConcat
       (reify org.apache.pekko.japi.function.Creator
@@ -845,10 +954,95 @@
                     (do (reset! prev-key k)
                         [x]))))))))))
 
+(def ^{:deprecated "N13"
+       :doc "Deprecated alias for `dedupe`. The name was wrong: this drops only
+   *consecutive* duplicates, where clojure.core/distinct drops every repeat."
+       :arglists '([src])}
+  distinct dedupe)
+
+(def ^{:deprecated "N13"
+       :doc "Deprecated alias for `dedupe-by`. See `distinct`."
+       :arglists '([src key-fn])}
+  distinct-by dedupe-by)
+
+(defn skeep
+  "Map each element through `f`, dropping the elements `f` returns nil for —
+   clojure.core/keep for streams.
+
+   This is the Clojure-shaped version of Pekko's `collect`, which takes a Scala
+   PartialFunction. One stage, not a map followed by a filter.
+
+   Example:
+     (skeep src #(when (even? %) (* 10 %)))"
+  [src f]
+  (op src mapConcat
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ x] (if-some [v (f x)] [v] [])))))
+
+(defn zip
+  "Combine with another Source element-by-element, emitting [a b] vectors.
+
+   Completes as soon as either side does. Pekko emits a `japi.Pair`; this maps it
+   to a Clojure vector, as `zip-with-index` does."
+  [src other]
+  (-> (op src zip other)
+      (smap (fn [^Pair p] [(.first p) (.second p)]))))
+
+(defn zip-all
+  "Like `zip`, but runs until *both* sides complete, padding the shorter one.
+
+   this-elem / that-elem are the padding values for this stream and for `other`."
+  [src other this-elem that-elem]
+  (-> (op src zipAll other this-elem that-elem)
+      (smap (fn [^Pair p] [(.first p) (.second p)]))))
+
+(defn interleave
+  "Emit `segment-size` elements from this stream, then `segment-size` from
+   `other`, and so on. Completes when both do."
+  ([src other] (interleave src other 1))
+  ([src other segment-size]
+   (op src interleave other (int segment-size))))
+
+(defn prepend
+  "Emit every element of `other` first, then this stream's."
+  [src other]
+  (op src prepend other))
+
+(defn or-else
+  "Fall back to `other` if this stream completes without emitting anything.
+
+   If this stream emits at least one element, `other` is never used."
+  [src other]
+  (op src orElse other))
+
+(defn divert-to
+  "Send the elements matching `pred` to `sink` instead of downstream.
+
+   Unlike `wire-tap`/`also-to`, which copy, this *removes* the matching elements
+   from the main flow — the usual shape for routing failures aside."
+  [src sink pred]
+  (op src divertTo sink
+      (reify org.apache.pekko.japi.function.Predicate
+        (test [_ x] (boolean (pred x))))))
+
+(defn limit
+  "Pass elements through, but fail the stream with a StreamLimitReachedException if
+   there turn out to be more than `n`.
+
+   Not `take`: `take` truncates quietly, this treats the overflow as an error. Use
+   it as a guard before a collecting sink."
+  [src n]
+  (op src limit (int n)))
+
 (defn zip-with-index
-  "Pair each element with its index (starting from 0)."
+  "Pair each element with its index (starting from 0), as a Clojure vector
+   [element index].
+
+   Pekko emits a `japi.Pair` here; leaking that into a Clojure pipeline would make
+   every downstream step do Java interop just to read the element."
   [src]
-  (op src zipWithIndex))
+  (-> (op src zipWithIndex)
+      (smap (fn [^Pair p] [(.first p) (.second p)]))))
 
 (defn stateful-map
   "Apply a stateful transformation to each element.
@@ -974,8 +1168,8 @@
 (defn run-graph
   "Run a RunnableGraph (from to-mat), returning its materialized value.
    A Keep/both pair is returned as a Clojure vector [left right]."
-  [^RunnableGraph graph ^Materializer materializer]
-  (mat-value (.run graph materializer)))
+  [^RunnableGraph graph materializer]
+  (mat-value (.run graph (->materializer materializer))))
 
 (defn run-mat
   "Run a Source into a Sink, keeping the materialized value(s) selected by `which`
@@ -986,8 +1180,8 @@
 
    Example:
      (let [[queue done] (run-mat queued-src (sink-seq) :both mat)] ...)"
-  [src sink which ^Materializer materializer]
-  (mat-value (.run ^RunnableGraph (to-mat src sink which) materializer)))
+  [src sink which materializer]
+  (mat-value (.run ^RunnableGraph (to-mat src sink which) (->materializer materializer))))
 
 (defn run-source-queue
   "Materialize a queue-backed Source into `sink` in one step.

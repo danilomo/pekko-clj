@@ -4,7 +4,8 @@
      cluster/singleton/sharding suites),
    - `eventually`/`poll-until` to replace flaky fixed `Thread/sleep` synchronization
      with a bounded poll that returns as soon as the condition holds."
-  (:require [pekko-clj.cluster :as cluster])
+  (:require [pekko-clj.cluster :as cluster]
+            [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorSystem]
            [com.typesafe.config ConfigFactory]
            [scala.concurrent Await]
@@ -67,3 +68,32 @@
      (is (eventually (= 3 (get-count actor))))"
   ([body] `(poll-until (fn [] ~body) 8000))
   ([timeout-ms body] `(poll-until (fn [] ~body) ~timeout-ms)))
+
+;; ---------------------------------------------------------------------------
+;; Lifecycle observation
+;; ---------------------------------------------------------------------------
+
+(defn stopped-within?
+  "True if `target` (an ActorRef) terminates within timeout-ms. Spawns a
+   throwaway watcher actor to observe it via DeathWatch — for confirming an
+   internally-spawned subscriber actor was actually stopped, not just
+   unsubscribed."
+  ([system target] (stopped-within? system target 3000))
+  ([system target timeout-ms]
+   (let [terminated (promise)
+         watcher (core/new-actor
+                  system
+                  {:function (fn [this msg]
+                               (binding [core/*current-actor* this]
+                                 (when (and (vector? msg) (= :terminated (first msg)))
+                                   (deliver terminated true)))
+                               nil)
+                   :pre-start (fn [this]
+                                (binding [core/*current-actor* this]
+                                  (core/watch target))
+                                nil)
+                   :state nil})]
+     (try
+       (boolean (deref terminated timeout-ms false))
+       (finally
+         (core/poison-pill watcher))))))

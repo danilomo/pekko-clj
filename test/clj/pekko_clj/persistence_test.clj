@@ -5,8 +5,10 @@
             [pekko-clj.stream :as s]
             [pekko-clj.core :as core]
             [pekko-clj.event-stream :as es]
+            [pekko-clj.supervision :as sup]
             [pekko-clj.test-support :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem]
+           [org.apache.pekko.persistence Recovery SnapshotSelectionCriteria]
            [com.typesafe.config ConfigFactory]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
@@ -747,6 +749,45 @@
           (catch clojure.lang.Compiler$CompilerException e
             (throw (.getCause e)))))))
 
+(deftest defactor-persistent-rejects-unknown-clause-head
+  ;; H8: an unknown clause head (a typo) used to be silently discarded by the
+  ;; parse-*'s (filter #(= 'head (first %)) clauses) pattern.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown clause"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent bad-clause-head
+                            :persistence-id (fn [_] "x")
+                            (init [_] {})
+                            (command :x (p/persist [:e]))
+                            (event [:e] state)
+                            (tagged [event] #{"x"})))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+(deftest defactor-persistent-rejects-duplicate-tagger-clause
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only one `tagger`"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent dup-tagger
+                            :persistence-id (fn [_] "x")
+                            (init [_] {})
+                            (command :x (p/persist [:e]))
+                            (event [:e] state)
+                            (tagger [event] #{"a"})
+                            (tagger [event] #{"b"})))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+(deftest defactor-persistent-rejects-duplicate-persistence-id
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only one `:persistence-id`"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent dup-pid
+                            :persistence-id (fn [_] "x")
+                            :persistence-id (fn [_] "y")
+                            (init [_] {})
+                            (command :x (p/persist [:e]))
+                            (event [:e] state)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
 (deftest defactor-persistent-rejects-state-shadow-in-command
   ;; H6: `this`/`state` are reserved anaphors in command bodies (macroexpand-1
   ;; wraps the guard's ExceptionInfo in a CompilerException).
@@ -756,5 +797,285 @@
                             :persistence-id (fn [_] "x")
                             (init [_] {})
                             (command [:set state] (p/persist [state]))))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+;; ---------------------------------------------------------------------------
+;; N11: persistence depth — lifecycle, async persists, plugins, recovery
+;; ---------------------------------------------------------------------------
+
+(def stopped-actors (atom []))
+(def child-failures (atom 0))
+
+(core/defactor fragile-child
+  "Child of a persistent actor, used to observe its supervisor strategy."
+  (init [_] {:n 0})
+  (handle [:bump] (update state :n inc))
+  (handle [:boom] (do (swap! child-failures inc)
+                      (throw (RuntimeException. "child boom"))))
+  (handle [:get] (core/reply (:n state))))
+
+(p/defactor-persistent lifecycle-actor
+  "Exercises the on-stop, supervision and timer additions."
+  :persistence-id (fn [args] (str "lifecycle-" (:id args)))
+
+  (init [args] {:id (:id args) :ticks 0 :child nil})
+
+  ;; Children of this actor are resumed on failure instead of restarted, so a
+  ;; failing child keeps the state it had.
+  (supervision (sup/one-for-one sup/resume-decider))
+
+  (on-stop (swap! stopped-actors conj (:id state)))
+
+  (command :spawn-child
+    (p/reply (core/new-actor (p/context) ((:make-props fragile-child) nil)))
+    nil)
+
+  (command [:start-ticking ms]
+    (p/start-timer :tick (java.time.Duration/ofMillis ms) :tick)
+    (p/reply :ticking)
+    nil)
+  (command :tick
+    (p/persist [:ticked]))
+  (command :stop-ticking
+    (p/cancel-timer :tick)
+    (p/reply (p/timer-active? :tick))
+    nil)
+
+  (command :get-ticks (p/reply (:ticks state)) nil)
+  (command :who (p/reply (str (.path (p/self)))) nil)
+
+  (event [:ticked] (update state :ticks inc)))
+
+(deftest persistent-on-stop-clause-runs
+  (let [sys (create-test-system "persistence-test")
+        id (unique-id)]
+    (try
+      (reset! stopped-actors [])
+      (let [actor (p/spawn sys lifecycle-actor {:id id})]
+        (is (eventually (= 0 (core/<! actor :get-ticks 3000))))
+        (core/poison-pill actor)
+        (is (eventually (= [id] @stopped-actors))
+            "on-stop ran with `state` bound"))
+      (finally (terminate-system sys)))))
+
+(deftest persistent-supervision-clause-supervises-children
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (reset! child-failures 0)
+      (let [actor (p/spawn sys lifecycle-actor {:id (unique-id)})
+            child (core/<! actor :spawn-child 3000)]
+        (is (some? child))
+        (core/! child [:bump])
+        (core/! child [:bump])
+        (is (eventually (= 2 (core/<! child [:get] 3000))))
+        ;; :resume keeps the child's state; the default (restart) would zero it.
+        (core/! child [:boom])
+        (is (eventually (= 1 @child-failures)))
+        (is (eventually (= 2 (core/<! child [:get] 3000)))
+            "the (supervision (resume-decider)) clause reached the child"))
+      (finally (terminate-system sys)))))
+
+(deftest persistent-timers-work
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (let [actor (p/spawn sys lifecycle-actor {:id (unique-id)})]
+        (is (= :ticking (core/<! actor [:start-ticking 100] 3000)))
+        ;; Each tick persists an event, so the ticks are journalled, not just counted.
+        (is (eventually (<= 3 (or (core/<! actor :get-ticks 3000) 0))))
+        (is (false? (core/<! actor :stop-ticking 3000))
+            "cancel-timer removed the timer"))
+      (finally (terminate-system sys)))))
+
+;; --- persist-async / defer / then -----------------------------------------
+
+(p/defactor-persistent async-actor
+  "Uses persist-async, defer and then."
+  :persistence-id (fn [args] (str "async-" (:id args)))
+
+  (init [_] {:events [] :deferred []})
+
+  (command [:observe v]
+    (p/persist-async [:observed v]))
+
+  (command [:observe-many vs]
+    (p/persist-all-async (mapv (fn [v] [:observed v]) vs)))
+
+  ;; persist, then reply only once the write has completed
+  (command [:record v]
+    (p/then (p/persist [:observed v])
+            (p/defer [:written v])))
+
+  (command [:written v]
+    (p/reply {:written v :events (:events state)})
+    nil)
+
+  (command :get (p/reply (:events state)) nil)
+
+  (event [:observed v] (update state :events conj v)))
+
+(deftest persist-async-applies-events
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (let [actor (p/spawn sys async-actor {:id (unique-id)})]
+        (core/! actor [:observe 1])
+        (core/! actor [:observe 2])
+        (core/! actor [:observe-many [3 4]])
+        (is (eventually (= [1 2 3 4] (core/<! actor :get 3000)))
+            "async writes still reach the event handler, in order"))
+      (finally (terminate-system sys)))))
+
+(deftest persist-async-events-recover
+  ;; The point of the marker is that these are real journal writes, not a
+  ;; fire-and-forget side channel.
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys async-actor {:id id})]
+          (core/! actor [:observe :a])
+          (core/! actor [:observe :b])
+          (is (eventually (= [:a :b] (core/<! actor :get 3000)))))
+        (finally (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys async-actor {:id id})]
+          (is (eventually (= [:a :b] (core/<! actor :get 3000)))
+              "replayed from the journal after a restart"))
+        (finally (terminate-system sys))))))
+
+(deftest defer-runs-after-the-write
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (let [actor (p/spawn sys async-actor {:id (unique-id)})
+            reply (core/<! actor [:record :x] 3000)]
+        (is (= :x (:written reply)))
+        (is (= [:x] (:events reply))
+            "the deferred command ran after the event was applied, not before"))
+      (finally (terminate-system sys)))))
+
+(deftest deferred-values-are-not-journalled
+  ;; `defer` sequences a side effect; it must not add anything to the journal.
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys async-actor {:id id})]
+          (is (= :x (:written (core/<! actor [:record :x] 3000)))))
+        (finally (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys async-actor {:id id})]
+          (is (eventually (= [:x] (core/<! actor :get 3000)))
+              "one event replayed — the deferred value was never written"))
+        (finally (terminate-system sys))))))
+
+;; --- per-actor plugin ids --------------------------------------------------
+
+(p/defactor-persistent inmem-actor
+  "Writes to the in-memory journal instead of the configured LevelDB one."
+  :persistence-id (fn [args] (str "inmem-" (:id args)))
+  (journal-plugin-id "pekko.persistence.journal.inmem")
+
+  (init [_] {:n 0})
+  (command :inc (p/persist [:inced]))
+  (command :get (p/reply (:n state)) nil)
+  (event [:inced] (update state :n inc)))
+
+(deftest journal-plugin-id-clause-redirects-writes
+  (let [sys (create-test-system "persistence-test")
+        id (unique-id)
+        pid (str "inmem-" id)]
+    (try
+      (let [actor (p/spawn sys inmem-actor {:id id})]
+        (core/! actor :inc)
+        (core/! actor :inc)
+        (is (eventually (= 2 (core/<! actor :get 3000))))
+        ;; The default (LevelDB) journal — which the query journal reads — has
+        ;; nothing for this persistence id, because the writes went to inmem.
+        (let [j (q/read-journal sys)
+              mat (s/materializer sys)
+              in-leveldb (vec (s/await-completion
+                               (s/run-to-seq (q/current-events-by-persistence-id j pid) mat)
+                               5000))]
+          (is (empty? in-leveldb)
+              "the events are in the inmem journal, not the configured default")))
+      (finally (terminate-system sys)))))
+
+;; --- recovery customization ------------------------------------------------
+
+(p/defactor-persistent no-recovery-actor
+  "Write-only: never replays its journal on start."
+  :persistence-id (fn [args] (str "no-recovery-" (:id args)))
+  (recovery :none)
+
+  (init [_] {:n 0})
+  (command :inc (p/persist [:inced]))
+  (command :get (p/reply (:n state)) nil)
+  (event [:inced] (update state :n inc)))
+
+(p/defactor-persistent bounded-recovery-actor
+  "Replays at most two events."
+  :persistence-id (fn [args] (str "bounded-recovery-" (:id args)))
+  (recovery {:replay-max 2})
+
+  (init [_] {:n 0})
+  (command :inc (p/persist [:inced]))
+  (command :get (p/reply (:n state)) nil)
+  (event [:inced] (update state :n inc)))
+
+(deftest recovery-none-skips-replay
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys no-recovery-actor {:id id})]
+          (core/! actor :inc)
+          (core/! actor :inc)
+          (is (eventually (= 2 (core/<! actor :get 3000)))))
+        (finally (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys no-recovery-actor {:id id})]
+          (is (eventually (= 0 (core/<! actor :get 3000)))
+              "(recovery :none) starts from init, ignoring the journal"))
+        (finally (terminate-system sys))))))
+
+(deftest recovery-replay-max-bounds-replay
+  (let [id (unique-id)]
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys bounded-recovery-actor {:id id})]
+          (dotimes [_ 5] (core/! actor :inc))
+          (is (eventually (= 5 (core/<! actor :get 3000)))))
+        (finally (terminate-system sys))))
+    (let [sys (create-test-system "persistence-test")]
+      (try
+        (let [actor (p/spawn sys bounded-recovery-actor {:id id})]
+          (is (eventually (= 2 (core/<! actor :get 3000)))
+              "only :replay-max events were replayed"))
+        (finally (terminate-system sys))))))
+
+(deftest recovery-settings-shapes
+  (is (= (Recovery/none) (p/recovery-settings :none)))
+  (is (= (Recovery/create) (p/recovery-settings :default)))
+  (is (= 7 (.replayMax (p/recovery-settings {:replay-max 7}))))
+  (is (= 3 (.toSequenceNr (p/recovery-settings {:to-sequence-nr 3}))))
+  (is (= (SnapshotSelectionCriteria/none)
+         (.fromSnapshot (p/recovery-settings {:from-snapshot :none}))))
+  (is (= 9 (.maxSequenceNr (.fromSnapshot
+                            (p/recovery-settings {:from-snapshot {:max-sequence-nr 9}})))))
+  (is (thrown-with-msg? IllegalArgumentException #"recovery must be"
+        (p/recovery-settings :bogus)))
+  (is (thrown-with-msg? IllegalArgumentException #":from-snapshot must be"
+        (p/recovery-settings {:from-snapshot :bogus}))))
+
+(deftest defactor-persistent-rejects-duplicate-lifecycle-clause
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only one `on-stop`"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent dup-on-stop
+                            :persistence-id (fn [_] "x")
+                            (init [_] {})
+                            (command :x (p/persist [:e]))
+                            (event [:e] state)
+                            (on-stop nil)
+                            (on-stop nil)))
           (catch clojure.lang.Compiler$CompilerException e
             (throw (.getCause e)))))))

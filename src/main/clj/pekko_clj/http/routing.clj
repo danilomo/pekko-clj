@@ -10,6 +10,9 @@
      `complete-json`/`complete-edn` out (see `pekko-clj.http.marshalling`)
    - failure handling: `handle-rejections`/`handle-exceptions` with the
      `rejection-handler`/`exception-handler` builders
+   - static content: `from-resource`/`from-resource-directory`, `from-file`/
+     `from-directory`, with content types resolved from the file extension
+   - auth: `basic-auth` (challenge + 401 handled for you), `bearer-token`
    - websockets: `websocket` over a stream Flow of Messages (`text-flow`)
 
    Example:
@@ -27,7 +30,9 @@
   (:import [org.apache.pekko.http.javadsl.server Route AllDirectives
             ExceptionHandler RejectionHandler RejectionHandlerBuilder
             PathMatchers Rejection]
-           [org.apache.pekko.http.javadsl.model HttpResponse HttpEntity$Strict
+           [org.apache.pekko.http.javadsl.server.directives
+            SecurityDirectives$ProvidedCredentials]
+           [org.apache.pekko.http.javadsl.model ContentType HttpResponse HttpEntity$Strict
             HttpRequest ResponseEntity Uri
             StatusCodes]
            [org.apache.pekko.http.javadsl.model.ws Message TextMessage]
@@ -385,6 +390,117 @@
                        header-name header-value)
                       (reify Supplier
                         (get [_] inner-route))))
+
+;; ---------------------------------------------------------------------------
+;; Static Content
+;; ---------------------------------------------------------------------------
+;;
+;; Content types come from Pekko's default resolver, which reads the file
+;; extension (`.css` -> text/css, `.png` -> image/png, ...), so nothing has to be
+;; declared per file. The directory forms resolve the *unmatched* path against the
+;; directory, so they nest under `path-prefix` the way the route macros do.
+
+(defn from-resource
+  "Serve a single file from the classpath.
+
+   (path \"favicon.ico\" (from-resource \"public/favicon.ico\"))"
+  ([^String resource-path]
+   (.getFromResource directives resource-path))
+  ([^String resource-path ^ContentType content-type]
+   (.getFromResource directives resource-path content-type)))
+
+(defn from-resource-directory
+  "Serve a classpath directory, resolving the still-unmatched path inside it.
+
+   (path-prefix \"assets\" (from-resource-directory \"public\"))
+   ;; GET /assets/css/app.css  ->  classpath resource public/css/app.css"
+  [^String resource-directory]
+  (.getFromResourceDirectory directives resource-directory))
+
+(defn from-file
+  "Serve a single file from the filesystem. `path` is a String or a java.io.File;
+   the 2-arity (explicit ContentType) needs a File."
+  ([path]
+   (if (instance? java.io.File path)
+     (.getFromFile directives ^java.io.File path)
+     (.getFromFile directives ^String path)))
+  ([path ^ContentType content-type]
+   (.getFromFile directives
+                 (if (instance? java.io.File path) ^java.io.File path (java.io.File. ^String path))
+                 content-type)))
+
+(defn from-directory
+  "Serve a filesystem directory, resolving the still-unmatched path inside it.
+
+   Pekko refuses to serve outside the directory, so `..` segments cannot escape it.
+
+   (path-prefix \"static\" (from-directory \"/var/www\"))"
+  [^String directory]
+  (.getFromDirectory directives directory))
+
+;; ---------------------------------------------------------------------------
+;; Authentication
+;; ---------------------------------------------------------------------------
+
+(defn basic-auth
+  "HTTP Basic authentication.
+
+   Arguments:
+   - realm: named in the `WWW-Authenticate` challenge sent with the 401
+   - authenticator: (fn [user verify] principal-or-nil). `user` is the supplied
+     username; `verify` is a predicate taking *your* known secret for that user and
+     returning true when it matches what the client sent. Return any value to
+     accept (it is handed to inner-fn) or nil to reject.
+   - inner-fn: (fn [principal] route)
+
+   The supplied password is deliberately not reachable: Pekko exposes only
+   `verify`, which compares in constant time, so a wrapper handing back the raw
+   password would trade that away for nothing.
+
+   A missing or wrong credential is rejected with 401 and the challenge; there is
+   nothing to handle in the route.
+
+   Example:
+     (basic-auth \"admin area\"
+       (fn [user verify]
+         (when-let [secret (get users user)]
+           (when (verify secret) {:user user})))
+       (fn [principal] (complete (str \"hi \" (:user principal)))))"
+  [^String realm authenticator inner-fn]
+  (.authenticateBasic
+   directives
+   realm
+   (reify Function
+     (apply [_ opt-credentials]
+       (let [^java.util.Optional opt opt-credentials]
+         (if (.isPresent opt)
+           (let [^SecurityDirectives$ProvidedCredentials creds (.get opt)]
+             (java.util.Optional/ofNullable
+              (authenticator (.identifier creds)
+                             (fn [secret] (.verify creds (str secret))))))
+           (java.util.Optional/empty)))))
+   (reify Function
+     (apply [_ principal] (inner-fn principal)))))
+
+(defn bearer-token
+  "Extract the token from an `Authorization: Bearer <token>` header.
+
+   `inner-fn` receives the token, or nil when the header is absent or uses another
+   scheme — deciding what that means (401, anonymous access, ...) is the route's
+   job, since this is extraction, not authentication. For a challenge-based OAuth2
+   flow use Pekko's `authenticateOAuth2` directly.
+
+   Example:
+     (bearer-token (fn [token]
+                     (if-let [user (verify-jwt token)]
+                       (complete-json user)
+                       (complete StatusCodes/UNAUTHORIZED \"nope\"))))"
+  [inner-fn]
+  (header-value-opt
+   "Authorization"
+   (fn [value]
+     (inner-fn (when (and value (str/starts-with? (str/lower-case value) "bearer "))
+                 (str/trim (subs value (count "Bearer "))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Entity Directives

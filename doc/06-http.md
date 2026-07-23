@@ -100,6 +100,57 @@ Since the HTTP requests use Pekko Streams underneath to stream bytes smoothly wi
       (complete :ok "Length processed!"))))
 ```
 
+## Static Content
+
+Serve files from the classpath or the filesystem. Content types come from the
+file extension, so nothing has to be declared per file. The directory forms
+resolve the *still-unmatched* path, so they nest under `path-prefix`:
+
+```clojure
+(r/routes
+  ;; One file
+  (r/path "favicon.ico" (r/from-resource "public/favicon.ico"))
+  ;; A whole tree: GET /assets/css/app.css -> classpath public/css/app.css
+  (r/path-prefix "assets" (r/from-resource-directory "public"))
+  ;; …or from disk (Pekko refuses to serve outside the directory)
+  (r/path-prefix "files" (r/from-directory "/var/www")))
+```
+
+## Authentication
+
+`basic-auth` handles the 401 and the `WWW-Authenticate` challenge for you. The
+supplied password is deliberately not reachable — Pekko exposes only `verify`,
+which compares your known secret against it in constant time:
+
+```clojure
+(r/path "admin"
+  (r/basic-auth "admin area"
+    (fn [user verify]
+      (when-let [secret (get users user)]
+        (when (verify secret) {:user user})))         ; nil rejects
+    (fn [principal]
+      (complete (str "hi " (:user principal))))))
+```
+
+`bearer-token` is extraction only — it hands the inner function the token from
+an `Authorization: Bearer …` header, or nil when the header is absent or uses
+another scheme, and the route decides what that means.
+
+## Marshalling: strings are values, not pre-encoded bodies
+
+`->json` / `->edn` (and therefore `resp/json`, `complete-json`, …) encode every
+value, strings included:
+
+```clojure
+(complete-json "hello")                        ;; => "hello"  (a JSON string)
+(complete-json (marshal/raw-body "{\"a\":1}")) ;; => {"a":1}  (verbatim)
+```
+
+Strings used to be passed through unchanged, on the theory that a string must
+already be encoded. That made `(resp/json "hello")` emit the bare characters
+`hello` — not valid JSON, with nothing to say so. Pre-encoded bodies are now
+explicit via `marshal/raw-body`.
+
 ## Contrast with Scala (Pekko HTTP)
 
 The original Scala `Route` DSL relies on a deeply nested sequence of function combinators (`~`) mapping into execution blocks.

@@ -169,10 +169,12 @@ Inside any `handle`, `init`, `on-stop`, `on-restart`, or `on-error` body:
 ;; Top-level (requires ActorSystem)
 (spawn system actor-def)
 (spawn system actor-def args)
+(spawn system actor-def args {:name "worker-1"})  ;; named, resolves at "/user/worker-1"
 
 ;; Inside an actor (creates child actor)
 (spawn actor-def)
 (spawn actor-def args)
+(spawn actor-def args {:name "child-1"})
 ```
 
 ### Message Passing
@@ -181,7 +183,7 @@ Inside any `handle`, `init`, `on-stop`, `on-restart`, or `on-error` body:
 ;; Fire-and-forget (tell)
 (! actor-ref msg)
 
-;; Non-blocking ask - returns Scala Future
+;; Non-blocking ask - returns a java.util.concurrent.CompletableFuture
 (<?> actor-ref msg)
 (<?> actor-ref msg timeout-ms)
 
@@ -244,6 +246,41 @@ always a single event, so there is no ambiguity between "one compound event" and
 write, all events or none — so a crash mid-command cannot leave a half-applied
 command behind.
 
+Two more write modes, for when the default is not what you want:
+
+```clojure
+;; Keep processing commands while the write is in flight. Faster, but the next
+;; command may read state that does not include the event yet.
+(command [:observe v] (persist-async [:observed v]))   ; persist-all-async for a batch
+
+;; Reply only once the events are durable: `defer` hands its value back to the
+;; command handler after the writes of the same command have completed, with the
+;; original sender still in scope. `then` runs several operations in order.
+(command [:withdraw n]
+  (then (persist [:withdrawn n])
+        (defer [:withdrawn-ok n])))
+
+(command [:withdrawn-ok n]
+  (reply {:ok true :balance (:balance state)})
+  nil)
+```
+
+Beyond commands and events, a persistent actor takes `(on-stop …)`,
+`(supervision strat)` and timers (`start-timer`/`cancel-timer` from
+`pekko-clj.persistence`), plus `(journal-plugin-id id)` / `(snapshot-plugin-id id)`
+to pick storage per actor and `(recovery …)` to bound or skip replay —
+`(recovery :none)` for a write-only actor, `(recovery {:replay-max 100})` to cap
+it. Note that `self`/`context`/timer helpers for a persistent actor live in
+`pekko-clj.persistence`, not `pekko-clj.core`, whose versions are typed to
+`defactor` actors.
+
+pekko-clj ships no journal or snapshot-store plugin of its own — LevelDB (via
+`org.iq80.leveldb`) is a test-only dependency, wired up in
+`test/resources/persistence-test.conf`, and is not on the classpath of
+consumers of this library. For production, configure a real Pekko Persistence
+plugin (e.g. `pekko-persistence-jdbc`, `pekko-persistence-r2dbc`, or
+`pekko-persistence-cassandra`) in your own `application.conf`.
+
 ## Reactive Streams
 
 Build reactive stream pipelines with backpressure:
@@ -269,6 +306,18 @@ Build reactive stream pipelines with backpressure:
     (s/via (s/flow-map #(str % "!")))
     (s/run-to-seq sys))  ;; => ["HELLO!" "WORLD!"]
 ```
+
+Every `run-*` takes either a `Materializer` or, as above, the `ActorSystem`
+itself — which resolves to `(s/system-materializer sys)`, the one materializer
+the system owns. Prefer that to `(s/materializer sys)`, which builds a *new*
+materializer on every call; each one owns actors that live until it is shut
+down, so calling it per stream leaks them.
+
+Beyond the usual `smap`/`sfilter`/`mapcat`, the operator set includes `skeep`
+(map-and-drop-nils), `zip` / `zip-all` / `interleave` / `prepend` / `or-else`
+for combining, `divert-to` for routing elements out of the main flow, `limit`
+(like `take`, but going over the bound is an error), `dedupe` / `dedupe-by`,
+and empty-safe `sink-head-option` / `sink-last-option` / `sink-take-last`.
 
 ## Clustering
 
@@ -344,7 +393,29 @@ serializer instead:
 
 Maps, vectors, lists, sets, keywords, symbols, ratios and big integers are bound to the
 serializer by default, and `ActorRef`s embedded in a message survive the round trip.
-Records need a Transit handler, so prefer plain maps in messages and persisted events.
+
+### Records
+
+Transit needs a handler per record type, so records are **opt-in**: list them under
+`:records` and they round trip as themselves.
+
+```clojure
+(defrecord Point [x y])
+
+(cluster/create-system "my-app"
+  {:port 7355
+   :transit-serialization {:records [Point]}})   ;; classes or class names
+
+;; Standalone, per call
+(ser/read-bytes (ser/write-bytes (->Point 1 2) nil :json [Point]) nil :json [Point])
+;; => #my-app.serialization.Point{:x 1, :y 2}
+```
+
+Every node exchanging a record needs it in its own `:records` list. Without
+registration Transit writes a record as a plain map and it comes back as a plain map —
+the type is silently erased — so prefer plain maps unless you register the type.
+Reading a payload whose record type is *not* registered locally throws with the
+unknown tag named, rather than yielding an opaque `TaggedValue`.
 
 ## Cluster Sharding
 

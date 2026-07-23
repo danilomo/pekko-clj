@@ -199,6 +199,18 @@
       (finally
         (ts/terminate-system sys)))))
 
+(deftest singleton-unknown-supervision-strategy-throws
+  ;; wrap-with-supervision runs before any cluster extension is touched, so a
+  ;; plain (non-cluster) system is enough to observe the throw.
+  (let [sys (core/actor-system "singleton-bad-strategy-test")]
+    (try
+      (is (thrown? IllegalArgumentException
+            (singleton/start sys simple-singleton
+                             {:name "bad-strategy-singleton"
+                              :supervision {:strategy :restart-with-backof}})))
+      (finally
+        (.terminate sys)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: Singleton State Query
 ;; ---------------------------------------------------------------------------

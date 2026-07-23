@@ -32,13 +32,78 @@
        (snapshot-every 100 2))"
   (:require [clojure.core.match :refer [match]])
   (:import [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.persistence SnapshotSelectionCriteria]
-           [pekko_clj.actor CljPersistentActor PersistAll]))
+           [org.apache.pekko.persistence Recovery SnapshotSelectionCriteria]
+           [pekko_clj.actor CljPersistentActor Defer PersistAll PersistAsync PersistOps]))
 
 (def ^:dynamic *current-persistent-actor*
   "Bound to the current CljPersistentActor during command handling.
    Used by (reply ...). Mirrors pekko-clj.core/*current-actor*."
   nil)
+
+;; ---------------------------------------------------------------------------
+;; Recovery settings
+;; ---------------------------------------------------------------------------
+
+(defn snapshot-criteria
+  "Create snapshot selection criteria.
+
+   Options:
+   - :max-sequence-nr - Maximum sequence number (inclusive)
+   - :max-timestamp   - Maximum timestamp in milliseconds
+   - :min-sequence-nr - Minimum sequence number (inclusive)
+   - :min-timestamp   - Minimum timestamp in milliseconds"
+  ^SnapshotSelectionCriteria
+  [{:keys [max-sequence-nr max-timestamp min-sequence-nr min-timestamp]
+    :or {max-sequence-nr Long/MAX_VALUE
+         max-timestamp Long/MAX_VALUE
+         min-sequence-nr 0
+         min-timestamp 0}}]
+  (SnapshotSelectionCriteria/create max-sequence-nr max-timestamp min-sequence-nr min-timestamp))
+
+(defn- ->snapshot-criteria
+  ^SnapshotSelectionCriteria [from-snapshot]
+  (cond
+    (or (nil? from-snapshot) (= :latest from-snapshot)) (SnapshotSelectionCriteria/latest)
+    (= :none from-snapshot) (SnapshotSelectionCriteria/none)
+    (instance? SnapshotSelectionCriteria from-snapshot) from-snapshot
+    (map? from-snapshot) (snapshot-criteria from-snapshot)
+    :else (throw (IllegalArgumentException.
+                  (str ":from-snapshot must be :latest, :none, a snapshot-criteria map or a "
+                       "SnapshotSelectionCriteria, got " (pr-str from-snapshot))))))
+
+(defn recovery-settings
+  "Build Pekko's Recovery from a Clojure value. This is what a `(recovery …)`
+   clause is passed through, and it is exposed so callers can build one directly.
+
+   Accepts:
+   - :none    - do not replay at all. The actor starts from its `init` state and
+                only writes; use it for a command-side actor whose state is
+                rebuilt elsewhere (a read model, a projection).
+   - :default - Pekko's default: latest snapshot, then every event after it
+   - a map:
+     - :from-snapshot  - :latest (default), :none, a `snapshot-criteria` map, or a
+                         SnapshotSelectionCriteria
+     - :to-sequence-nr - replay stops here (default: no limit)
+     - :replay-max     - replay at most this many events (default: no limit)
+   - a Recovery, returned unchanged
+
+   Returns: org.apache.pekko.persistence.Recovery
+
+   Example:
+     (recovery-settings {:replay-max 100})
+     (recovery-settings :none)"
+  ^Recovery [opts]
+  (cond
+    (instance? Recovery opts) opts
+    (= :none opts) (Recovery/none)
+    (= :default opts) (Recovery/create)
+    (map? opts) (let [{:keys [from-snapshot to-sequence-nr replay-max]} opts]
+                  (Recovery/create (->snapshot-criteria from-snapshot)
+                                   (long (or to-sequence-nr Long/MAX_VALUE))
+                                   (long (or replay-max Long/MAX_VALUE))))
+    :else (throw (IllegalArgumentException.
+                  (str "recovery must be :none, :default, a map or a Recovery, got "
+                       (pr-str opts))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Persistent Actor Definition
@@ -88,6 +153,16 @@
       (let [[_ bindings & body] recovery-clause]
         `(fn ~bindings ~@body)))))
 
+(defn- find-clause
+  "The first clause headed by `head`, or nil."
+  [clauses head]
+  (first (filter #(and (seq? %) (= head (first %))) clauses)))
+
+(defn- parse-value-clause
+  "The single argument of a (head value) clause, or nil when it is absent."
+  [clauses head]
+  (second (find-clause clauses head)))
+
 (defn- catch-all-pattern?
   "True if a core.match `command` pattern already matches every message — a bare
    local symbol (binds anything, e.g. `cmd` or `_`) or the `:else` keyword — so
@@ -96,6 +171,49 @@
   [pattern]
   (or (= pattern :else)
       (symbol? pattern)))
+
+(def ^:private persistent-actor-clause-heads
+  "List-clause heads defactor-persistent recognizes. :persistence-id is handled
+   separately below — it's a bare keyword/value pair, not a list clause."
+  '#{init command event tagger snapshot-every delete-events-on-snapshot
+     on-recovery-complete on-stop supervision recovery
+     journal-plugin-id snapshot-plugin-id})
+
+(def ^:private persistent-actor-singleton-heads
+  "Clauses that may appear at most once; command/event are the only clauses
+   allowed to repeat, so they're excluded here."
+  '#{init tagger snapshot-every on-recovery-complete on-stop supervision
+     recovery journal-plugin-id snapshot-plugin-id})
+
+(defn- validate-persistent-clauses
+  "Throw at macro-expansion for common defactor-persistent authoring mistakes
+   that `parse-persistence-id`/`parse-init`/etc. would otherwise silently
+   swallow: an unknown clause head (a typo like `(tagged ...)`), a duplicate of
+   a clause that may only appear once, or more than one :persistence-id."
+  [name clauses]
+  (loop [remaining clauses
+         seen {}]
+    (if (empty? remaining)
+      (doseq [[head n] seen]
+        (when (and (> n 1)
+                   (or (= head :persistence-id)
+                       (contains? persistent-actor-singleton-heads head)))
+          (throw (ex-info (str "defactor-persistent " name ": only one `" head
+                               "` clause is allowed, found " n)
+                          {:clause head :count n}))))
+      (let [item (first remaining)]
+        (if (= :persistence-id item)
+          (recur (drop 2 remaining) (update seen :persistence-id (fnil inc 0)))
+          (let [head (when (seq? item) (first item))]
+            (when-not (contains? persistent-actor-clause-heads head)
+              (throw (ex-info (str "defactor-persistent " name ": unknown clause `"
+                                   (pr-str item) "` — expected :persistence-id or one "
+                                   "of init, command, event, tagger, snapshot-every, "
+                                   "delete-events-on-snapshot, on-recovery-complete, "
+                                   "on-stop, supervision, recovery, journal-plugin-id, "
+                                   "snapshot-plugin-id")
+                              {:clause item})))
+            (recur (rest remaining) (update seen head (fnil inc 0)))))))))
 
 (defn- build-command-handler [commands]
   (let [this-sym (with-meta (gensym "this") {:tag 'pekko_clj.actor.CljPersistentActor})
@@ -150,6 +268,30 @@
                                 gone for good: only use it when nothing replays this
                                 actor's journal (no events-by-tag consumer, no audit).
    - (on-recovery-complete [this] ...) - Called when recovery finishes
+   - (on-stop ...)            - Side effects to run when the actor stops (and, via
+                                the default restart path, before a restart). `this`
+                                and `state` are bound. There is deliberately no
+                                `on-restart` counterpart: a restarted persistent
+                                actor rebuilds its state by replaying the journal,
+                                so `on-recovery-complete` is the hook that fires
+                                once the state is valid again.
+   - (supervision strat)      - Supervisor strategy for this actor's children (see
+                                pekko-clj.supervision). There is no `on-error`
+                                clause: `defactor`'s recovers by returning a new
+                                state, which for an event-sourced actor would be
+                                state no event produced — gone on the next replay.
+                                Let the failure reach supervision instead.
+   - (recovery opts)          - How much to replay on start: `:none` for a
+                                write-only actor, or a map (`:from-snapshot`,
+                                `:to-sequence-nr`, `:replay-max`). See
+                                `recovery-settings`.
+   - (journal-plugin-id id)   - Journal plugin for this actor only, overriding
+                                `pekko.persistence.journal.plugin`
+   - (snapshot-plugin-id id)  - Snapshot-store plugin for this actor only
+
+   `:persistence-id` and `init` are called with the spawn args — except under
+   cluster sharding, where every entity of a type shares one Props and both are
+   called with the **entity id** instead (see `pekko-clj.cluster.sharding/start`).
 
    In command bodies, `this` (the actor) and `state` (its current value) are
    reserved anaphors:
@@ -157,6 +299,11 @@
    - (reply msg)     - Reply to sender
    - (persist event) - Return a single event to persist
    - (persist-all events) - Return several events to persist, in order
+   - (persist-async event) / (persist-all-async events) - persist without stashing
+     the commands that arrive meanwhile
+   - (defer value) - hand `value` back to the command handler once the writes
+     issued before it have completed
+   - (then op ...) - run several of the above, in order
    Do not shadow `this`/`state` in a command pattern — that throws at
    macro-expansion.
 
@@ -188,6 +335,7 @@
   [name & clauses]
   (let [docstring (when (string? (first clauses)) (first clauses))
         clauses   (if docstring (rest clauses) clauses)
+        _ (validate-persistent-clauses name clauses)
         persistence-id-fn (parse-persistence-id clauses)
         init-fn (parse-init clauses)
         commands (parse-commands clauses)
@@ -196,6 +344,21 @@
         delete-events-on-snapshot (parse-delete-events-on-snapshot clauses)
         tagger-fn (parse-tagger clauses)
         on-recovery-complete (parse-on-recovery-complete clauses)
+        on-stop-clause (find-clause clauses 'on-stop)
+        supervision-expr (parse-value-clause clauses 'supervision)
+        recovery-expr (parse-value-clause clauses 'recovery)
+        journal-plugin-id (parse-value-clause clauses 'journal-plugin-id)
+        snapshot-plugin-id (parse-value-clause clauses 'snapshot-plugin-id)
+        this-sym (gensym "this")
+        ;; on-stop runs for side effects only — a persistent actor's state comes
+        ;; from its events, so a return value has nowhere legitimate to go.
+        post-stop-fn (when on-stop-clause
+                       `(fn [~this-sym]
+                          (binding [*current-persistent-actor* ~this-sym]
+                            (let [~'this ~this-sym
+                                  ~'state (deref ~this-sym)]
+                              ~@(rest on-stop-clause)
+                              nil))))
         command-handler (build-command-handler commands)
         event-handler (build-event-handler events)]
     ;; Reserved-anaphor guard: `this`/`state` are auto-bound in command bodies.
@@ -222,7 +385,27 @@
              keep-snapshots#       ~keep-snapshots
              delete-events#        ~delete-events-on-snapshot
              tagger#               ~tagger-fn
-             on-recovery-complete# ~on-recovery-complete]
+             on-recovery-complete# ~on-recovery-complete
+             post-stop#            ~post-stop-fn
+             supervisor-strategy#  ~supervision-expr
+             recovery#             ~(when recovery-expr `(recovery-settings ~recovery-expr))
+             journal-plugin-id#    ~journal-plugin-id
+             snapshot-plugin-id#   ~snapshot-plugin-id
+             ;; Everything that is the same for every instance of this definition.
+             ;; The two props builders below only add what differs: an eagerly
+             ;; computed id + state, or the functions that derive them per entity.
+             shared-props#         {:command-handler command-handler#
+                                    :event-handler event-handler#
+                                    :snapshot-every snapshot-every#
+                                    :keep-snapshots keep-snapshots#
+                                    :delete-events-on-snapshot delete-events#
+                                    :tagger tagger#
+                                    :on-recovery-complete on-recovery-complete#
+                                    :post-stop post-stop#
+                                    :supervisor-strategy supervisor-strategy#
+                                    :recovery recovery#
+                                    :journal-plugin-id journal-plugin-id#
+                                    :snapshot-plugin-id snapshot-plugin-id#}]
          {:type :persistent-actor
           :persistence-id-fn persistence-id-fn#
           :init-fn init-fn#
@@ -233,18 +416,17 @@
           :delete-events-on-snapshot delete-events#
           :tagger tagger#
           :on-recovery-complete on-recovery-complete#
+          :recovery recovery#
+          ;; Props shared by every entity of a sharded type: nothing per-instance
+          ;; can be baked in, so `:persistence-id` and `init` are handed to the
+          ;; actor as functions and invoked with the entity id at construction.
+          :entity-props (assoc shared-props#
+                               :persistence-id-fn persistence-id-fn#
+                               :init-fn init-fn#)
           :make-props (fn [args#]
-                        (let [initial-state# (when init-fn# (init-fn# args#))
-                              persistence-id# (persistence-id-fn# args#)]
-                          {:state initial-state#
-                           :persistence-id persistence-id#
-                           :command-handler command-handler#
-                           :event-handler event-handler#
-                           :snapshot-every snapshot-every#
-                           :keep-snapshots keep-snapshots#
-                           :delete-events-on-snapshot delete-events#
-                           :tagger tagger#
-                           :on-recovery-complete on-recovery-complete#}))}))))
+                        (assoc shared-props#
+                               :state (when init-fn# (init-fn# args#))
+                               :persistence-id (persistence-id-fn# args#)))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Spawning Persistent Actors
@@ -312,6 +494,68 @@
   [events]
   (PersistAll/of events))
 
+(defn persist-async
+  "Return an event to be persisted **without stashing** the commands that arrive
+   while the write is in flight (Pekko's `persistAsync`).
+
+   `persist` guarantees that the next command sees the state the event produced,
+   by holding those commands back until the journal has acknowledged the write.
+   This one does not: the actor keeps processing, and the event handler runs when
+   the write completes. Higher throughput, at the cost of a command possibly
+   reading state that does not include an event already on its way to the journal.
+   Reach for it only when that is genuinely acceptable — a metrics or audit
+   stream, say, rather than a balance whose next command must not overdraw it.
+
+   Example:
+     (command [:observe v] (persist-async [:observed v]))"
+  [event]
+  (PersistAsync/of [event]))
+
+(defn persist-all-async
+  "Like `persist-async`, for several events at once. Unlike `persist-all` these are
+   ordinary asynchronous writes and are **not** atomic — the batch can end up
+   partially written if the actor crashes mid-flight.
+
+   An empty collection persists nothing."
+  [events]
+  (PersistAsync/of events))
+
+(defn defer
+  "Return a value the command handler will be called with again, once every event
+   the same command asked to persist has actually been written (Pekko's
+   `deferAsync`).
+
+   The value is *not* an event: it never reaches the journal or the event handler,
+   and it is gone after a restart. Its purpose is to sequence a side effect —
+   almost always a reply — after the writes, so the caller only hears back once the
+   events are durable. The sender is still in scope, so `(reply …)` works.
+
+   Combine it with a persist using `then`:
+
+     (command [:withdraw n]
+       (then (persist [:withdrawn n])
+             (defer [:withdrawn-ok n])))
+
+     (command [:withdrawn-ok n]
+       (reply {:ok true :balance (:balance state)})
+       nil)"
+  [value]
+  (Defer/of value))
+
+(defn then
+  "Return several persist operations to run in order — the way a command handler
+   expresses more than one, since it returns a single value.
+
+   Each argument is an operation: a bare event, or the result of `persist`,
+   `persist-all`, `persist-async`, `persist-all-async`, `defer`, or a nested
+   `then`. Nils are dropped, so a conditional operation can just be nil.
+
+   Example:
+     (then (persist-all [[:debited n] [:audited]])
+           (defer :done))"
+  [& ops]
+  (PersistOps/of (remove nil? ops)))
+
 (defn reply
   "Reply to the sender of the current command. Call inside a command handler,
    where defactor-persistent binds the current persistent actor. Returns nil, so
@@ -319,6 +563,86 @@
   [msg]
   (.reply ^CljPersistentActor *current-persistent-actor* msg)
   nil)
+
+;; ---------------------------------------------------------------------------
+;; Actor context (the persistent-actor counterparts of pekko-clj.core's)
+;; ---------------------------------------------------------------------------
+;;
+;; `pekko-clj.core`'s self/sender/context/timers read `core/*current-actor*`, which
+;; is type-hinted CljActor — so calling them from a persistent actor's body throws
+;; a ClassCastException. These read `*current-persistent-actor*` instead. Same
+;; names, same semantics; use these inside defactor-persistent, core's inside
+;; defactor. (`reply` above has always worked this way.)
+
+(defn self
+  "The current persistent actor's own ActorRef."
+  ^org.apache.pekko.actor.ActorRef []
+  (.selfRef ^CljPersistentActor *current-persistent-actor*))
+
+(defn sender
+  "The ActorRef that sent the command being handled."
+  ^org.apache.pekko.actor.ActorRef []
+  (.senderRef ^CljPersistentActor *current-persistent-actor*))
+
+(defn context
+  "The current persistent actor's ActorContext."
+  ^org.apache.pekko.actor.ActorContext []
+  (.actorContext ^CljPersistentActor *current-persistent-actor*))
+
+(defn tell
+  "Send `msg` to `target` with this actor as the sender."
+  [^org.apache.pekko.actor.ActorRef target msg]
+  (.tell ^CljPersistentActor *current-persistent-actor* target msg)
+  nil)
+
+(defn stop
+  "Stop `target` (self or a child) via the current actor's context. Returns nil."
+  [^org.apache.pekko.actor.ActorRef target]
+  (.stop (context) target)
+  nil)
+
+(defn watch
+  "Watch `actor-ref`; its termination arrives as a Terminated command."
+  [^org.apache.pekko.actor.ActorRef actor-ref]
+  (.watch ^CljPersistentActor *current-persistent-actor* actor-ref)
+  nil)
+
+(defn unwatch
+  "Stop watching `actor-ref`."
+  [^org.apache.pekko.actor.ActorRef actor-ref]
+  (.unwatch ^CljPersistentActor *current-persistent-actor* actor-ref)
+  nil)
+
+(defn start-timer
+  "Start a repeating timer under `key`, delivering `message` to self every
+   `interval` (a java.time.Duration). Starting a timer with an existing key
+   replaces it. Timers are cancelled automatically when the actor stops or
+   restarts."
+  ([key interval message]
+   (.startTimer ^CljPersistentActor *current-persistent-actor* key interval message))
+  ([key initial-delay interval message]
+   (.startTimerWithInitialDelay ^CljPersistentActor *current-persistent-actor*
+                                key initial-delay interval message)))
+
+(defn start-single-timer
+  "Deliver `message` to self once after `delay` (a java.time.Duration)."
+  [key delay message]
+  (.startSingleTimer ^CljPersistentActor *current-persistent-actor* key delay message))
+
+(defn cancel-timer
+  "Cancel the timer registered under `key`."
+  [key]
+  (.cancelTimer ^CljPersistentActor *current-persistent-actor* key))
+
+(defn timer-active?
+  "True while a timer is registered under `key`."
+  [key]
+  (.isTimerActive ^CljPersistentActor *current-persistent-actor* key))
+
+(defn cancel-all-timers
+  "Cancel every timer this actor has started."
+  []
+  (.cancelAllTimers ^CljPersistentActor *current-persistent-actor*))
 
 ;; ---------------------------------------------------------------------------
 ;; Actor State Access
@@ -350,17 +674,3 @@
   [actor criteria]
   (.deleteSnapshotsMatching ^CljPersistentActor actor criteria))
 
-(defn snapshot-criteria
-  "Create snapshot selection criteria.
-
-   Options:
-   - :max-sequence-nr - Maximum sequence number (inclusive)
-   - :max-timestamp   - Maximum timestamp in milliseconds
-   - :min-sequence-nr - Minimum sequence number (inclusive)
-   - :min-timestamp   - Minimum timestamp in milliseconds"
-  [{:keys [max-sequence-nr max-timestamp min-sequence-nr min-timestamp]
-    :or {max-sequence-nr Long/MAX_VALUE
-         max-timestamp Long/MAX_VALUE
-         min-sequence-nr 0
-         min-timestamp 0}}]
-  (SnapshotSelectionCriteria/create max-sequence-nr max-timestamp min-sequence-nr min-timestamp))

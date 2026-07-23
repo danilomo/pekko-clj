@@ -113,7 +113,8 @@
 
 (defn request-query-params
   "Get query parameters as a map of strings.
-   Multi-valued params return the first value."
+   Multi-valued params return the last value (later entries overwrite
+   earlier ones with the same name)."
   [^HttpRequest request]
   (let [uri (.getUri request)
         query (.query uri)]
@@ -131,7 +132,8 @@
 
 (defn request-headers
   "Get all headers as a map.
-   Multi-valued headers return the first value."
+   Multi-valued headers return the last value (later entries overwrite
+   earlier ones with the same name)."
   [^HttpRequest request]
   (into {}
         (for [^HttpHeader header (iterator-seq (.iterator (.getHeaders request)))]

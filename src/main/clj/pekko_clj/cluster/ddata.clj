@@ -70,8 +70,6 @@
            [java.time Duration]
            [java.util.concurrent CompletableFuture]))
 
-(set! *warn-on-reflection* true)
-
 (def ^:private ^scala.Option none (scala.None$/MODULE$))
 
 (def ^:private default-consistency-timeout-ms 5000)
@@ -325,25 +323,44 @@
       ((:handler state) change))
     state))
 
+;; ActorRefs of change-subscriber actors subscribe spawned internally (passed
+;; a fn, not an ActorRef) — tracked so unsubscribe can also stop them: telling
+;; the replicator to Unsubscribe never stops the actor, so without this it
+;; runs forever.
+(defonce ^:private internal-subscribers (atom #{}))
+
+(defn- stop-if-internal!
+  "Poison-pill ref and forget it, if (and only if) it's in the internal-refs
+   registry — never touches a caller-supplied ActorRef."
+  [internal-refs ^ActorRef ref]
+  (when (contains? @internal-refs ref)
+    (swap! internal-refs disj ref)
+    (core/poison-pill ref)))
+
 (defn subscribe
   "Subscribe to changes of `key`. The final argument is either an ActorRef (which
    receives raw Changed/Deleted messages — convert them with `change->map`) or a
    function called with {:key :value :data :deleted?} for each change.
 
-   Returns the subscriber ActorRef; pass it to `unsubscribe` (and stop it when it
-   is one this function spawned)."
+   Returns the subscriber ActorRef; pass it to `unsubscribe`, which also stops
+   it when it's one this function spawned (a directly-passed ActorRef is left
+   running; the caller owns it)."
   [^ActorSystem system ^Key key subscriber-or-fn]
   (if (instance? ActorRef subscriber-or-fn)
     (do (core/! (replicator system) (Replicator$Subscribe. key ^ActorRef subscriber-or-fn))
         subscriber-or-fn)
-    (core/spawn system change-subscriber {:replicator (replicator system)
-                                          :key key
-                                          :handler subscriber-or-fn})))
+    (let [ref (core/spawn system change-subscriber {:replicator (replicator system)
+                                                    :key key
+                                                    :handler subscriber-or-fn})]
+      (swap! internal-subscribers conj ref)
+      ref)))
 
 (defn unsubscribe
-  "Stop sending change notifications for `key` to `subscriber`."
+  "Stop sending change notifications for `key` to `subscriber`. If `subscriber`
+   is an internal actor `subscribe` spawned, it is also stopped."
   [system ^Key key ^ActorRef subscriber]
   (core/! (replicator system) (Replicator$Unsubscribe. key subscriber))
+  (stop-if-internal! internal-subscribers subscriber)
   nil)
 
 ;; ---------------------------------------------------------------------------
@@ -418,5 +435,3 @@
                        nil)]
      (when (= :success (:status result))
        (:value result)))))
-
-(set! *warn-on-reflection* false)

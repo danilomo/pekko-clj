@@ -13,13 +13,15 @@
      (json-> \"{\\\"a\\\":1}\")     ;; => {:a 1}
      (unmarshal \"application/json; charset=UTF-8\" body)
 
-   Keys are keywordized when reading JSON (`json->` takes a flag to opt out)."
+   Keys are keywordized when reading JSON (`json->` takes a flag to opt out).
+
+   A Clojure string is encoded like any other value — `(->json \"hi\")` is the JSON
+   string `\"hi\"`, not the bare characters `hi`. To serve a body you have already
+   encoded, wrap it in `raw-body`."
   (:require [cheshire.core :as cheshire]
             [clojure.edn :as edn]
             [clojure.string :as str])
   (:import [org.apache.pekko.http.javadsl.model ContentType HttpCharsets MediaTypes]))
-
-(set! *warn-on-reflection* true)
 
 (def edn-content-type
   "ContentType for application/edn (UTF-8)."
@@ -27,14 +29,43 @@
                                 "edn" HttpCharsets/UTF_8 (into-array String ["edn"]))))
 
 ;; ---------------------------------------------------------------------------
+;; Pre-encoded bodies
+;; ---------------------------------------------------------------------------
+
+(defn raw-body
+  "Mark `s` as an already-encoded body that `->json` / `->edn` must emit verbatim.
+
+   `->json` and `->edn` used to pass *every* string through unchanged, on the
+   theory that a string must already be encoded. That made it impossible to serve
+   a Clojure string as a JSON string value: `(->json \"hello\")` emitted the bare
+   characters `hello`, which is not valid JSON, and no error said so. Encoding is
+   now uniform and pre-encoded bodies are explicit:
+
+     (->json {:a 1})                    ;; => \"{\\\"a\\\":1}\"
+     (->json \"hello\")                   ;; => \"\\\"hello\\\"\"    (a JSON string)
+     (->json (raw-body \"{\\\"a\\\":1}\"))    ;; => \"{\\\"a\\\":1}\"   (verbatim)
+
+   The marker is a plain map with a namespaced key, so nothing about it depends on
+   a type surviving serialization."
+  [s]
+  {::raw (str s)})
+
+(defn raw-body?
+  "True for a value produced by `raw-body`."
+  [x]
+  (and (map? x) (contains? x ::raw)))
+
+;; ---------------------------------------------------------------------------
 ;; JSON
 ;; ---------------------------------------------------------------------------
 
 (defn ->json
-  "Encode Clojure data as a JSON string. Strings are passed through unchanged, so
-   an already-encoded body is never double-encoded."
+  "Encode Clojure data as a JSON string.
+
+   Every value is encoded, strings included — `(->json \"hi\")` is `\"hi\"` with the
+   quotes. Wrap an already-encoded body in `raw-body` to emit it verbatim."
   ^String [data]
-  (if (string? data) data (cheshire/generate-string data)))
+  (if (raw-body? data) (::raw data) (cheshire/generate-string data)))
 
 (defn json->
   "Parse a JSON string into Clojure data. Object keys become keywords unless
@@ -48,9 +79,12 @@
 ;; ---------------------------------------------------------------------------
 
 (defn ->edn
-  "Encode Clojure data as an EDN string. Strings are passed through unchanged."
+  "Encode Clojure data as an EDN string.
+
+   Every value is encoded, strings included — `(->edn \"hi\")` is `\"hi\"` with the
+   quotes. Wrap an already-encoded body in `raw-body` to emit it verbatim."
   ^String [data]
-  (if (string? data) data (pr-str data)))
+  (if (raw-body? data) (::raw data) (pr-str data)))
 
 (defn edn->
   "Parse an EDN string into Clojure data using `clojure.edn/read-string` (safe:
@@ -74,5 +108,3 @@
       (str/includes? ct "json") (json-> body)
       (str/includes? ct "edn") (edn-> body)
       :else body)))
-
-(set! *warn-on-reflection* false)

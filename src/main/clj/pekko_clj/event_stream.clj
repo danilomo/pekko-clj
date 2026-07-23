@@ -33,30 +33,51 @@
     ((:handler state) msg)
     state))
 
+;; ActorRefs of handler actors subscribe spawned internally (passed a fn, not
+;; an ActorRef) — tracked so unsubscribe can also stop them: EventStream's
+;; unsubscribe only deregisters, it never stops the actor, so without this it
+;; runs forever.
+(defonce ^:private internal-subscribers (atom #{}))
+
+(defn- stop-if-internal!
+  "Poison-pill ref and forget it, if (and only if) it's in the internal-refs
+   registry — never touches a caller-supplied ActorRef."
+  [internal-refs ^ActorRef ref]
+  (when (contains? @internal-refs ref)
+    (swap! internal-refs disj ref)
+    (core/poison-pill ref)))
+
 ;; ---------------------------------------------------------------------------
 ;; Subscribe / unsubscribe / publish
 ;; ---------------------------------------------------------------------------
 
 (defn subscribe
   "Subscribe to events whose class is `event-class` (or a subclass). The final
-   argument is either an ActorRef (subscribed directly) or a function of one
-   argument (an internal subscriber actor is spawned that calls it per event).
+   argument is either an ActorRef (subscribed directly — the caller owns its
+   lifecycle) or a function of one argument (an internal subscriber actor is
+   spawned that calls it per event, and unsubscribe stops it too).
    Returns the subscriber ActorRef — pass it to `unsubscribe`."
   [^ActorSystem system ^Class event-class subscriber-or-fn]
-  (let [ref (if (instance? ActorRef subscriber-or-fn)
-              subscriber-or-fn
-              (core/spawn system event-subscriber {:handler subscriber-or-fn}))]
+  (let [internal? (not (instance? ActorRef subscriber-or-fn))
+        ref (if internal?
+              (core/spawn system event-subscriber {:handler subscriber-or-fn})
+              subscriber-or-fn)]
+    (when internal? (swap! internal-subscribers conj ref))
     (.subscribe (event-stream system) ref event-class)
     ref))
 
 (defn unsubscribe
   "Unsubscribe `subscriber-ref` from `event-class`, or from ALL classes when no
-   class is given. Returns nil."
+   class is given. If `subscriber-ref` is an internal actor `subscribe` spawned
+   (passed a fn), it is also stopped; an ActorRef the caller supplied directly
+   is left running (the caller owns it). Returns nil."
   ([^ActorSystem system ^ActorRef subscriber-ref]
    (.unsubscribe (event-stream system) subscriber-ref)
+   (stop-if-internal! internal-subscribers subscriber-ref)
    nil)
   ([^ActorSystem system ^ActorRef subscriber-ref ^Class event-class]
    (.unsubscribe (event-stream system) subscriber-ref event-class)
+   (stop-if-internal! internal-subscribers subscriber-ref)
    nil))
 
 (defn publish

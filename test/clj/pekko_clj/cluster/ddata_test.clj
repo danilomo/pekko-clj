@@ -1,6 +1,7 @@
 (ns pekko-clj.cluster.ddata-test
   "Tests for N8: Distributed Data (ORSet / LWWMap / PNCounter)."
   (:require [clojure.test :refer [deftest is]]
+            [pekko-clj.core :as core]
             [pekko-clj.cluster.ddata :as ddata]
             [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.actor ActorRef]
@@ -176,6 +177,32 @@
           (is (eventually (= #{"first" "second" "third"} (ddata/value sys k))))
           (Thread/sleep 500)                      ;; give a stray notification time to arrive
           (is (= seen (count @changes)))))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest unsubscribe-stops-internally-spawned-subscriber-test
+  ;; H12: subscribe passed a fn spawns an internal change-subscriber actor;
+  ;; unsubscribe used to only tell the replicator to remove the subscription,
+  ;; leaking the actor forever.
+  (let [sys (ts/create-cluster-system "ddata-unsub-leak-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [k (ddata/or-set-key "leak-check")
+            subscriber (ddata/subscribe sys k (fn [_]))]
+        (ddata/unsubscribe sys k subscriber)
+        (is (ts/stopped-within? sys subscriber)))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest unsubscribe-does-not-stop-a-caller-supplied-ref-test
+  (let [sys (ts/create-cluster-system "ddata-unsub-no-leak-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [k (ddata/or-set-key "no-leak-check")
+            worker (core/new-actor sys (fn [_ _] nil) nil)
+            subscriber (ddata/subscribe sys k worker)]
+        (ddata/unsubscribe sys k subscriber)
+        (is (not (ts/stopped-within? sys worker 500))))
       (finally
         (ts/terminate-system sys)))))
 

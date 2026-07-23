@@ -47,6 +47,15 @@ If you prefer operating with custom Flow graph blocks natively, you can integrat
 ;; Awaits the stream and returns ["Processed: Data 1" "Processed: Data 2"]
 ```
 
+### Materializers
+
+Every `run-*` above is handed the `ActorSystem` directly. That resolves to
+`(s/system-materializer sys)` — the single materializer the system owns, created
+on first use and shut down with the system. `(s/materializer sys)` builds a
+**new** materializer each call, and each one owns actors that live until it is
+explicitly shut down, so reach for it only when a stream needs its own settings
+or lifetime.
+
 ### Contrast with Scala (Pekko Typed)
 
 In native Scala, constructing a stream demands instantiating specific objects explicitly and attaching them.
