@@ -195,3 +195,30 @@
   ;; directly threw "No matching method toStrictEntity found taking 2 args".
   (testing "extract-strict-entity builds a route from a millisecond timeout"
     (is (routing/extract-strict-entity 1000 (fn [_] (routing/complete "ok"))))))
+
+;; ---------------------------------------------------------------------------
+;; Compression & timeout directives (N16) — construction / validation
+;; (behaviour is proven end-to-end in integration_test)
+;; ---------------------------------------------------------------------------
+
+(deftest compression-directives-build-routes-test
+  (testing "encode/decode directives build routes for the known coders"
+    (let [inner (routing/complete "ok")]
+      (is (routing/encode-response inner))
+      (is (routing/encode-response-with [:gzip :deflate] inner))
+      (is (routing/decode-request inner))
+      (is (routing/decode-request-with :gzip inner)))))
+
+(deftest coder-directives-reject-unknown-coder-test
+  (testing "an unknown coder keyword throws instead of silently falling back"
+    (is (thrown-with-msg? IllegalArgumentException #"Unknown coder"
+          (routing/encode-response-with [:brotli] (routing/complete "ok"))))
+    (is (thrown-with-msg? IllegalArgumentException #"Unknown coder"
+          (routing/decode-request-with :brotli (routing/complete "ok"))))))
+
+(deftest request-timeout-directives-build-routes-test
+  (testing "with-request-timeout / without-request-timeout build routes"
+    (let [inner (routing/complete "ok")]
+      (is (routing/with-request-timeout 1000 inner))
+      (is (routing/with-request-timeout 1000 (resp/response :service-unavailable "slow") inner))
+      (is (routing/without-request-timeout inner)))))

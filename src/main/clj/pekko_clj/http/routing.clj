@@ -13,6 +13,8 @@
    - static content: `from-resource`/`from-resource-directory`, `from-file`/
      `from-directory`, with content types resolved from the file extension
    - auth: `basic-auth` (challenge + 401 handled for you), `bearer-token`
+   - compression: `encode-response`/`decode-request` (gzip/deflate negotiated)
+   - timeouts: `with-request-timeout`/`without-request-timeout`
    - websockets: `websocket` over a stream Flow of Messages (`text-flow`)
 
    Example:
@@ -36,6 +38,7 @@
             HttpRequest ResponseEntity Uri
             StatusCodes]
            [org.apache.pekko.http.javadsl.model.ws Message TextMessage]
+           [org.apache.pekko.http.javadsl.coding Coder]
            [org.apache.pekko.japi.pf FI$Apply]
            [java.time Duration]
            [java.util.function Supplier Function]
@@ -551,6 +554,85 @@
                        (extract-request
                         (fn [req]
                           (inner-fn (.entity ^HttpRequest req))))))))
+
+;; ---------------------------------------------------------------------------
+;; Compression (content coding)
+;; ---------------------------------------------------------------------------
+
+(defn- ->coder
+  "Resolve a coder keyword to a Pekko Coder (a Coder passes through)."
+  ^Coder [coder]
+  (cond
+    (instance? Coder coder) coder
+    (= coder :gzip)    Coder/Gzip
+    (= coder :deflate) Coder/Deflate
+    (or (= coder :none) (= coder :identity)) Coder/NoCoding
+    :else (throw (IllegalArgumentException.
+                  (str "Unknown coder " (pr-str coder)
+                       " — expected :gzip, :deflate, :none, or a Coder")))))
+
+(defn encode-response
+  "Compress the response with whichever encoding the client asked for in
+   `Accept-Encoding` (gzip/deflate/identity), negotiated automatically. A client
+   that asks for none gets the response unchanged.
+
+   (encode-response my-routes)"
+  [inner-route]
+  (.encodeResponse directives (reify Supplier (get [_] inner-route))))
+
+(defn encode-response-with
+  "Like `encode-response`, but restrict the offered encodings to `coders` (a coll
+   of :gzip / :deflate / :none keywords or Coder values), in preference order.
+
+   (encode-response-with [:gzip] my-routes)"
+  [coders inner-route]
+  (.encodeResponseWith directives
+                       ^Iterable (mapv ->coder coders)
+                       (reify Supplier (get [_] inner-route))))
+
+(defn decode-request
+  "Decode a compressed request entity (per its `Content-Encoding`) before inner
+   routes read the body. gzip, deflate and identity are handled automatically.
+
+   (decode-request (with-request-body (fn [body] ...)))"
+  [inner-route]
+  (.decodeRequest directives (reify Supplier (get [_] inner-route))))
+
+(defn decode-request-with
+  "Like `decode-request`, but only accept the single `coder` (a :gzip / :deflate /
+   :none keyword or a Coder); a request in any other encoding is rejected."
+  [coder inner-route]
+  (.decodeRequestWith directives
+                      (->coder coder)
+                      (reify Supplier (get [_] inner-route))))
+
+;; ---------------------------------------------------------------------------
+;; Request Timeouts
+;; ---------------------------------------------------------------------------
+
+(defn with-request-timeout
+  "Override the server's request timeout for `inner-route`. If the route has not
+   completed within `timeout-ms`, Pekko finishes the request with 503 Service
+   Unavailable — or with `timeout-response` (an HttpResponse) when the 3-arity is
+   used.
+
+   (with-request-timeout 2000 slow-routes)
+   (with-request-timeout 2000 (resp/response :service-unavailable \"too slow\") slow-routes)"
+  ([timeout-ms inner-route]
+   (.withRequestTimeout directives
+                        (Duration/ofMillis (long timeout-ms))
+                        (reify Supplier (get [_] inner-route))))
+  ([timeout-ms ^HttpResponse timeout-response inner-route]
+   (.withRequestTimeout directives
+                        (Duration/ofMillis (long timeout-ms))
+                        (reify Function (apply [_ _req] timeout-response))
+                        (reify Supplier (get [_] inner-route)))))
+
+(defn without-request-timeout
+  "Disable the request timeout for `inner-route` (for long-lived responses such as
+   server-sent events or large downloads)."
+  [inner-route]
+  (.withoutRequestTimeout directives (reify Supplier (get [_] inner-route))))
 
 ;; ---------------------------------------------------------------------------
 ;; Compojure-style Macros

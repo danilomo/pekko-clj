@@ -136,6 +136,69 @@ which compares your known secret against it in constant time:
 an `Authorization: Bearer …` header, or nil when the header is absent or uses
 another scheme, and the route decides what that means.
 
+## HTTPS / TLS
+
+Build an `SSLContext` from a keystore/truststore with `pekko-clj.http.tls`, wrap
+it as a connection context, and hand it to the server or the client. `ssl-context`
+accepts a KeyStore or anything `clojure.java.io/input-stream` reads (a path, File,
+URL, or `io/resource`):
+
+```clojure
+(require '[pekko-clj.http.tls :as tls]
+         '[pekko-clj.http.client :as client])
+
+;; Server: a keystore holding the server key/cert
+(def server-ctx
+  (tls/https-server-context {:keystore "certs/server.p12"
+                             :keystore-password "changeit"}))
+(http/bind-server sys "0.0.0.0" 8443 app {:https server-ctx})
+
+;; Client: a truststore holding the CAs it trusts (needed for self-signed servers)
+(def client-ctx
+  (tls/https-client-context {:truststore "certs/truststore.p12"
+                             :truststore-password "changeit"}))
+
+;; per request …
+(client/GET sys "https://example.com/" {:https-context client-ctx})
+;; … or as the system default
+(client/set-default-client-https-context! sys client-ctx)
+```
+
+## Compression
+
+`encode-response` gzips/deflates the response according to the client's
+`Accept-Encoding` (and leaves it untouched when the client asks for none);
+`decode-request` inflates a compressed request body before inner routes read it:
+
+```clojure
+(r/encode-response
+  (r/decode-request
+    app))                          ; both negotiate gzip/deflate automatically
+```
+
+Restrict the offered/accepted codings with `encode-response-with [coders]` and
+`decode-request-with coder`, where a coder is `:gzip`, `:deflate`, or `:none`.
+Note the built-in client does **not** auto-decode responses — read the body bytes
+and inflate them (e.g. a `java.util.zip.GZIPInputStream`) when a response carries
+`Content-Encoding: gzip`.
+
+## Request timeouts
+
+`with-request-timeout` overrides the server's per-request deadline for a subtree;
+a route that overruns completes `503 Service Unavailable` (or a response you
+supply). `without-request-timeout` lifts the deadline for long-lived responses:
+
+```clojure
+(r/with-request-timeout 2000 app)                     ; 503 after 2s
+(r/with-request-timeout 2000
+  (resp/response :service-unavailable "too slow") app) ; custom timeout response
+(r/without-request-timeout streaming-download)
+```
+
+The strict-entity buffering timeouts in `http/entity->string` / `entity->bytes`
+and `client/response-body` / `response-body-bytes` also take an explicit
+millisecond argument as their last parameter.
+
 ## Marshalling: strings are values, not pre-encoded bodies
 
 `->json` / `->edn` (and therefore `resp/json`, `complete-json`, …) encode every

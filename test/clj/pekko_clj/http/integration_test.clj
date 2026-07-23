@@ -2,6 +2,7 @@
   "Integration tests for HTTP server and client."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.string :as str]
+            [clojure.java.io :as io]
             [pekko-clj.core :as core]
             [pekko-clj.stream :as stream]
             [pekko-clj.http.core :as http]
@@ -9,6 +10,7 @@
             [pekko-clj.http.response :as resp]
             [pekko-clj.http.marshalling :as marshal]
             [pekko-clj.http.client :as client]
+            [pekko-clj.http.tls :as tls]
             [pekko-clj.test-support :as ts])
   (:import [org.apache.pekko.http.javadsl Http]
            [org.apache.pekko.http.javadsl.model.ws WebSocketRequest]
@@ -16,6 +18,9 @@
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
            [java.net ServerSocket]
+           [java.util.function Supplier]
+           [java.util.zip GZIPOutputStream GZIPInputStream]
+           [java.io ByteArrayOutputStream ByteArrayInputStream]
            [java.util.concurrent CompletableFuture]))
 
 (def ^:dynamic *system* nil)
@@ -774,3 +779,154 @@
         (let [[status body] (get-status+body (str "http://127.0.0.1:" *port* "/pre-encoded"))]
           (is (= 200 status))
           (is (= "{\"a\":1}" body) "raw-body is emitted verbatim"))))))
+
+;; ---------------------------------------------------------------------------
+;; N16: HTTPS
+;; ---------------------------------------------------------------------------
+;;
+;; test/resources/certs holds a self-signed server keystore (server.p12, with an
+;; ip:127.0.0.1 / dns:localhost SAN so hostname verification passes on loopback)
+;; and a truststore (truststore.p12) holding just that cert for the client to trust.
+
+(defn- server-https-context []
+  (tls/https-server-context {:keystore (io/resource "certs/server.p12")
+                             :keystore-password "changeit"}))
+
+(defn- client-https-context []
+  (tls/https-client-context {:truststore (io/resource "certs/truststore.p12")
+                             :truststore-password "changeit"}))
+
+(deftest https-round-trip-test
+  (testing "a self-signed https server answers a client that trusts its cert"
+    (let [routes (routing/path "secure"
+                   (routing/method-get (routing/path-end (routing/complete "over TLS"))))
+          binding (-> (http/bind-server *system* "127.0.0.1" *port* routes
+                                        {:https (server-https-context)})
+                      (stream/await-completion 5000))]
+      (try
+        (let [response (-> (client/GET *system* (str "https://127.0.0.1:" *port* "/secure")
+                             {:https-context (client-https-context)})
+                           (client/await-response 5000))]
+          (is (= 200 (client/response-status response)))
+          (is (= "over TLS" (-> (client/response-body response *system*)
+                                (client/await-response 5000)))))
+        (finally
+          (stream/await-completion (http/unbind binding) 5000))))))
+
+;; ---------------------------------------------------------------------------
+;; N16: compression
+;; ---------------------------------------------------------------------------
+
+(defn- gzip ^bytes [^String s]
+  (let [baos (ByteArrayOutputStream.)]
+    (with-open [gz (GZIPOutputStream. baos)]
+      (.write gz (.getBytes s "UTF-8")))
+    (.toByteArray baos)))
+
+(defn- gunzip [^bytes b]
+  (with-open [gz (GZIPInputStream. (ByteArrayInputStream. b))]
+    (String. (.readAllBytes gz) "UTF-8")))
+
+(deftest gzip-encode-response-test
+  (testing "encode-response gzips when the client asks for it, and the body decodes"
+    (let [payload (apply str (repeat 50 "pekko-clj compresses this response. "))
+          routes (routing/encode-response
+                  (routing/path "data"
+                    (routing/method-get (routing/path-end (routing/complete payload)))))]
+      (with-test-server routes
+        (fn []
+          (let [response (-> (client/GET *system* (url "/data")
+                               {:headers {"Accept-Encoding" "gzip"}})
+                             (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (= "gzip" (client/response-header response "Content-Encoding"))
+                "the response advertises gzip")
+            ;; the pekko client does not auto-decode, so the raw body is gzip bytes
+            (let [raw (-> (client/response-body-bytes response *system*)
+                          (client/await-response 5000))]
+              (is (= payload (gunzip raw)) "the gzipped body inflates to the original"))))))))
+
+(deftest gzip-encode-response-skipped-without-accept-encoding-test
+  (testing "with no Accept-Encoding, encode-response leaves the body identity-coded"
+    (let [routes (routing/encode-response
+                  (routing/path "data"
+                    (routing/method-get (routing/path-end (routing/complete "plain")))))]
+      (with-test-server routes
+        (fn []
+          (let [response (-> (client/GET *system* (url "/data")) (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (not= "gzip" (client/response-header response "Content-Encoding")))
+            (is (= "plain" (get-body response)))))))))
+
+(deftest gzip-decode-request-test
+  (testing "decode-request inflates a gzipped request body before the route reads it"
+    (let [routes (routing/path "ingest"
+                   (routing/method-post
+                     (routing/path-end
+                       (routing/decode-request
+                        (routing/with-request-body
+                          (fn [body] (routing/complete (str "got:" body))))))))]
+      (with-test-server routes
+        (fn []
+          (let [response (-> (client/POST *system* (url "/ingest")
+                               {:body (gzip "hello gzip")
+                                :content-type :plain
+                                :headers {"Content-Encoding" "gzip"}})
+                             (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (= "got:hello gzip" (get-body response))
+                "the server saw the decompressed text")))))))
+
+;; ---------------------------------------------------------------------------
+;; N16: request timeouts
+;; ---------------------------------------------------------------------------
+
+(deftest request-timeout-returns-503-test
+  (testing "a route that overruns with-request-timeout completes 503; a fast one is fine"
+    (let [slow-response (CompletableFuture/supplyAsync
+                         (reify Supplier
+                           (get [_] (Thread/sleep 3000) (resp/ok "late"))))
+          routes (routing/with-request-timeout 500
+                   (routing/routes
+                     (routing/path "fast"
+                       (routing/method-get (routing/path-end (routing/complete "quick"))))
+                     (routing/path "slow"
+                       (routing/method-get
+                         (routing/path-end (routing/complete-future slow-response))))))]
+      (with-test-server routes
+        (fn []
+          (let [fast (-> (client/GET *system* (url "/fast")) (client/await-response 5000))]
+            (is (= 200 (client/response-status fast)))
+            (is (= "quick" (get-body fast))))
+          (let [slow (-> (client/GET *system* (url "/slow")) (client/await-response 5000))]
+            (is (= 503 (client/response-status slow))
+                "the request timed out with Service Unavailable")))))))
+
+;; ---------------------------------------------------------------------------
+;; N16: strict-entity timeout is configurable
+;; ---------------------------------------------------------------------------
+
+(deftest strict-entity-timeout-option-test
+  (testing "entity->string and response-body accept an explicit strict timeout"
+    ;; The materializer comes from the route context (extract-materializer): the
+    ;; handler runs on a Pekko dispatcher thread where the test's *system* binding
+    ;; is no longer in scope.
+    (let [routes (routing/path "echo"
+                   (routing/method-post
+                     (routing/path-end
+                       (routing/extract-request
+                        (fn [req]
+                          (routing/extract-materializer
+                           (fn [mat]
+                             (routing/complete-future
+                              (-> (http/entity->string req mat 3000)
+                                  (client/then-apply resp/ok))))))))))]
+      (with-test-server routes
+        (fn []
+          (let [response (-> (client/POST *system* (url "/echo")
+                               {:body "timed body" :content-type :plain})
+                             (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (= "timed body"
+                   (-> (client/response-body response *system* 3000)
+                       (client/await-response 5000))))))))))

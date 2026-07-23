@@ -7,6 +7,7 @@
  {:analyze-call
   {pekko-clj.core/defactor                hooks.pekko-clj.defactor/defactor
    pekko-clj.persistence/defactor-persistent hooks.pekko-clj.defactor/defactor-persistent
+   pekko-clj.persistence.delivery/defactor-delivery hooks.pekko-clj.defactor/defactor-delivery
    ;; (GET "/users/:id" [id] ...) — the binding vector is scoped over the body.
    pekko-clj.http.routing/GET             hooks.pekko-clj.routing/route
    pekko-clj.http.routing/POST            hooks.pekko-clj.routing/route

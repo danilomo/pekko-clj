@@ -131,7 +131,11 @@
         clause-heads #{'init 'handle 'command 'event 'on-stop 'on-restart
                        'supervision 'on-error 'tagger 'snapshot-every
                        'delete-events-on-snapshot 'on-recovery-complete
-                       'recovery 'journal-plugin-id 'snapshot-plugin-id}
+                       'recovery 'journal-plugin-id 'snapshot-plugin-id
+                       ;; defactor-delivery config clauses (single value each,
+                       ;; so they fall through to the default rewrite branch).
+                       'redeliver-interval 'redelivery-burst-limit
+                       'warn-after-unconfirmed 'max-unconfirmed}
         {clauses true others false} (group-by #(clause? clause-heads %) body)]
     {:node
      (api/list-node
@@ -155,5 +159,11 @@
 (defn defactor-persistent
   "Hook for pekko-clj.persistence/defactor-persistent. Command bodies see both
    `this` (the actor) and `state`; event bodies see `state`."
+  [call]
+  (rewrite '[this state] call))
+
+(defn defactor-delivery
+  "Hook for pekko-clj.persistence.delivery/defactor-delivery. Both command and
+   event bodies see `this` and `state` (the delivery event handler takes `this`)."
   [call]
   (rewrite '[this state] call))

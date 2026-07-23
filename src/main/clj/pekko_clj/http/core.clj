@@ -3,7 +3,7 @@
 
    Provides server binding, request accessors, and entity handling."
   (:require [clojure.string :as str])
-  (:import [org.apache.pekko.http.javadsl Http ServerBinding ServerBuilder]
+  (:import [org.apache.pekko.http.javadsl Http ServerBinding ServerBuilder HttpsConnectionContext]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpMethods HttpHeader RequestEntity]
            [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
            [org.apache.pekko.japi Pair]
@@ -18,6 +18,20 @@
 ;; Server Lifecycle
 ;; ---------------------------------------------------------------------------
 
+(defn- bind-route
+  "Bind a Route or a plain request->CompletionStage<HttpResponse> function on an
+   already-configured ServerBuilder."
+  [^ServerBuilder builder route]
+  (if (instance? Route route)
+    (.bind builder ^Route route)
+    ;; route is a function: HttpRequest -> CompletionStage<HttpResponse>.
+    ;; ServerBuilder.bind takes Pekko's japi Function, NOT java.util.function
+    ;; .Function — reifying the latter throws "No matching method bind".
+    (.bind builder
+           (reify org.apache.pekko.japi.function.Function
+             (apply [_ request]
+               (route request))))))
+
 (defn bind-server
   "Bind an HTTP server to a host and port with the given route handler.
 
@@ -26,29 +40,27 @@
    port: port number
    route: a Route or function (request -> CompletionStage<HttpResponse>)
 
+   The optional last argument is either a Materializer (kept for back-compat) or
+   an options map:
+   - :materializer - a stream Materializer
+   - :https        - an HttpsConnectionContext (see `pekko-clj.http.tls/
+                     https-server-context`); when present the server speaks TLS
+
    Returns a CompletionStage<ServerBinding>."
   ([system host port route]
-   (let [http (Http/get ^ActorSystem system)
-         ^ServerBuilder builder (.newServerAt http ^String host (int port))]
-     (if (instance? Route route)
-       (.bind builder ^Route route)
-       ;; route is a function: HttpRequest -> CompletionStage<HttpResponse>.
-       ;; ServerBuilder.bind takes Pekko's japi Function, NOT java.util.function
-       ;; .Function — reifying the latter throws "No matching method bind".
-       (.bind builder
-              (reify org.apache.pekko.japi.function.Function
-                (apply [_ request]
-                  (route request)))))))
-  ([system host port route materializer]
-   (let [http (Http/get ^ActorSystem system)
-         ^ServerBuilder builder (-> (.newServerAt http ^String host (int port))
-                                    (.withMaterializer materializer))]
-     (if (instance? Route route)
-       (.bind builder ^Route route)
-       (.bind builder
-              (reify org.apache.pekko.japi.function.Function
-                (apply [_ request]
-                  (route request))))))))
+   (bind-server system host port route {}))
+  ([system host port route mat-or-opts]
+   (let [opts (if (instance? Materializer mat-or-opts)
+                {:materializer mat-or-opts}
+                mat-or-opts)
+         {:keys [materializer https]} opts
+         http (Http/get ^ActorSystem system)
+         ^ServerBuilder builder (.newServerAt http ^String host (int port))
+         ^ServerBuilder builder (if materializer (.withMaterializer builder materializer) builder)
+         ^ServerBuilder builder (if https
+                                  (.enableHttps builder ^HttpsConnectionContext https)
+                                  builder)]
+     (bind-route builder route))))
 
 (defn unbind
   "Unbind a server, stopping it from accepting new connections.
@@ -151,7 +163,8 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private entity-strict-timeout-ms
-  "How long entity->string / entity->bytes wait for the body to be fully collected."
+  "Default time entity->string / entity->bytes wait for the body to be fully
+   collected. Override per call with the trailing timeout-ms argument."
   10000)
 
 (defn ->materializer
@@ -169,25 +182,31 @@
   "Convert a request entity to a string.
    Returns a CompletionStage<String>.
 
-   materializer-or-system: Materializer or ActorSystem"
-  [^HttpRequest request materializer-or-system]
-  (let [mat (->materializer materializer-or-system)]
-    (-> (.toStrict ^RequestEntity (.entity request) (long entity-strict-timeout-ms) mat)
-        (.thenApply (reify Function
-                      (apply [_ strict]
-                        (.utf8String (.getData ^HttpEntity$Strict strict))))))))
+   materializer-or-system: Materializer or ActorSystem
+   timeout-ms: how long to wait for the body (default 10000)."
+  ([^HttpRequest request materializer-or-system]
+   (entity->string request materializer-or-system entity-strict-timeout-ms))
+  ([^HttpRequest request materializer-or-system timeout-ms]
+   (let [mat (->materializer materializer-or-system)]
+     (-> (.toStrict ^RequestEntity (.entity request) (long timeout-ms) mat)
+         (.thenApply (reify Function
+                       (apply [_ strict]
+                         (.utf8String (.getData ^HttpEntity$Strict strict)))))))))
 
 (defn entity->bytes
   "Convert a request entity to a byte array.
    Returns a CompletionStage<byte[]>.
 
-   materializer-or-system: Materializer or ActorSystem"
-  [^HttpRequest request materializer-or-system]
-  (let [mat (->materializer materializer-or-system)]
-    (-> (.toStrict ^RequestEntity (.entity request) (long entity-strict-timeout-ms) mat)
-        (.thenApply (reify Function
-                      (apply [_ strict]
-                        (.toArray (.getData ^HttpEntity$Strict strict))))))))
+   materializer-or-system: Materializer or ActorSystem
+   timeout-ms: how long to wait for the body (default 10000)."
+  ([^HttpRequest request materializer-or-system]
+   (entity->bytes request materializer-or-system entity-strict-timeout-ms))
+  ([^HttpRequest request materializer-or-system timeout-ms]
+   (let [mat (->materializer materializer-or-system)]
+     (-> (.toStrict ^RequestEntity (.entity request) (long timeout-ms) mat)
+         (.thenApply (reify Function
+                       (apply [_ strict]
+                         (.toArray (.getData ^HttpEntity$Strict strict)))))))))
 
 (defn entity->data-bytes
   "Get the entity data as a Source of ByteString.

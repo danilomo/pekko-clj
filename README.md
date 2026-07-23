@@ -9,6 +9,7 @@ pekko-clj provides a declarative `defactor` macro with implicit state binding, `
 - **Declarative Actor Definition** - `defactor` macro with pattern matching
 - **Erlang-style Messaging** - `!` (tell), `<?>` (ask), `<!` (blocking ask)
 - **Event Sourcing** - `defactor-persistent` with commands, events, and snapshots
+- **At-least-once delivery** - `defactor-delivery` for reliable, redelivered messaging
 - **Reactive Streams** - Functional stream API with backpressure
 - **Clustering** - Cluster membership, events, and state management
 - **Cluster Sharding** - Distribute actors across cluster nodes
@@ -280,6 +281,41 @@ pekko-clj ships no journal or snapshot-store plugin of its own — LevelDB (via
 consumers of this library. For production, configure a real Pekko Persistence
 plugin (e.g. `pekko-persistence-jdbc`, `pekko-persistence-r2dbc`, or
 `pekko-persistence-cassandra`) in your own `application.conf`.
+
+### At-least-once delivery
+
+For reliable actor-to-actor messaging — a message that must arrive even across
+crashes and restarts — `pekko-clj.persistence.delivery/defactor-delivery` wraps
+Pekko's `AtLeastOnceDelivery`. Call `deliver`/`confirm-delivery!` from the *event*
+handler so a journal replay rebuilds the outstanding set; the message is
+redelivered on `redeliver-interval` until confirmed:
+
+```clojure
+(require '[pekko-clj.persistence.delivery :as d])
+
+(d/defactor-delivery notifier
+  :persistence-id (fn [args] (str "notifier-" (:id args)))
+  (init [args] {:target (:target args)})
+
+  (command [:notify payload]      (d/persist [:queued payload]))
+  (command [:ack delivery-id]     (d/persist [:confirmed delivery-id]))
+
+  (event [:queued payload]
+    (d/deliver (:target state) (fn [delivery-id] [:deliver delivery-id payload]))
+    state)
+  (event [:confirmed delivery-id]
+    (d/confirm-delivery! delivery-id)
+    state)
+
+  (redeliver-interval (java.time.Duration/ofSeconds 5)))
+```
+
+It is a deliberate sibling of `defactor-persistent`, not a mode of it: Pekko's
+timers (which `defactor-persistent` exposes) and at-least-once delivery come from
+two Scala traits that a single Java class cannot combine without a Scala compiler,
+so a delivery actor trades the timer clauses for the delivery ones
+(`redeliver-interval`, `redelivery-burst-limit`, `warn-after-unconfirmed`,
+`max-unconfirmed`). The `persist`/`then`/`defer` helpers are re-exported unchanged.
 
 ## Reactive Streams
 
@@ -573,6 +609,24 @@ Body helpers: `with-request-body` (string), `with-json-body`, `with-edn-body`,
 `complete-edn`, and the `pekko-clj.http.response` builders (`ok`, `created`,
 `not-found`, `redirect`, …). Encoding/decoding lives in
 `pekko-clj.http.marshalling` (Cheshire for JSON, `clojure.edn` for EDN).
+
+Static content (`from-resource`/`from-directory`), auth (`basic-auth`,
+`bearer-token`), compression (`encode-response`/`decode-request`, gzip/deflate),
+and per-subtree `with-request-timeout` are all directives too. For TLS, build a
+context from a keystore with `pekko-clj.http.tls` and pass it to the server or
+client:
+
+```clojure
+(require '[pekko-clj.http.tls :as tls] '[pekko-clj.http.client :as client])
+
+(http/bind-server sys "0.0.0.0" 8443 app
+  {:https (tls/https-server-context {:keystore "certs/server.p12"
+                                     :keystore-password "changeit"})})
+
+(client/GET sys "https://example.com/"
+  {:https-context (tls/https-client-context {:truststore "certs/truststore.p12"
+                                             :truststore-password "changeit"})})
+```
 
 ## Design Principles
 

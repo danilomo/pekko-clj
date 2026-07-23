@@ -54,11 +54,11 @@ commit `7e59e55`.
 | H12 | Subscriber lifecycle + odds-and-ends cleanups | Hardening | DONE | — | low |
 | N10 | Persistent sharded entities (CQRS aggregates) | New | DONE | B14 | high |
 | N11 | Persistence depth: `persist-async`, `defer`, plugins, recovery, lifecycle | New | DONE | B12, B15 | medium |
-| N12 | At-least-once delivery | New | TODO | N11 | medium |
+| N12 | At-least-once delivery | New | DONE | N11 | medium |
 | N13 | Streams consistency fixes + missing operators | New | DONE | — | medium |
 | N14 | Streams FileIO + StreamConverters | New | DONE | N13 | low |
 | N15 | HTTP routing completion: segment capture, static content, auth | New | DONE | B11 | medium |
-| N16 | HTTPS + compression + request timeouts | New | TODO | N15 | medium |
+| N16 | HTTPS + compression + request timeouts | New | DONE | N15 | medium |
 | N17 | Transit record support | New | DONE | — | low |
 | N18 | Router parity leftovers | New | DONE | H7 | low |
 | N19 | Small parity odds and ends | New | DONE | — | low |
@@ -662,10 +662,9 @@ subscribe/unsubscribe rows were already ✅ and stay that way.
 
 ## Milestone N — Parity
 
-**Definition of done reached (2026-07-23):** all B + H stories plus the four
-required N stories (N10, N11, N13, N15) are `DONE`. Of the prioritized-optional
-tail, N14, N17, N18, and N19 are now also `DONE`; what remains is **N12**
-(at-least-once delivery) and **N16** (HTTPS + compression + request timeouts).
+**Epic complete (2026-07-23):** all B + H stories, the four required N stories
+(N10, N11, N13, N15), and the entire prioritized-optional tail (N12, N14, N16,
+N17, N18, N19) are `DONE`. Every story in the index is `DONE`.
 
 
 ### N10 · Persistent sharded entities (CQRS aggregates) — `DONE`
@@ -834,7 +833,71 @@ Update the kondo hook + cljfmt indents for every new clause (per CLAUDE.md).
 **Tests:** each clause end-to-end; persist-async ordering vs persist; recovery-none
 skips replay.
 
-### N12 · At-least-once delivery — `TODO`
+### N12 · At-least-once delivery — `DONE`
+**Note (2026-07-23):** built as a **sibling** of `defactor-persistent`, not on
+top of the N11 Java class as the sketch proposed — deliberately, and worth
+recording. `AtLeastOnceDelivery` and the `Timers` that N11 gave
+`CljPersistentActor` are two Scala traits, and with no Scala compiler in this
+build (`:java-source-paths` only), Java single inheritance cannot combine them:
+there is no provided abstract class mixing both. Folding `AtLeastOnceDelivery`
+into `CljPersistentActor` instead would also saddle **every** persistent actor
+with the trait's unconditional periodic redelivery tick. So N12 is a lean,
+self-contained sibling — `CljAtLeastOnceDeliveryActor` (extends
+`AbstractPersistentActorWithAtLeastOnceDelivery`) + a new namespace
+`pekko-clj.persistence.delivery` with `defactor-delivery` — and N11 /
+`CljPersistentActor` are **untouched** (zero regression risk). This matches the
+codebase's documented preference (H12, N11 notes) for controlled duplication over
+premature shared abstractions; the alternative (a shared `PersistentActorOps`
+interface to retag the macro + helpers against) was rejected as the same refactor
+N11 already declined, for a prioritized-optional story.
+**No linearization dance needed:** unlike `AbstractPersistentActorWithTimers`
+(N11's fight), `AbstractPersistentActorWithAtLeastOnceDelivery` exposes concrete
+`aroundReceive`/`aroundPreRestart`/`aroundPostStop`, so extending it from Java
+compiles without the Eventsourced-forwarder overrides.
+**Restart survival is by replay, not snapshots.** `deliver` / `confirm-delivery!`
+are called from the **event** handler, so recovery re-runs them for every replayed
+event — re-issuing the still-unconfirmed deliveries (Pekko re-derives the same
+delivery ids from the restored delivery sequence number) and dropping the
+confirmed ones. The outstanding set is therefore rebuilt from the journal with no
+delivery snapshot involved, which is why this lean class ships no snapshotting
+(adding composite state+delivery snapshots is the obvious future enhancement). To
+make that work the delivery event handler is 3-arg `(fn [this state event])` —
+`this` is bound during recovery too — where `defactor-persistent`'s is 2-arg.
+**API:** clauses `redeliver-interval` (java.time.Duration), `redelivery-burst-limit`,
+`warn-after-unconfirmed`, `max-unconfirmed` (each overrides the matching Pekko
+method only when supplied), plus `init`/`command`/`event`/`on-recovery-complete`/
+`on-stop`/`supervision`. Helpers `deliver` (an ActorRef or ActorPath + a
+delivery-id→message fn), `confirm-delivery!`, `num-unconfirmed`, plus
+`reply`/`self`/`sender`/`context`/`tell`/`watch`/`unwatch`/`recovering?` typed to
+the delivery class via `*current-delivery-actor*`; the class-agnostic
+`persist`/`persist-all`/`persist-async`/`persist-all-async`/`defer`/`then` are
+re-exported unchanged. `deliver` shadows `clojure.core/deliver`, so the ns does
+`(:refer-clojure :exclude [deliver])`. Validation (H8 style) throws at expansion
+on an unknown clause, a duplicate singleton, or a missing `:persistence-id`.
+**Java suppressions, both intentional and documented in-file:**
+`org.apache.pekko.japi.Function` (the only type `AtLeastOnceDeliveryLike.deliver`
+accepts from Java — no non-deprecated overload) is deprecated →
+`@SuppressWarnings("deprecation")` on `deliverTo`; the inherited Scala trait
+accessors have raw generic return types (`SortedMap`, `Option`) → class-level
+`@SuppressWarnings("unchecked")`. Reflection-clean.
+**Kondo/cljfmt (per CLAUDE.md):** added a `defactor-delivery` hook (delegates to
+the shared `rewrite` with `[this state]` anaphors, correct for both command and
+event bodies here) and the four config clause-heads to the hook's shared set;
+registered `pekko-clj.persistence.delivery/defactor-delivery` in the export
+`config.edn`. No cljfmt `:extra-indents` entry needed — the config clauses take a
+single value (default indent), and command/event/init/on-recovery-complete/on-stop/
+supervision are already covered.
+Tests (`persistence/delivery_test.clj`, 5, real LevelDB-backed system,
+redeliver-interval 300 ms): `redelivers-until-confirmed-then-stops-test` (a
+message arrives ≥2×, `num-unconfirmed` = 1, ack → `num-unconfirmed` polls to 0,
+then the received count is stable), `delivery-state-survives-restart-test`
+(deliver, poison-pill the sender + `stopped-within?`, re-spawn with the same
+persistence id → redelivery resumes from replay and `num-unconfirmed` is rebuilt
+to 1, then ack stops it), and three macro-validation guards
+(unknown-clause / missing-`:persistence-id` / duplicate-singleton). README gained
+an "At-least-once delivery" subsection + a Features bullet; no `docs/specs/*` or
+`doc/` guide covers persistence. `lein test` (610 tests, was 605), `lein lint`,
+`lein check` (no reflection warnings) all clean.
 **Deps:** N11.
 `AbstractPersistentActorWithAtLeastOnceDelivery` is a marquee Pekko persistence
 feature with no wrapper: reliable actor-to-actor delivery with redelivery +
@@ -1048,7 +1111,57 @@ was 566), `lein lint`, `lein check` (no reflection warnings) all clean.
 **Tests:** end-to-end per directive; auth 401/challenge; static file with correct
 content type; the json-string decision's behavior pinned.
 
-### N16 · HTTPS + compression + request timeouts — `TODO`
+### N16 · HTTPS + compression + request timeouts — `DONE`
+**Note (2026-07-23):** all three parts built, plus the strict-entity timeout
+options. Signatures verified with `javap` first (the epic's reflection rule):
+`ConnectionContext/httpsServer|httpsClient(SSLContext)`,
+`ServerBuilder.enableHttps(HttpsConnectionContext)`,
+`Http.singleRequest(req, HttpsConnectionContext)` /
+`setDefaultClientHttpsContext`, `withRequestTimeout(java.time.Duration,
+Supplier|Function, …)`, `encodeResponse`/`decodeRequest` on `AllDirectives`.
+**HTTPS:** new ns `pekko-clj.http.tls` — `ssl-context` (a JSSE `SSLContext` from
+a keystore/truststore opts map; each store is a `KeyStore` **or** anything
+`clojure.java.io/input-stream` reads — path/File/URL/`io/resource` — so it works
+off the classpath; throws if neither store is given) and
+`https-server-context`/`https-client-context` (each takes an opts map **or** a
+ready `SSLContext`). `bind-server` gained a 5th arg that is now *either* a
+`Materializer` (unchanged back-compat, kept by an `instance?` check) *or* an opts
+map `{:https … :materializer …}`; the route-vs-function bind logic moved to a
+private `bind-route`. Client: `set-default-client-https-context!` plus a
+per-request `:https-context` on `request`/`GET`/… (routes to the
+`singleRequest(req, ctx)` overload). **Chose keystore-based `SSLContext` over
+Pekko's `PekkoSSLConfig` path** — the JSSE route is standard, dependency-free, and
+lets the same helper serve key managers (server) and trust managers (client).
+**Compression:** `encode-response`/`decode-request` (auto-negotiated) plus
+`encode-response-with [coders]` / `decode-request-with coder`; a private `->coder`
+maps `:gzip`/`:deflate`/`:none` (or a `Coder`) and **throws** on anything else
+(H7 style, no silent fallback). **Timeouts:** `with-request-timeout` (2-arity →
+503; 3-arity → a custom `HttpResponse`) and `without-request-timeout`. The
+hard-coded strict-entity timeouts are now optional trailing args:
+`http/entity->string`/`entity->bytes` (default 10 s) and
+`client/response-body`/`response-body-bytes` (default 30 s).
+**Two gotchas recorded in the tests:** (1) the built-in client does **not**
+auto-decode a gzipped response — the body bytes arrive gzipped with
+`Content-Encoding: gzip`, so a caller inflates them (a `GZIPInputStream` in the
+test); (2) a route handler runs on a Pekko dispatcher thread where a test's
+`binding [*system* …]` is gone, so reaching for the materializer via the dynamic
+var NPE'd ("system must not be null") — the strict-entity test reads it from the
+route context via `extract-materializer` instead.
+Test fixtures: `test/resources/certs/server.p12` (self-signed, SAN
+`dns:localhost,ip:127.0.0.1` so loopback hostname verification passes) and
+`truststore.p12` (that cert only, for the client to trust). Tests: `tls_test.clj`
+(4: store-required throw, build-from-keystore, build-from-truststore, contexts
+from opts-or-SSLContext); `routing_test.clj` (3: coder/timeout directives build,
+unknown-coder throws); `http/integration_test.clj` (6, real bound server:
+`https-round-trip-test`, `gzip-encode-response-test` + the
+no-`Accept-Encoding` skip case, `gzip-decode-request-test`,
+`request-timeout-returns-503-test` (fast route OK, slow route → 503),
+`strict-entity-timeout-option-test`). `doc/06-http.md` gained HTTPS/Compression/
+Request-timeout sections; README's HTTP paragraph lists the new directives and
+shows the TLS setup. No macro clause added/renamed → no clj-kondo hook / cljfmt
+change. No `docs/specs/*` checklist covers HTTP (routing-parity-spec.md is about
+*router* strategies). `lein test` (605 tests, was 592), `lein lint`, `lein check`
+(no reflection warnings) all clean.
 **Deps:** N15.
 - **HTTPS:** server (`ConnectionContext/httpsServer` from a keystore opts map,
   `ServerBuilder.enableHttps`) and client (`Http.setDefaultClientHttpsContext` /

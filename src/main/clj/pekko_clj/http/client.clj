@@ -4,7 +4,7 @@
    Provides simple HTTP request functions with async response handling."
   (:require [pekko-clj.http.response :as resp]
             [pekko-clj.http.core :as http])
-  (:import [org.apache.pekko.http.javadsl Http]
+  (:import [org.apache.pekko.http.javadsl Http HttpsConnectionContext]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse HttpMethods
             HttpHeader ResponseEntity ContentType$NonBinary]
            [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
@@ -19,7 +19,8 @@
 ;; ---------------------------------------------------------------------------
 
 (def ^:private response-strict-timeout-ms
-  "How long response-body / response-body-bytes wait for the body to be collected."
+  "Default time response-body / response-body-bytes wait for the body to be
+   collected. Override per call with the trailing timeout-ms argument."
   30000)
 
 (defn- build-request
@@ -57,12 +58,23 @@
 ;; Request Functions
 ;; ---------------------------------------------------------------------------
 
+(defn set-default-client-https-context!
+  "Install `ctx` (an HttpsConnectionContext from `pekko-clj.http.tls/
+   https-client-context`) as the default context for outgoing https requests on
+   this system, so requests need not pass :https-context each time."
+  [system ^HttpsConnectionContext ctx]
+  (.setDefaultClientHttpsContext (Http/get ^ActorSystem system) ctx))
+
 (defn request
   "Make an HTTP request.
 
    method: :get, :post, :put, :delete, :head, :options, :patch
    url: request URL string
-   opts: optional map with :headers, :body, :content-type
+   opts: optional map with :headers, :body, :content-type, :https-context
+
+   :https-context is an HttpsConnectionContext used for this request only (see
+   `pekko-clj.http.tls/https-client-context`); without it, https requests use the
+   system default context.
 
    Returns CompletionStage<HttpResponse>."
   ([system method url]
@@ -80,7 +92,9 @@
                        :connect HttpMethods/CONNECT)
          req (build-request http-method url opts)
          http (Http/get ^ActorSystem system)]
-     (.singleRequest http req))))
+     (if-let [ctx (:https-context opts)]
+       (.singleRequest http req ^HttpsConnectionContext ctx)
+       (.singleRequest http req)))))
 
 (defn GET
   "Make a GET request.
@@ -205,25 +219,31 @@
   "Get the response body as a string.
    Returns a CompletionStage<String>.
 
-   materializer-or-system: Materializer or ActorSystem"
-  [^HttpResponse response materializer-or-system]
-  (let [mat (http/->materializer materializer-or-system)]
-    (-> (.toStrict ^ResponseEntity (.entity response) (long response-strict-timeout-ms) mat)
-        (.thenApply (reify Function
-                      (apply [_ strict]
-                        (.utf8String (.getData ^HttpEntity$Strict strict))))))))
+   materializer-or-system: Materializer or ActorSystem
+   timeout-ms: how long to wait for the body (default 30000)."
+  ([^HttpResponse response materializer-or-system]
+   (response-body response materializer-or-system response-strict-timeout-ms))
+  ([^HttpResponse response materializer-or-system timeout-ms]
+   (let [mat (http/->materializer materializer-or-system)]
+     (-> (.toStrict ^ResponseEntity (.entity response) (long timeout-ms) mat)
+         (.thenApply (reify Function
+                       (apply [_ strict]
+                         (.utf8String (.getData ^HttpEntity$Strict strict)))))))))
 
 (defn response-body-bytes
   "Get the response body as a byte array.
    Returns a CompletionStage<byte[]>.
 
-   materializer-or-system: Materializer or ActorSystem"
-  [^HttpResponse response materializer-or-system]
-  (let [mat (http/->materializer materializer-or-system)]
-    (-> (.toStrict ^ResponseEntity (.entity response) (long response-strict-timeout-ms) mat)
-        (.thenApply (reify Function
-                      (apply [_ strict]
-                        (.toArray (.getData ^HttpEntity$Strict strict))))))))
+   materializer-or-system: Materializer or ActorSystem
+   timeout-ms: how long to wait for the body (default 30000)."
+  ([^HttpResponse response materializer-or-system]
+   (response-body-bytes response materializer-or-system response-strict-timeout-ms))
+  ([^HttpResponse response materializer-or-system timeout-ms]
+   (let [mat (http/->materializer materializer-or-system)]
+     (-> (.toStrict ^ResponseEntity (.entity response) (long timeout-ms) mat)
+         (.thenApply (reify Function
+                       (apply [_ strict]
+                         (.toArray (.getData ^HttpEntity$Strict strict)))))))))
 
 (defn discard-body
   "Discard the response body.
