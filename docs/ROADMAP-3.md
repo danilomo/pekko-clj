@@ -58,7 +58,7 @@ performance note, see H16).
 | H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | DONE | — | medium |
 | H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | DONE | — | low |
 | H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | DONE | — | low |
-| H16 | Docstring corrections + micro-polish batch | Hardening | TODO | — | trivial |
+| H16 | Docstring corrections + micro-polish batch | Hardening | DONE | — | trivial |
 | H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | TODO | — | low |
 | H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | TODO | — | low |
 | N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | TODO | B19 | medium |
@@ -325,7 +325,17 @@ macroexpand-time test, non-list clause guard. **Deps:** none.
 guard-test style); `(persistence/spawn sys def-without-id {})` case removed —
 it becomes a macroexpand-time test.
 
-### H16 · Docstring corrections + micro-polish batch — `TODO`
+### H16 · Docstring corrections + micro-polish batch — `DONE`
+**Done:** all six items landed — `http/client` `response-headers` now documents the
+last-value contract (+ a pin test mirroring `http/core-test`'s twin);
+`http/response` `json`/`edn` point at `marshal/raw-body` instead of the removed
+string passthrough; `core/unhandled` was already corrected by B21 (verified);
+`stream/source-maybe` now says `CompletableFuture<Optional>` not "a Promise";
+`schedule-once` documents that `f` runs on the scheduler thread (not the actor),
+pointing at `start-single-timer`; and `response-status-keyword`'s `(case (int
+code) …)` cleared the last `lein check` performance note — **the tree is now fully
+clean (zero reflection AND zero performance warnings).** The `doc/06-http.md`
+guide already documented the N15 marshalling change correctly, so no guide edits.
 **Deps:** none. All confirmed against source on 2026-07-24; each is a few lines:
 - `http/client.clj:212` — `response-headers` says multi-valued headers "return the
   first value"; `into {}` keeps the **last**. H11 fixed the identical wording in

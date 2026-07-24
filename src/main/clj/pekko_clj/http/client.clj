@@ -172,7 +172,9 @@
    Returns :ok, :not-found, :internal-server-error, etc."
   [^HttpResponse response]
   (let [code (response-status response)]
-    (case code
+    ;; (int code): the case tests are primitive, so match a primitive expression —
+    ;; avoids the "case has int tests, but tested expression is not primitive" note.
+    (case (int code)
       200 :ok
       201 :created
       202 :accepted
@@ -208,8 +210,10 @@
       (.value ^HttpHeader (.get optional)))))
 
 (defn response-headers
-  "Get all headers as a map.
-   Multi-valued headers return the first value."
+  "Get all headers as a map keyed by lowercase name.
+   When a header name appears more than once, the map keeps the LAST value
+   (`into {}` overwrites earlier entries); use `response-header` for a single
+   lookup. See `pekko-clj.http.core/response-headers` for the server-side twin."
   [^HttpResponse response]
   (into {}
         (for [^HttpHeader header (iterator-seq (.iterator (.getHeaders response)))]

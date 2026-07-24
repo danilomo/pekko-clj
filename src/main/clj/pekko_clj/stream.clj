@@ -870,8 +870,9 @@
 
 (defn source-maybe
   "Create a Source that can emit 0 or 1 elements.
-   The materialized value is a Promise that must be completed with
-   an Optional."
+   In javadsl the materialized value is a `CompletableFuture<Optional<T>>`:
+   complete it with a present Optional to emit that one element, or an empty
+   Optional to complete the stream with no element."
   []
   (Source/maybe))
 

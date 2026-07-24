@@ -1,7 +1,8 @@
 (ns pekko-clj.http.client-test
   (:require [clojure.test :refer [deftest is testing]]
             [pekko-clj.http.client :as client])
-  (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes]))
+  (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes]
+           [org.apache.pekko.http.javadsl.model.headers RawHeader]))
 
 ;; ---------------------------------------------------------------------------
 ;; Response Status Tests
@@ -19,6 +20,15 @@
                                  (.withStatus StatusCodes/NOT_FOUND))]
       (is (= :ok (client/response-status-keyword ok-response)))
       (is (= :not-found (client/response-status-keyword not-found-response))))))
+
+(deftest response-headers-multi-valued-test
+  ;; H16: pins the documented last-value contract for the client twin (mirrors
+  ;; http/core-test's request-headers pin). `into {}` overwrites earlier entries.
+  (testing "A repeated header name keeps the last value, per the docstring"
+    (let [headers [(RawHeader/create "X-Tag" "a") (RawHeader/create "X-Tag" "b")]
+          response (.withHeaders (HttpResponse/create)
+                                 (java.util.ArrayList. ^java.util.Collection headers))]
+      (is (= "b" (get (client/response-headers response) "x-tag"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Response Status Check Tests

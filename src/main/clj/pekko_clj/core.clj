@@ -494,7 +494,12 @@
 
 (defn schedule-once
   "Schedule a function to run once after a delay (a java.time.Duration or a number
-   of milliseconds)."
+   of milliseconds).
+
+   Note: `f` runs on the scheduler/dispatcher thread, NOT inside the actor, so
+   touching `state` (or other actor internals) from it races with message
+   handling. For actor-safe timing use `start-single-timer`, which delivers a
+   message to the actor instead."
   [duration f]
   (.scheduleOnce (current-actor "schedule-once") (->duration duration) f))
 

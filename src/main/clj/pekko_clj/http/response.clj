@@ -105,16 +105,19 @@
       (HttpEntities/create ct ^bytes content))))
 
 (defn json
-  "Create a JSON entity from Clojure data (encoded with Cheshire) or from an
-   already-encoded JSON string, which is passed through unchanged.
+  "Create a JSON entity from Clojure data (encoded with Cheshire). A string is a
+   JSON *value*, so it is encoded and comes back quoted — to emit a pre-encoded
+   JSON body verbatim, wrap it with `pekko-clj.http.marshalling/raw-body` (N15).
 
-     (json {:name \"ada\" :ids [1 2]})  ;; => {\"name\":\"ada\",\"ids\":[1,2]}"
+     (json {:name \"ada\" :ids [1 2]})  ;; => {\"name\":\"ada\",\"ids\":[1,2]}
+     (json \"hi\")                       ;; => \"hi\"  (a quoted JSON string)"
   [data]
   (entity (marshal/->json data) :json))
 
 (defn edn
-  "Create an application/edn entity from Clojure data (or a pre-rendered EDN
-   string, passed through unchanged)."
+  "Create an application/edn entity from Clojure data (rendered with pr-str). A
+   string is rendered as an EDN string literal, so to emit a pre-rendered EDN body
+   verbatim wrap it with `pekko-clj.http.marshalling/raw-body` (N15)."
   [data]
   (entity (marshal/->edn data) :edn))
 
