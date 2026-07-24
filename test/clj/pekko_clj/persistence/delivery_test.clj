@@ -214,3 +214,32 @@
   ;; IllegalStateException naming the fn, not a bare NPE.
   (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence\.delivery/self" (d/self)))
   (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence\.delivery/context" (d/context))))
+
+;; ---------------------------------------------------------------------------
+;; H17: delivery actors spawn as children (ActorRefFactory)
+;; ---------------------------------------------------------------------------
+
+(d/defactor-delivery h17-delivery-child
+  :persistence-id (fn [args] (str "h17-del-child-" (:id args)))
+  (init [args] {:v (:v args)})
+  (command :get (d/reply (:v state)) nil))
+
+(core/defactor h17-delivery-parent
+  (init [_] {})
+  (handle [:spawn-child id v]
+    (core/reply (d/spawn (core/context) h17-delivery-child {:id id :v v}))))
+
+(deftest delivery-actor-spawns-as-child-via-context
+  ;; d/spawn now takes an ActorRefFactory, so a delivery actor can be spawned as a
+  ;; child of a classic actor via (core/context) — it recovers, replies, and a
+  ;; parent stop tears it down.
+  (let [sys (create-test-system "h17-delivery-parent")]
+    (try
+      (let [parent (core/spawn sys h17-delivery-parent nil)
+            child (core/<! parent [:spawn-child (unique-id) 7] 3000)]
+        (is (some? child))
+        (is (= 7 (core/<! child :get 3000)) "the delivery child recovered and replied")
+        (core/poison-pill parent)
+        (is (ts/stopped-within? sys child 5000) "parent stop tore down the child"))
+      (finally
+        (terminate-system sys)))))

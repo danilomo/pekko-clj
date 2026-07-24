@@ -41,7 +41,7 @@
   (:require [clojure.core.match :refer [match]]
             [pekko-clj.persistence :as p]
             [pekko-clj.internal.context :as ctx])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef ActorPath]
+  (:import [org.apache.pekko.actor ActorRefFactory ActorRef ActorPath]
            [pekko_clj.actor CljAtLeastOnceDeliveryActor]))
 
 (def ^:dynamic *current-delivery-actor*
@@ -270,14 +270,17 @@
 
 (defn spawn
   "Spawn an at-least-once-delivery actor. args are passed to init and
-   :persistence-id. Returns an ActorRef."
-  [^ActorSystem system actor-def args]
-  (.actorOf system (CljAtLeastOnceDeliveryActor/create ((:make-props actor-def) args))))
+   :persistence-id. `factory` is an ActorRefFactory — an ActorSystem (top-level)
+   or an actor context (`core/context`, to spawn it as a child). Returns an
+   ActorRef."
+  [^ActorRefFactory factory actor-def args]
+  (.actorOf factory (CljAtLeastOnceDeliveryActor/create ((:make-props actor-def) args))))
 
 (defn spawn-named
-  "Spawn an at-least-once-delivery actor with a specific name."
-  [^ActorSystem system actor-def args name]
-  (.actorOf system (CljAtLeastOnceDeliveryActor/create ((:make-props actor-def) args)) name))
+  "Spawn an at-least-once-delivery actor with a specific name. `factory` is an
+   ActorRefFactory (an ActorSystem or an actor context)."
+  [^ActorRefFactory factory actor-def args name]
+  (.actorOf factory (CljAtLeastOnceDeliveryActor/create ((:make-props actor-def) args)) name))
 
 ;; ---------------------------------------------------------------------------
 ;; Handlers' actor context + delivery API

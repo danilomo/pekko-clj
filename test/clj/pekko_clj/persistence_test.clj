@@ -6,7 +6,7 @@
             [pekko-clj.core :as core]
             [pekko-clj.event-stream :as es]
             [pekko-clj.supervision :as sup]
-            [pekko-clj.test-support :refer [eventually]])
+            [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.persistence Recovery SnapshotSelectionCriteria]
            [com.typesafe.config ConfigFactory]
@@ -94,6 +94,18 @@
                                  (deliver got-sender (core/sender)))
                                nil)
                    :state nil}))
+
+;; H17: a persistent actor spawned as a *child* of a classic defactor via
+;; (persistence/spawn (core/context) ...).
+(p/defactor-persistent h17-child
+  :persistence-id (fn [args] (str "h17-child-" (:id args)))
+  (init [args] {:v (:v args)})
+  (command :get (p/reply (:v state)) nil))
+
+(core/defactor h17-parent
+  (init [_] {})
+  (handle [:spawn-child id v]
+    (core/reply (p/spawn (core/context) h17-child {:id id :v v}))))
 
 ;; B15: handles only :known — anything else must route to unhandled() rather
 ;; than being silently dropped.
@@ -1180,5 +1192,24 @@
         (core/! probe :hi)
         (is (= (.deadLetters sys) (deref got-sender 5000 :timeout))
             "a top-level send has no sender"))
+      (finally
+        (terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; H17: persistent actors spawn as children (ActorRefFactory)
+;; ---------------------------------------------------------------------------
+
+(deftest persistent-actor-spawns-as-child-via-context
+  ;; persistence/spawn now takes an ActorRefFactory, so a persistent actor can be
+  ;; spawned as a child of a classic actor via (core/context) — it recovers,
+  ;; replies, and a parent stop tears it down.
+  (let [sys (create-test-system "h17-parent")]
+    (try
+      (let [parent (core/spawn sys h17-parent nil)
+            child (core/<! parent [:spawn-child (unique-id) 42] 3000)]
+        (is (some? child))
+        (is (= 42 (core/<! child :get 3000)) "the persistent child recovered and replied")
+        (core/poison-pill parent)
+        (is (ts/stopped-within? sys child 5000) "parent stop tore down the child"))
       (finally
         (terminate-system sys)))))

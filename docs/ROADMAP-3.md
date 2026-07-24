@@ -59,7 +59,7 @@ performance note, see H16).
 | H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | DONE | — | low |
 | H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | DONE | — | low |
 | H16 | Docstring corrections + micro-polish batch | Hardening | DONE | — | trivial |
-| H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | TODO | — | low |
+| H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | DONE | — | low |
 | H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | TODO | — | low |
 | N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | TODO | B19 | medium |
 | N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | TODO | — | low |
@@ -357,8 +357,14 @@ guide already documented the N15 marshalling change correctly, so no guide edits
 **Tests:** the client-headers last-value contract gets the same pin test
 `http/core-test` already has for its twin; the rest are doc-only.
 
-### H17 · Let persistent/delivery actors spawn as children — `TODO`
-**Deps:** none.
+### H17 · Let persistent/delivery actors spawn as children — `DONE`
+**Done:** `persistence/spawn`/`spawn-named` and `delivery/spawn`/`spawn-named`
+retagged `^ActorSystem` → `^ActorRefFactory` (param renamed `system` → `factory`);
+`.actorOf` is declared on `ActorRefFactory`, so no call-site change and no
+reflection. A persistent/delivery actor can now be spawned as a child via
+`(persistence/spawn (core/context) def args)`. Tests: spawn a persistent (and a
+delivery) actor from inside a `defactor` handler → it recovers, replies, and a
+parent stop tears it down. **Deps:** none.
 `persistence/spawn`/`spawn-named` and `delivery/spawn`/`spawn-named` hint
 `^ActorSystem` and call `.actorOf` on it — a persistent actor cannot be spawned as
 a *child* of another actor, though Pekko allows it and `core`/`routing` already

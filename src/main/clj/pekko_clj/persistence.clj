@@ -32,7 +32,7 @@
        (snapshot-every 100 2))"
   (:require [clojure.core.match :refer [match]]
             [pekko-clj.internal.context :as ctx])
-  (:import [org.apache.pekko.actor ActorSystem]
+  (:import [org.apache.pekko.actor ActorRefFactory]
            [org.apache.pekko.persistence Recovery SnapshotSelectionCriteria]
            [pekko_clj.actor CljPersistentActor Defer PersistAll PersistAsync PersistOps]
            [java.time Duration]))
@@ -463,30 +463,32 @@
   "Spawn a persistent actor.
 
    Arguments:
-   - system: ActorSystem
+   - factory: an ActorRefFactory — an ActorSystem (top-level) or an actor context
+     (`core/context`, to spawn it as a child of the current actor)
    - actor-def: Actor definition from defactor-persistent
    - args: Arguments passed to init and persistence-id functions
 
    Returns an ActorRef."
-  [^ActorSystem system actor-def args]
+  [^ActorRefFactory factory actor-def args]
   (let [props-map ((:make-props actor-def) args)
         props (CljPersistentActor/create props-map)]
-    (.actorOf system props)))
+    (.actorOf factory props)))
 
 (defn spawn-named
   "Spawn a persistent actor with a specific name.
 
    Arguments:
-   - system: ActorSystem
+   - factory: an ActorRefFactory — an ActorSystem (top-level) or an actor context
+     (`core/context`, to spawn it as a child of the current actor)
    - actor-def: Actor definition from defactor-persistent
    - args: Arguments passed to init and persistence-id functions
    - name: Actor name
 
    Returns an ActorRef."
-  [^ActorSystem system actor-def args name]
+  [^ActorRefFactory factory actor-def args name]
   (let [props-map ((:make-props actor-def) args)
         props (CljPersistentActor/create props-map)]
-    (.actorOf system props name)))
+    (.actorOf factory props name)))
 
 ;; ---------------------------------------------------------------------------
 ;; Command Helpers (for use in command handlers)
