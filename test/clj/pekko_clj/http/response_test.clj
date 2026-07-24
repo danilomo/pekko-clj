@@ -24,6 +24,25 @@
     (let [sc (resp/->status-code 418)]
       (is (= 418 (.intValue sc))))))
 
+(deftest integer-status-code-resolves-registered-test
+  ;; B20: a registered integer must resolve to the real StatusCode with correct
+  ;; flags — not the old custom(n,"","",false,false), whose empty reason /
+  ;; isSuccess=false / allowsEntity=false rendered a 500 and dropped bodies.
+  (testing "a registered integer matches its keyword twin, flags and all"
+    (let [sc (resp/->status-code 201)]
+      (is (= 201 (.intValue sc)))
+      (is (= "Created" (.reason sc)))
+      (is (true? (.isSuccess sc)))
+      (is (true? (.allowsEntity sc)))
+      (is (= (resp/->status-code :created) sc))))
+  (testing "204 keeps its body-less semantics"
+    (is (false? (.allowsEntity (resp/->status-code 204)))))
+  (testing "an unregistered integer round-trips and still allows a body"
+    (let [sc (resp/->status-code 289)]
+      (is (= 289 (.intValue sc)))
+      (is (true? (.allowsEntity sc)) "a body must survive an unregistered code")
+      (is (not= "" (.reason sc)) "no empty-reason custom code"))))
+
 (deftest invalid-status-code-test
   (testing "Invalid status keyword throws exception"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown status code"

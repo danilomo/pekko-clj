@@ -155,9 +155,12 @@
 ;; ---------------------------------------------------------------------------
 
 (defn source
-  "Create a Source from a Clojure collection or sequence."
+  "Create a Source from a Clojure collection or sequence.
+
+   An empty (or nil) collection yields an empty Source that completes
+   immediately. The `seq` call also coerces Strings/arrays into an Iterable."
   [coll]
-  (Source/from (seq coll)))
+  (Source/from (or (seq coll) [])))
 
 (defn source-single
   "Create a Source that emits a single element."
@@ -849,10 +852,15 @@
     {:source (.second pair) :queue (.first pair)}))
 
 (defn source-cycle
-  "Create a Source that infinitely cycles through a collection."
+  "Create a Source that infinitely cycles through a collection.
+
+   An empty collection is a user error: the stream fails at run time with
+   Pekko's own IllegalArgumentException (\"empty iterator\"), not an NPE."
   [coll]
   (Source/cycle (reify org.apache.pekko.japi.function.Creator
-                  (create [_] (.iterator ^Iterable (seq coll))))))
+                  (create [_]
+                    (let [^Iterable it (or (seq coll) [])]
+                      (.iterator it))))))
 
 (defn source-from-publisher
   "Create a Source from a Reactive Streams Publisher."

@@ -41,6 +41,27 @@
                    (s/await-completion 3000))]
     (is (= [1 2 3 4 5] (vec result)))))
 
+(deftest source-empty-collection-runs-to-empty
+  ;; B19: (seq []) is nil; Source/from must still get an empty Iterable, not null.
+  (let [result (-> (s/source [])
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (empty? (vec result)))))
+
+(deftest source-nil-runs-to-empty
+  ;; B19: (source nil) is an ordinary empty stream, not an NPE.
+  (let [result (-> (s/source nil)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (empty? (vec result)))))
+
+(deftest source-from-string-emits-chars
+  ;; B19 guard: the (seq coll) coercion of a String must survive the empty-fallback fix.
+  (let [result (-> (s/source "ab")
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= [\a \b] (vec result)))))
+
 (deftest source-single-element
   (let [result (-> (s/source-single :hello)
                    (s/run-head *mat*)
@@ -563,6 +584,16 @@
                    (s/run-to-seq *mat*)
                    (s/await-completion 3000))]
     (is (= [1 2 3 1 2 3 1] (vec result)))))
+
+(deftest source-cycle-empty-throws-pekko-error
+  ;; B19: an empty cycle is a *user* error — it must surface as Pekko's own
+  ;; IllegalArgumentException ("empty iterator"), not our construction-time NPE.
+  (is (thrown-with-msg?
+       IllegalArgumentException #"empty iterator"
+        (-> (s/source-cycle [])
+            (s/take 3)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Phase 8 - Additional Sinks

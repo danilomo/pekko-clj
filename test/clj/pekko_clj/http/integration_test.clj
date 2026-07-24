@@ -656,6 +656,24 @@
      [(client/response-status response)
       (-> (client/response-body response *system*) (client/await-response 5000))])))
 
+(deftest integer-status-codes-round-trip-test
+  ;; B20: an integer status must behave exactly like its keyword twin. The old
+  ;; ->status-code routed every integer through StatusCodes/custom(n,"","",false,
+  ;; false), so (complete 201 body) rendered a 500 with no body.
+  (testing "int status codes round-trip with their bodies (real server)"
+    (let [routes (routing/routes
+                   (routing/GET "/kw" [] (routing/complete :created "kw-body"))
+                   (routing/GET "/int" [] (routing/complete 201 "int-body"))
+                   (routing/GET "/unregistered" [] (routing/complete 289 "odd-body"))
+                   (routing/not-found "nope"))]
+      (with-test-server routes
+        (fn []
+          ;; the integer 201 behaves exactly like :created — status and body
+          (is (= [201 "kw-body"] (get-status+body (url "/kw"))))
+          (is (= [201 "int-body"] (get-status+body (url "/int"))))
+          ;; a code outside the registry still round-trips, body and all
+          (is (= [289 "odd-body"] (get-status+body (url "/unregistered")))))))))
+
 (deftest from-resource-serves-a-classpath-file
   (let [routes (routing/routes
                  (routing/path "style.css" (routing/from-resource "public/css/app.css"))

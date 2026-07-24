@@ -42,14 +42,25 @@
    :gateway-timeout       StatusCodes/GATEWAY_TIMEOUT})
 
 (defn ->status-code
-  "Convert a status keyword or integer to a StatusCode."
+  "Convert a status keyword or integer to a StatusCode.
+
+   Keywords are the documented primary form (see `status-codes`). An integer
+   resolves to the real registered StatusCode when Pekko knows it (so 201
+   behaves exactly like :created — correct reason, isSuccess and allowsEntity
+   flags); a genuinely unregistered code falls back to a custom StatusCode with
+   sensible defaults (never an empty reason / isSuccess=false / allowsEntity=false,
+   which renders a 500 and drops the body)."
   ^StatusCode [status]
   (cond
     (instance? StatusCode status) status
     (keyword? status) (or (get status-codes status)
                           (throw (ex-info (str "Unknown status code: " status)
                                           {:status status})))
-    (integer? status) (StatusCodes/custom (int status) "" "" false false)
+    (integer? status) (let [n (int status)
+                            registered (StatusCodes/lookup n)]
+                        (if (.isPresent registered)
+                          (.get registered)
+                          (StatusCodes/custom n "Custom" "Custom")))
     :else (throw (ex-info "Invalid status type" {:status status}))))
 
 ;; ---------------------------------------------------------------------------
