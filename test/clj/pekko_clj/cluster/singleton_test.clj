@@ -54,6 +54,17 @@
     (swap! singleton-events conj [:stopping])
     :stop))
 
+;; B22: cooperatively stops itself on a *custom* termination-message (:bye).
+;; Under :restart-with-stop supervision this is the case that used to stall
+;; hand-over — the onStop supervisor restarted the actor forever.
+(core/defactor coop-singleton
+  "Singleton that stops itself when it receives the custom :bye termination-message."
+  (init [args] {:value (or (:initial args) 0)})
+  (handle :get
+    (core/reply (:value state)))
+  (handle :bye
+    (core/stop (core/self))))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: Basic Singleton
 ;; ---------------------------------------------------------------------------
@@ -196,6 +207,77 @@
         (is (eventually 15000 (= :pong (await-result (core/<?> proxy :ping 3000)))))
         ;; Verify started event
         (is (some #(= [:started] %) @singleton-events)))
+      (finally
+        (ts/terminate-system sys)))))
+
+;; B22: hand-over must complete under supervision. Leaving a 1-node cluster
+;; triggers hand-over with nowhere to go: the manager sends the
+;; termination-message and waits for its child (the backoff supervisor) to
+;; terminate. `singleton-running-here?` on the manager path resolves that child,
+;; so it flips to false exactly when hand-over completes.
+
+(deftest singleton-restart-with-stop-hands-over-with-custom-message
+  ;; The core B22 regression. Without withFinalStopMessage the onStop supervisor
+  ;; restarts the actor after it stops itself on :bye, so the supervisor never
+  ;; terminates and this poll times out (verified live: still running after 8s).
+  (let [sys (ts/create-cluster-system "singleton-b22-stop-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (singleton/start sys coop-singleton
+                       {:name "b22-stop-singleton"
+                        :termination-message :bye
+                        :hand-over-retry-interval 200
+                        :supervision {:strategy :restart-with-stop
+                                      :min-backoff-ms 200
+                                      :max-backoff-ms 500}})
+      (is (ts/poll-until #(singleton/singleton-running-here? sys "/user/b22-stop-singleton") 10000)
+          "singleton should be running before hand-over")
+      (cluster/leave sys)
+      (is (ts/poll-until #(not (singleton/singleton-running-here? sys "/user/b22-stop-singleton")) 8000)
+          ":restart-with-stop must not stall hand-over when the actor stops on the custom termination-message")
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest singleton-restart-with-backoff-hands-over-with-custom-message
+  ;; Pins the assumption that onFailure supervisors already hand over: a clean
+  ;; self-stop is not a failure, so the supervisor stops itself with no extra
+  ;; wiring needed.
+  (let [sys (ts/create-cluster-system "singleton-b22-backoff-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (singleton/start sys coop-singleton
+                       {:name "b22-backoff-singleton"
+                        :termination-message :bye
+                        :hand-over-retry-interval 200
+                        :supervision {:strategy :restart-with-backoff
+                                      :min-backoff-ms 200
+                                      :max-backoff-ms 500}})
+      (is (ts/poll-until #(singleton/singleton-running-here? sys "/user/b22-backoff-singleton") 10000)
+          "singleton should be running before hand-over")
+      (cluster/leave sys)
+      (is (ts/poll-until #(not (singleton/singleton-running-here? sys "/user/b22-backoff-singleton")) 8000)
+          ":restart-with-backoff hands over on a clean self-stop")
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest singleton-supervision-default-poison-pill-hands-over
+  ;; Pins that the default PoisonPill termination-message still hands over under
+  ;; :restart-with-stop — PoisonPill stops the supervisor directly, so it never
+  ;; stalled; the withFinalStopMessage fix must not break this path.
+  (let [sys (ts/create-cluster-system "singleton-b22-pill-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (singleton/start sys vanilla-singleton
+                       {:name "b22-pill-singleton"
+                        :hand-over-retry-interval 200
+                        :supervision {:strategy :restart-with-stop
+                                      :min-backoff-ms 200
+                                      :max-backoff-ms 500}})
+      (is (ts/poll-until #(singleton/singleton-running-here? sys "/user/b22-pill-singleton") 10000)
+          "singleton should be running before hand-over")
+      (cluster/leave sys)
+      (is (ts/poll-until #(not (singleton/singleton-running-here? sys "/user/b22-pill-singleton")) 8000)
+          "default PoisonPill hand-over still completes under :restart-with-stop")
       (finally
         (ts/terminate-system sys)))))
 

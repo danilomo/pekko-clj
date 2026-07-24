@@ -60,6 +60,13 @@
 - `:restart-with-backoff` - Restart on failure with exponential backoff
 - `:restart-with-stop` - Restart on stop with exponential backoff
 
+**Hand-over under supervision (B22):** with `:restart-with-stop`, the resolved
+`:termination-message` is wired as the supervisor's `withFinalStopMessage` so the
+supervisor stops itself once the singleton stops in response, rather than
+restarting it forever and stalling hand-over. `:restart-with-backoff` (onFailure)
+hands over on a clean self-stop without extra wiring; the default PoisonPill stops
+the supervisor directly.
+
 ---
 
 ### 2. Singleton Identification Interval ✅ Implemented
@@ -176,6 +183,9 @@ Tests in `test/clj/pekko_clj/cluster/singleton_test.clj`:
 - `singleton-with-hand-over-settings-test` - Hand-over configuration
 - `proxy-with-custom-settings-test` - Proxy customization
 - `singleton-with-backoff-supervision-test` - Supervision with backoff
+- `singleton-restart-with-stop-hands-over-with-custom-message` - B22: `:restart-with-stop` hand-over
+- `singleton-restart-with-backoff-hands-over-with-custom-message` - B22: `:restart-with-backoff` hand-over
+- `singleton-supervision-default-poison-pill-hands-over` - B22: default PoisonPill hand-over under supervision
 - `singleton-running-here-test` - State query function
 
 ---

@@ -54,7 +54,7 @@ performance note, see H16).
 | B19 | `(stream/source [])` throws NPE | Bugs | DONE | — | trivial |
 | B20 | Integer status codes produce 500s | Bugs | DONE | — | low |
 | B21 | Death-pact not honored for unmatched Terminated | Bugs | DONE | — | medium |
-| B22 | Singleton hand-over stalls under `:restart-with-stop` supervision | Bugs | TODO | — | medium |
+| B22 | Singleton hand-over stalls under `:restart-with-stop` supervision | Bugs | DONE | — | medium |
 | H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | TODO | — | medium |
 | H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | TODO | — | low |
 | H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | TODO | — | low |
@@ -177,7 +177,17 @@ still works; `watchWith` marker message still arrives as-is when unmatched →
 UnhandledMessage (no death pact — same as Pekko, where the custom message is an
 ordinary message); `core/unhandled` docstring corrected.
 
-### B22 · Singleton hand-over stalls under `:restart-with-stop` supervision — `TODO`
+### B22 · Singleton hand-over stalls under `:restart-with-stop` supervision — `DONE`
+**Done:** `wrap-with-supervision` now threads the resolved termination-message
+through and, for `:restart-with-stop`, applies
+`BackoffOnStopOptions.withFinalStopMessage` (a `FnWrapper` over
+`#(= % termination-message)`) so the supervisor stops itself once the singleton
+stops in response — hand-over completes instead of the onStop supervisor
+restarting the actor forever. `:restart-with-backoff` (onFailure) already hands
+over on a clean self-stop (pinned by test); the default PoisonPill stops the
+supervisor directly (pinned). `start` docstring + singleton-parity-spec updated.
+Tests: three single-node cluster hand-over tests; the `:restart-with-stop`
+regression verified failing (stalled >8s) on HEAD.
 **Deps:** none. **VERIFIED live (2026-07-24)** on a single-node cluster:
 ```
 (singleton/start sys coop-actor {:name "coop-mgr"

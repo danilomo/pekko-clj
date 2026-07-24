@@ -31,7 +31,7 @@
            [org.apache.pekko.cluster.singleton ClusterSingletonManager ClusterSingletonManagerSettings
             ClusterSingletonProxy ClusterSingletonProxySettings]
            [org.apache.pekko.pattern BackoffSupervisor BackoffOpts]
-           [pekko_clj.actor CljActor]
+           [pekko_clj.actor CljActor FnWrapper]
            [java.time Duration]
            [scala.concurrent.duration FiniteDuration]
            [java.util.concurrent TimeUnit]))
@@ -44,8 +44,13 @@
   "Wrap actor Props with backoff supervision if configured.
 
    supervision nil/false means no supervision wrapper; otherwise its :strategy
-   must be :restart-with-backoff or :restart-with-stop — anything else throws."
-  ^Props [^Props props supervision]
+   must be :restart-with-backoff or :restart-with-stop — anything else throws.
+
+   `termination-message` is the resolved hand-over message (see `start`): under
+   :restart-with-stop it is wired as the supervisor's final-stop message so the
+   supervisor stops itself once the singleton stops in response, instead of
+   restarting it and stalling hand-over (B22)."
+  ^Props [^Props props termination-message supervision]
   (if supervision
     (let [{:keys [strategy min-backoff-ms max-backoff-ms random-factor]
            :or {min-backoff-ms 3000
@@ -62,12 +67,23 @@
           (BackoffSupervisor/props backoff-opts))
 
         :restart-with-stop
-        (let [backoff-opts (BackoffOpts/onStop
-                            props
-                            "singleton"
-                            (Duration/ofMillis (long min-backoff-ms))
-                            (Duration/ofMillis (long max-backoff-ms))
-                            (double random-factor))]
+        ;; onStop restarts the child whenever it stops — including when the
+        ;; singleton stops itself in response to the hand-over termination-message.
+        ;; The manager's child is this supervisor, so it would never terminate and
+        ;; hand-over would stall forever. withFinalStopMessage makes the supervisor
+        ;; stop itself (not restart) once the child stops in response to that
+        ;; message. (The default PoisonPill stops the supervisor directly and so
+        ;; never stalled; matching it here is harmless — it never reaches the
+        ;; supervisor's receive.)
+        (let [backoff-opts (.withFinalStopMessage
+                            (BackoffOpts/onStop
+                             props
+                             "singleton"
+                             (Duration/ofMillis (long min-backoff-ms))
+                             (Duration/ofMillis (long max-backoff-ms))
+                             (double random-factor))
+                            (FnWrapper/create
+                             (fn [msg] (= msg termination-message))))]
           (BackoffSupervisor/props backoff-opts))
 
         (throw (IllegalArgumentException.
@@ -99,8 +115,14 @@
        handle it by stopping itself (e.g. `(core/stop (core/self))`), or
        hand-over stalls until the manager's retries are exhausted.
      - :hand-over-retry-interval - Retry interval during hand-over (ms)
-     - :supervision - Supervision options map
-       - :strategy - :restart-with-backoff or :restart-with-stop
+     - :supervision - Supervision options map. The singleton is wrapped in a
+       backoff supervisor; the manager's child becomes that supervisor.
+       - :strategy - :restart-with-backoff (restarts only on failure) or
+         :restart-with-stop (also restarts when the actor stops itself, so it
+         backs off after a clean stop). With :restart-with-stop the resolved
+         :termination-message is wired as the supervisor's final-stop message so
+         hand-over completes: the supervisor stops itself once the singleton
+         stops in response, instead of restarting it and stalling hand-over.
        - :min-backoff-ms - Min backoff delay (default: 3000)
        - :max-backoff-ms - Max backoff delay (default: 30000)
        - :random-factor - Backoff randomization 0.0-1.0 (default: 0.2)
@@ -119,7 +141,7 @@
   (let [{:keys [name role args termination-message hand-over-retry-interval supervision]
          :or {termination-message (PoisonPill/getInstance)}} opts
         base-props (CljActor/create ((:make-props actor-def) args))
-        props (wrap-with-supervision base-props supervision)
+        props (wrap-with-supervision base-props termination-message supervision)
         ^ClusterSingletonManagerSettings settings
         (ClusterSingletonManagerSettings/create system)
         ^ClusterSingletonManagerSettings settings
