@@ -43,6 +43,27 @@
     (core/reply (sharding/entity-id))
     state))
 
+;; H13: a sharded entity that echoes :pong back to whoever pinged it, and a
+;; PERSISTENT actor that pings it via sharding/tell. sharding/tell routes through
+;; core/!, so from a persistent command body it used to send as noSender and the
+;; echo's reply went to dead letters — the caller never saw :pong.
+(core/defactor h13-echo-entity
+  "Sharded entity that replies :pong to its sender."
+  (init [_] {})
+  (handle [:ping]
+    (core/reply :pong)
+    state))
+
+(persistence/defactor-persistent h13-sharding-caller
+  :persistence-id (fn [args] (str "h13-scaller-" (:id args)))
+  (init [args] {:region (:region args) :probe (:probe args)})
+  (command [:call entity-id]
+    (sharding/tell (:region state) entity-id [:ping])
+    nil)
+  (command :pong
+    (core/! (:probe state) :pong-received)
+    nil))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: Basic Sharding
 ;; ---------------------------------------------------------------------------
@@ -597,5 +618,30 @@
         ;; the region terminates.
         (sharding/graceful-shutdown! region)
         (is (ts/stopped-within? sys region 15000) "the region actor terminates"))
+      (finally
+        (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: H13 — sharding/tell from a persistent entity round-trips
+;; ---------------------------------------------------------------------------
+
+(deftest sharding-tell-from-persistent-entity-round-trips
+  ;; sharding/tell routes through core/!. From a persistent command body the
+  ;; sender used to be noSender, so the echo entity's reply went to dead letters
+  ;; and the persistent caller never received :pong. With the H13 fix the reply
+  ;; comes back and the caller notifies the probe. Fails before the fix.
+  (let [sys (ts/create-cluster-system "h13-sharding-persistent")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys h13-echo-entity {:type-name "H13Echo"
+                                                        :num-shards 4})
+            got (promise)
+            probe (core/new-actor sys {:function (fn [_ _] (deliver got true) nil)
+                                       :state nil})
+            caller (persistence/spawn sys h13-sharding-caller
+                                      {:id "caller-1" :region region :probe probe})]
+        (core/! caller [:call "echo-1"])
+        (is (true? (deref got 8000 false))
+            "the echo entity's reply returned to the persistent caller"))
       (finally
         (ts/terminate-system sys)))))

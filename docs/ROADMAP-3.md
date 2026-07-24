@@ -55,7 +55,7 @@ performance note, see H16).
 | B20 | Integer status codes produce 500s | Bugs | DONE | — | low |
 | B21 | Death-pact not honored for unmatched Terminated | Bugs | DONE | — | medium |
 | B22 | Singleton hand-over stalls under `:restart-with-stop` supervision | Bugs | DONE | — | medium |
-| H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | TODO | — | medium |
+| H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | DONE | — | medium |
 | H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | TODO | — | low |
 | H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | TODO | — | low |
 | H16 | Docstring corrections + micro-polish batch | Hardening | TODO | — | trivial |
@@ -226,8 +226,21 @@ supervision + default PoisonPill → same. Update `start`'s docstring (the
 
 ## Milestone H — Hardening / DX
 
-### H13 · `core/!` silently sends as noSender inside persistent/delivery actors — `TODO`
-**Deps:** none.
+### H13 · `core/!` silently sends as noSender inside persistent/delivery actors — `DONE`
+**Done:** new `pekko-clj.internal.context` ns holds one dynamic `*current-self*`
+(ActorRef or nil, no pekko-clj deps → no cycle). `defactor-persistent` and
+`defactor-delivery` command/event/on-stop binders bind it to `(.selfRef this)`
+alongside their existing `*current-*-actor*` binding (outer `this-sym` tagged so
+the interop stays reflection-free). `core/!` gains a middle branch: use
+`*current-actor*` when bound (unchanged fast path), else `*current-self*`, else
+noSender — so `sharding/tell`/`graceful-shutdown!` inherit the fix. **Deviation
+from the sketch:** `*current-self*` is bound only in persistent/delivery binders,
+NOT in `defactor` — classic actors bind `*current-actor*` which `!` already uses,
+so binding it there is redundant and needlessly touches the classic hot path;
+`*current-self*`'s docstring states this scope. Tests (bug-catch verified by
+temporarily dropping the fallback): persistent `!` → entity sender; delivery `!`
+→ entity sender; `sharding/tell` from a persistent entity round-trips back;
+top-level `!` still noSender. No public API change. **Deps:** none.
 `core/!` (`core.clj:38-44`) checks only `core/*current-actor*`; inside a
 `defactor-persistent` or `defactor-delivery` body that var is unbound, so `!`
 falls back to `(.tell target msg noSender)` — the reply path silently breaks

@@ -30,7 +30,8 @@
 
        ;; Snapshot every 100 events, keeping the 2 most recent
        (snapshot-every 100 2))"
-  (:require [clojure.core.match :refer [match]])
+  (:require [clojure.core.match :refer [match]]
+            [pekko-clj.internal.context :as ctx])
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.persistence Recovery SnapshotSelectionCriteria]
            [pekko_clj.actor CljPersistentActor Defer PersistAll PersistAsync PersistOps]))
@@ -226,7 +227,8 @@
         ;; dropping it. Mirrors the `defactor` catch-all in pekko-clj.core.
         has-catch-all? (some catch-all-pattern? (map second commands))]
     `(fn [~this-sym ~command-sym]
-       (binding [*current-persistent-actor* ~this-sym]
+       (binding [*current-persistent-actor* ~this-sym
+                 ctx/*current-self* (.selfRef ~this-sym)]
          (let [~'this ~this-sym
                ~'state @~this-sym]
            (match ~command-sym
@@ -349,12 +351,14 @@
         recovery-expr (parse-value-clause clauses 'recovery)
         journal-plugin-id (parse-value-clause clauses 'journal-plugin-id)
         snapshot-plugin-id (parse-value-clause clauses 'snapshot-plugin-id)
-        this-sym (gensym "this")
+        ;; Tagged so (.selfRef this-sym) in post-stop-fn resolves without reflection.
+        this-sym (with-meta (gensym "this") {:tag 'pekko_clj.actor.CljPersistentActor})
         ;; on-stop runs for side effects only — a persistent actor's state comes
         ;; from its events, so a return value has nowhere legitimate to go.
         post-stop-fn (when on-stop-clause
                        `(fn [~this-sym]
-                          (binding [*current-persistent-actor* ~this-sym]
+                          (binding [*current-persistent-actor* ~this-sym
+                                    ctx/*current-self* (.selfRef ~this-sym)]
                             (let [~'this ~this-sym
                                   ~'state (deref ~this-sym)]
                               ~@(rest on-stop-clause)

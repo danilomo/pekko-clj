@@ -39,7 +39,8 @@
    `[:ack delivery-id]` once it has processed the message."
   (:refer-clojure :exclude [deliver])
   (:require [clojure.core.match :refer [match]]
-            [pekko-clj.persistence :as p])
+            [pekko-clj.persistence :as p]
+            [pekko-clj.internal.context :as ctx])
   (:import [org.apache.pekko.actor ActorSystem ActorRef ActorPath]
            [pekko_clj.actor CljAtLeastOnceDeliveryActor]))
 
@@ -133,7 +134,8 @@
         match-clauses (mapcat (fn [[_ pattern & body]] [pattern `(do ~@body)]) commands)
         has-catch-all? (some catch-all-pattern? (map second commands))]
     `(fn [~this-sym ~command-sym]
-       (binding [*current-delivery-actor* ~this-sym]
+       (binding [*current-delivery-actor* ~this-sym
+                 ctx/*current-self* (.selfRef ~this-sym)]
          (let [~'this ~this-sym
                ~'state @~this-sym]
            (match ~command-sym
@@ -151,7 +153,8 @@
         event-sym (gensym "event")
         match-clauses (mapcat (fn [[_ pattern & body]] [pattern `(do ~@body)]) events)]
     `(fn [~this-sym ~state-sym ~event-sym]
-       (binding [*current-delivery-actor* ~this-sym]
+       (binding [*current-delivery-actor* ~this-sym
+                 ctx/*current-self* (.selfRef ~this-sym)]
          (let [~'this ~this-sym
                ~'state ~state-sym]
            (match ~event-sym
@@ -197,10 +200,12 @@
         burst-limit (parse-value-clause clauses 'redelivery-burst-limit)
         warn-after (parse-value-clause clauses 'warn-after-unconfirmed)
         max-unconfirmed (parse-value-clause clauses 'max-unconfirmed)
-        this-sym (gensym "this")
+        ;; Tagged so (.selfRef this-sym) in post-stop-fn resolves without reflection.
+        this-sym (with-meta (gensym "this") {:tag 'pekko_clj.actor.CljAtLeastOnceDeliveryActor})
         post-stop-fn (when on-stop-clause
                        `(fn [~this-sym]
-                          (binding [*current-delivery-actor* ~this-sym]
+                          (binding [*current-delivery-actor* ~this-sym
+                                    ctx/*current-self* (.selfRef ~this-sym)]
                             (let [~'this ~this-sym
                                   ~'state (deref ~this-sym)]
                               ~@(rest on-stop-clause)

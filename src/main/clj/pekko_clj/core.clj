@@ -1,5 +1,6 @@
 (ns pekko-clj.core
-  (:require [clojure.core.match :as m])
+  (:require [clojure.core.match :as m]
+            [pekko-clj.internal.context :as ctx])
   (:import [org.apache.pekko.actor ActorSystem ActorRef ActorRefFactory ActorContext
             ActorSelection PoisonPill Props ReceiveTimeout]
            [org.apache.pekko.pattern Patterns AskTimeoutException]
@@ -36,12 +37,20 @@
   (.getContext *current-actor*))
 
 (defn !
-  "Send a message to an actor. Inside an actor context, sender is self.
-   Outside, sender is noSender."
+  "Send a message to an actor. Inside any actor handler the sender is self, so the
+   recipient can `reply`; outside an actor the sender is noSender.
+
+   The self resolution works in every actor kind: a classic `defactor` binds
+   `*current-actor*` (the fast path here), while `defactor-persistent` /
+   `defactor-delivery` bind only `pekko-clj.internal.context/*current-self*` — so
+   without the second branch `!` (and `sharding/tell`, which routes through it)
+   would send as noSender inside a persistent/delivery body and replies would go
+   to dead letters."
   [^ActorRef target msg]
   (if *current-actor*
     (.tell *current-actor* target msg)
-    (.tell target msg (ActorRef/noSender))))
+    (let [^ActorRef sender (or ctx/*current-self* (ActorRef/noSender))]
+      (.tell target msg sender))))
 
 (defn reply
   "Reply to the sender of the current message. Returns nil (so it doesn't

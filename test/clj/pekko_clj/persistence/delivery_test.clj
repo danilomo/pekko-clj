@@ -146,3 +146,36 @@
                             (redeliver-interval (java.time.Duration/ofSeconds 2))))
           (catch clojure.lang.Compiler$CompilerException e
             (throw (.getCause e)))))))
+
+;; ---------------------------------------------------------------------------
+;; H13: core/! resolves the sender inside a delivery command handler
+;; ---------------------------------------------------------------------------
+
+(d/defactor-delivery h13-delivery-sender
+  :persistence-id (fn [args] (str "h13-del-sender-" (:id args)))
+
+  (init [args] {:probe (:probe args)})
+
+  (command [:ping-probe]
+    (core/! (:probe state) :hi)
+    nil))
+
+(deftest delivery-command-tell-uses-entity-as-sender
+  ;; H13: like the persistent case, core/! inside a delivery command body must
+  ;; send with the entity as sender, not noSender. *current-actor* is unbound in
+  ;; a delivery body; the fix resolves the sender via *current-self*.
+  (let [sys (create-test-system "h13-delivery-sender")]
+    (try
+      (let [got-sender (promise)
+            probe (core/new-actor sys
+                                  {:function (fn [this _msg]
+                                               (binding [core/*current-actor* this]
+                                                 (deliver got-sender (core/sender)))
+                                               nil)
+                                   :state nil})
+            entity (d/spawn sys h13-delivery-sender {:id (unique-id) :probe probe})]
+        (core/! entity [:ping-probe])
+        (is (= entity (deref got-sender 5000 :timeout))
+            "the probe saw the delivery entity as sender (noSender before the fix)"))
+      (finally
+        (terminate-system sys)))))

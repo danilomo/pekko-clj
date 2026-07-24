@@ -73,6 +73,28 @@
 
   (snapshot-every 5))
 
+;; H13: a persistent command handler that sends to another actor via core/!.
+;; The reply path only works if ! resolves the sender to this entity (via
+;; *current-self*); *current-actor* is unbound inside a persistent body.
+(p/defactor-persistent h13-persistent-sender
+  :persistence-id (fn [args] (str "h13-sender-" (:id args)))
+
+  (init [args] {:probe (:probe args)})
+
+  (command [:ping-probe]
+    (core/! (:probe state) :hi)
+    nil))
+
+(defn- sender-recording-probe
+  "A classic actor that records the sender of the first message it receives."
+  [sys got-sender]
+  (core/new-actor sys
+                  {:function (fn [this _msg]
+                               (binding [core/*current-actor* this]
+                                 (deliver got-sender (core/sender)))
+                               nil)
+                   :state nil}))
+
 ;; B15: handles only :known — anything else must route to unhandled() rather
 ;; than being silently dropped.
 (p/defactor-persistent picky-persistent
@@ -1079,3 +1101,35 @@
                             (on-stop nil)))
           (catch clojure.lang.Compiler$CompilerException e
             (throw (.getCause e)))))))
+
+;; ---------------------------------------------------------------------------
+;; H13: core/! resolves the sender inside a persistent command handler
+;; ---------------------------------------------------------------------------
+
+(deftest persistent-command-tell-uses-entity-as-sender
+  ;; core/! inside a persistent command body must send with the entity as sender
+  ;; (so the recipient can reply), not noSender. *current-actor* is unbound in a
+  ;; persistent body; the fix resolves the sender via *current-self*.
+  (let [sys (create-test-system "h13-persistent-sender")]
+    (try
+      (let [got-sender (promise)
+            probe (sender-recording-probe sys got-sender)
+            entity (p/spawn sys h13-persistent-sender {:id (unique-id) :probe probe})]
+        (core/! entity [:ping-probe])
+        (is (= entity (deref got-sender 5000 :timeout))
+            "the probe saw the persistent entity as sender (noSender before the fix)"))
+      (finally
+        (terminate-system sys)))))
+
+(deftest top-level-tell-still-sends-as-no-sender
+  ;; Guard: outside any actor, core/! must still send as noSender — Pekko then
+  ;; reports deadLetters as the sender. The *current-self* fallback must not leak.
+  (let [sys (create-test-system "h13-top-level")]
+    (try
+      (let [got-sender (promise)
+            probe (sender-recording-probe sys got-sender)]
+        (core/! probe :hi)
+        (is (= (.deadLetters sys) (deref got-sender 5000 :timeout))
+            "a top-level send has no sender"))
+      (finally
+        (terminate-system sys)))))
