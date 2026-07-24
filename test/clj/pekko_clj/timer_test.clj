@@ -158,3 +158,58 @@
       ;; After cancelling all, counts should not increase
       (is (<= @counter1 (+ c1 1)))
       (is (<= @counter2 (+ c2 1))))))
+
+;; ---------------------------------------------------------------------------
+;; H14: timers and schedule-once accept a plain ms number, not only a Duration
+;; ---------------------------------------------------------------------------
+
+(deftest core-timers-accept-millis
+  ;; start-timer / start-single-timer used to require a java.time.Duration and
+  ;; threw ClassCastException on a number. They now take ms too.
+  (let [single (promise)
+        ticks (atom 0)
+        actor (core/new-actor
+               *system*
+               {:function (fn [this msg]
+                            (binding [core/*current-actor* this]
+                              (case msg
+                                :setup (do
+                                         (core/start-single-timer :single 50 :single-fired)
+                                         (core/start-timer :periodic 20 :tick)
+                                         nil)
+                                :single-fired (do (deliver single true) nil)
+                                :tick (do (swap! ticks inc) nil)
+                                nil)))
+                :state nil})]
+    (core/! actor :setup)
+    (is (true? (deref single 2000 false)) "start-single-timer fired with ms")
+    (is (eventually (>= @ticks 2)) "start-timer (ms) fired periodically")))
+
+(deftest core-timer-initial-delay-accepts-millis
+  ;; The 4-arg start-timer (initial-delay + interval), both as ms numbers.
+  (let [ticks (atom 0)
+        actor (core/new-actor
+               *system*
+               {:function (fn [this msg]
+                            (binding [core/*current-actor* this]
+                              (case msg
+                                :setup (do (core/start-timer :periodic 10 20 :tick) nil)
+                                :tick (do (swap! ticks inc) nil)
+                                nil)))
+                :state nil})]
+    (core/! actor :setup)
+    (is (eventually (>= @ticks 2)))))
+
+(deftest schedule-once-accepts-millis
+  ;; schedule-once runs the fn after a delay; ms number instead of a Duration.
+  (let [fired (promise)
+        actor (core/new-actor
+               *system*
+               {:function (fn [this msg]
+                            (binding [core/*current-actor* this]
+                              (when (= msg :setup)
+                                (core/schedule-once 50 (fn [] (deliver fired true))))
+                              nil))
+                :state nil})]
+    (core/! actor :setup)
+    (is (true? (deref fired 2000 false)))))

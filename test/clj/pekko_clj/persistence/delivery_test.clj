@@ -160,6 +160,31 @@
     (core/! (:probe state) :hi)
     nil))
 
+;; H14: redeliver-interval as a plain ms number (not a Duration).
+(d/defactor-delivery ms-notifier
+  :persistence-id (fn [args] (str "ms-notifier-" (:id args)))
+  (init [args] {:target (:target args)})
+  (command [:notify payload]
+    (d/persist [:queued payload]))
+  (event [:queued payload]
+    (d/deliver (:target state) (fn [delivery-id] [:deliver delivery-id payload]))
+    state)
+  (redeliver-interval 300))
+
+(deftest redeliver-interval-accepts-millis
+  ;; A ms number must be coerced to a Duration for the Java side; before the fix
+  ;; the actor threw ClassCastException at construction (the Java prop is cast to
+  ;; java.time.Duration), so spawn itself failed.
+  (let [sys (create-test-system "h14-delivery-ms")]
+    (try
+      (let [received (atom [])
+            dest (recording-destination sys received)
+            n (d/spawn sys ms-notifier {:id (unique-id) :target dest})]
+        (core/! n [:notify "hi"])
+        (is (ts/poll-until #(>= (count @received) 2) 6000)
+            "the unconfirmed message is redelivered on the ms interval"))
+      (finally (terminate-system sys)))))
+
 (deftest delivery-command-tell-uses-entity-as-sender
   ;; H13: like the persistent case, core/! inside a delivery command body must
   ;; send with the entity as sender, not noSender. *current-actor* is unbound in

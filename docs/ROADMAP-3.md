@@ -56,7 +56,7 @@ performance note, see H16).
 | B21 | Death-pact not honored for unmatched Terminated | Bugs | DONE | — | medium |
 | B22 | Singleton hand-over stalls under `:restart-with-stop` supervision | Bugs | DONE | — | medium |
 | H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | DONE | — | medium |
-| H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | TODO | — | low |
+| H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | DONE | — | low |
 | H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | TODO | — | low |
 | H16 | Docstring corrections + micro-polish batch | Hardening | TODO | — | trivial |
 | H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | TODO | — | low |
@@ -266,8 +266,18 @@ same inside a delivery actor; `sharding/tell` from inside a persistent entity to
 another entity → the other entity's `reply` arrives back (round trip, fails
 today); top-level `!` still noSender.
 
-### H14 · Duration-convention sweep — `TODO`
-**Deps:** none.
+### H14 · Duration-convention sweep — `DONE`
+**Done:** every pre-convention duration arg now accepts ms-or-Duration.
+`core`/`persistence` each gained a private `->duration` (mirrors stream's) routing
+`schedule-once`, `start-timer`, `start-single-timer`; stream's seven pre-N1 ops
+(`source-tick`, `throttle`, `delay-each`, `grouped-within`, `take-within`,
+`drop-within`, `keep-alive`) drop their `^Duration` param hints and run through
+the existing `->duration`; delivery's `redeliver-interval` clause is coerced
+inline in the macro (nil-safe, fully-qualified `java.time.Duration` since
+generated code can't call a private fn) before the Java-side Duration cast.
+Widening only; docstrings say "ms or java.time.Duration" uniformly. Tests: one
+per fn family passing a plain number (timers/schedule-once, persistent timers,
+delivery redeliver-interval, all seven stream ops). **Deps:** none.
 The convention (established across N1/N5/N13/N16) is "durations are a
 java.time.Duration **or** milliseconds", but the older surface still requires a
 `Duration` and NPEs/mismatches on a number:

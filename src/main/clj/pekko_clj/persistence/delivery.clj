@@ -176,7 +176,7 @@
    - (on-recovery-complete [this] ...)
    - (on-stop ...)             - side effects on stop; `this`/`state` bound
    - (supervision strat)       - child supervisor strategy
-   - (redeliver-interval d)         - java.time.Duration between redelivery attempts
+   - (redeliver-interval d)         - ms or java.time.Duration between redelivery attempts
    - (redelivery-burst-limit n)     - cap redeliveries per interval
    - (warn-after-unconfirmed n)     - deliver an UnconfirmedWarning after n attempts
    - (max-unconfirmed n)            - cap outstanding messages (deliver then throws)
@@ -230,7 +230,13 @@
              on-recovery-complete# ~on-recovery-complete
              post-stop#            ~post-stop-fn
              supervisor-strategy#  ~supervision-expr
-             redeliver-interval#   ~redeliver-interval
+             ;; The Java side casts this prop to java.time.Duration, so coerce a
+             ;; ms number (H14) here; nil (clause absent) stays nil = Pekko default.
+             redeliver-interval#   ~(when redeliver-interval
+                                      `(when-let [d# ~redeliver-interval]
+                                         (if (instance? java.time.Duration d#)
+                                           d#
+                                           (java.time.Duration/ofMillis (long d#)))))
              burst-limit#          ~burst-limit
              warn-after#           ~warn-after
              max-unconfirmed#      ~max-unconfirmed]

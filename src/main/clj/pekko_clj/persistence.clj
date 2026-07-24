@@ -34,12 +34,19 @@
             [pekko-clj.internal.context :as ctx])
   (:import [org.apache.pekko.actor ActorSystem]
            [org.apache.pekko.persistence Recovery SnapshotSelectionCriteria]
-           [pekko_clj.actor CljPersistentActor Defer PersistAll PersistAsync PersistOps]))
+           [pekko_clj.actor CljPersistentActor Defer PersistAll PersistAsync PersistOps]
+           [java.time Duration]))
 
 (def ^:dynamic *current-persistent-actor*
   "Bound to the current CljPersistentActor during command handling.
    Used by (reply ...). Mirrors pekko-clj.core/*current-actor*."
   nil)
+
+(defn- ->duration
+  "Coerce a java.time.Duration or a number of milliseconds to a Duration
+   (the ms-or-Duration convention; mirrors pekko-clj.core / pekko-clj.stream)."
+  ^Duration [d]
+  (if (instance? Duration d) d (Duration/ofMillis (long d))))
 
 ;; ---------------------------------------------------------------------------
 ;; Recovery settings
@@ -619,19 +626,21 @@
 
 (defn start-timer
   "Start a repeating timer under `key`, delivering `message` to self every
-   `interval` (a java.time.Duration). Starting a timer with an existing key
+   `interval` (ms or a java.time.Duration). Starting a timer with an existing key
    replaces it. Timers are cancelled automatically when the actor stops or
    restarts."
   ([key interval message]
-   (.startTimer ^CljPersistentActor *current-persistent-actor* key interval message))
+   (.startTimer ^CljPersistentActor *current-persistent-actor*
+                key (->duration interval) message))
   ([key initial-delay interval message]
    (.startTimerWithInitialDelay ^CljPersistentActor *current-persistent-actor*
-                                key initial-delay interval message)))
+                                key (->duration initial-delay) (->duration interval) message)))
 
 (defn start-single-timer
-  "Deliver `message` to self once after `delay` (a java.time.Duration)."
+  "Deliver `message` to self once after `delay` (ms or a java.time.Duration)."
   [key delay message]
-  (.startSingleTimer ^CljPersistentActor *current-persistent-actor* key delay message))
+  (.startSingleTimer ^CljPersistentActor *current-persistent-actor*
+                     key (->duration delay) message))
 
 (defn cancel-timer
   "Cancel the timer registered under `key`."

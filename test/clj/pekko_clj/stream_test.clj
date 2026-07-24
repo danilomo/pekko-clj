@@ -468,6 +468,42 @@
     ;; Should have heartbeats before actual data
     (is (some #(= :heartbeat %) result))))
 
+(deftest duration-ops-accept-millis
+  ;; H14: the pre-N1 time ops take a plain ms number, not only a
+  ;; java.time.Duration (they used to ClassCastException on a number).
+  ;; source-tick (ms x2) + take-within (ms)
+  (let [ticks (-> (s/source-tick 10 20 :tick)
+                  (s/take-within 150)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))]
+    (is (pos? (count ticks)) "source-tick + take-within accept ms"))
+  ;; delay-each (ms) + grouped-within (ms)
+  (let [grouped (-> (s/source (range 6))
+                    (s/delay-each 1)
+                    (s/grouped-within 2 10000)
+                    (s/run-to-seq *mat*)
+                    (s/await-completion 3000))]
+    (is (= [[0 1] [2 3] [4 5]] (mapv vec grouped)) "delay-each + grouped-within accept ms"))
+  ;; throttle (ms)
+  (let [throttled (-> (s/source [1 2 3])
+                      (s/throttle 100 10)
+                      (s/run-to-seq *mat*)
+                      (s/await-completion 3000))]
+    (is (= [1 2 3] (vec throttled)) "throttle accepts ms"))
+  ;; drop-within (ms)
+  (let [dropped (-> (s/source [1 2 3 4 5])
+                    (s/drop-within 1)
+                    (s/run-to-seq *mat*)
+                    (s/await-completion 3000))]
+    (is (<= (count dropped) 5) "drop-within accepts ms"))
+  ;; keep-alive (ms)
+  (let [ka (-> (s/source-tick 200 200 :data)
+               (s/keep-alive 50 (fn [] :heartbeat))
+               (s/take 3)
+               (s/run-to-seq *mat*)
+               (s/await-completion 3000))]
+    (is (some #(= :heartbeat %) ka) "keep-alive accepts ms")))
+
 ;; ---------------------------------------------------------------------------
 ;; Tests: Phase 5 - Backpressure Strategies
 ;; ---------------------------------------------------------------------------

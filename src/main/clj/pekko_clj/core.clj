@@ -469,30 +469,39 @@
                                         ~(second on-error-params) ~msg-sym]
                                     ~@on-error-body)))})))}))))
 
+(defn- ->duration
+  "Coerce a java.time.Duration or a number of milliseconds to a Duration.
+   Mirrors pekko-clj.stream's private helper so the timer/schedule fns accept
+   either (the ms-or-Duration convention used across the library)."
+  ^Duration [d]
+  (if (instance? Duration d) d (Duration/ofMillis (long d))))
+
 (defn schedule-once
-  "Schedule a function to run once after a duration (java.time.Duration)."
+  "Schedule a function to run once after a delay (a java.time.Duration or a number
+   of milliseconds)."
   [duration f]
-  (.scheduleOnce *current-actor* duration f))
+  (.scheduleOnce *current-actor* (->duration duration) f))
 
 ;; Timer functions
 (defn start-timer
   "Start a periodic timer that sends a message to self at fixed intervals.
    key: timer key for cancellation/checking
-   interval: java.time.Duration between messages
+   interval: ms or java.time.Duration between messages
    message: message to send to self
-   Optional initial-delay: java.time.Duration before first message"
+   Optional initial-delay: ms or java.time.Duration before first message"
   ([key interval message]
-   (.startTimer *current-actor* key interval message))
+   (.startTimer *current-actor* key (->duration interval) message))
   ([key initial-delay interval message]
-   (.startTimerWithInitialDelay *current-actor* key initial-delay interval message)))
+   (.startTimerWithInitialDelay *current-actor* key (->duration initial-delay)
+                                (->duration interval) message)))
 
 (defn start-single-timer
   "Start a single-shot timer that sends a message to self after a delay.
    key: timer key for cancellation/checking
-   delay: java.time.Duration before message is sent
+   delay: ms or java.time.Duration before message is sent
    message: message to send to self"
   [key delay message]
-  (.startSingleTimer *current-actor* key delay message))
+  (.startSingleTimer *current-actor* key (->duration delay) message))
 
 (defn cancel-timer
   "Cancel a timer by key."

@@ -857,6 +857,15 @@
     (p/start-timer :tick (java.time.Duration/ofMillis ms) :tick)
     (p/reply :ticking)
     nil)
+  ;; H14: the timer fns accept a plain ms number, not only a Duration.
+  (command [:start-ticking-ms ms]
+    (p/start-timer :tick ms :tick)
+    (p/reply :ticking)
+    nil)
+  (command [:start-once-ms ms]
+    (p/start-single-timer :once ms :tick)
+    (p/reply :once-set)
+    nil)
   (command :tick
     (p/persist [:ticked]))
   (command :stop-ticking
@@ -907,6 +916,22 @@
         (is (eventually (<= 3 (or (core/<! actor :get-ticks 3000) 0))))
         (is (false? (core/<! actor :stop-ticking 3000))
             "cancel-timer removed the timer"))
+      (finally (terminate-system sys)))))
+
+(deftest persistent-timers-accept-millis
+  ;; H14: p/start-timer and p/start-single-timer take a plain ms number, not only
+  ;; a java.time.Duration (previously a ClassCastException on the Java hint).
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (let [periodic (p/spawn sys lifecycle-actor {:id (unique-id)})]
+        (is (= :ticking (core/<! periodic [:start-ticking-ms 30] 3000)))
+        (is (eventually (<= 3 (or (core/<! periodic :get-ticks 3000) 0)))
+            "periodic timer (ms) persisted several ticks")
+        (core/<! periodic :stop-ticking 3000))
+      (let [once (p/spawn sys lifecycle-actor {:id (unique-id)})]
+        (is (= :once-set (core/<! once [:start-once-ms 30] 3000)))
+        (is (eventually (<= 1 (or (core/<! once :get-ticks 3000) 0)))
+            "single timer (ms) fired once"))
       (finally (terminate-system sys)))))
 
 ;; --- persist-async / defer / then -----------------------------------------

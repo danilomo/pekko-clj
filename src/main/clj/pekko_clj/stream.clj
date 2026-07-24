@@ -184,11 +184,11 @@
 
 (defn source-tick
   "Create a Source that emits elements at regular intervals.
-   initial-delay: Duration before first element
-   interval: Duration between elements
+   initial-delay: ms or Duration before first element
+   interval: ms or Duration between elements
    element: The element to emit"
-  [^Duration initial-delay ^Duration interval element]
-  (Source/tick initial-delay interval element))
+  [initial-delay interval element]
+  (Source/tick (->duration initial-delay) (->duration interval) element))
 
 (defn source-unfold
   "Create a Source by repeatedly applying a function.
@@ -320,14 +320,15 @@
 (defn throttle
   "Limit the rate of elements.
    elements: number of elements
-   per: Duration for the rate limit"
-  [src elements ^Duration per]
-  (op src throttle (int elements) per))
+   per: ms or Duration for the rate limit"
+  [src elements per]
+  (op src throttle (int elements) (->duration per)))
 
 (defn delay-each
-  "Delay each element by the given duration (backpressuring upstream while waiting)."
-  [src ^Duration duration]
-  (op src delay duration (org.apache.pekko.stream.DelayOverflowStrategy/backpressure)))
+  "Delay each element by the given duration, ms or a java.time.Duration
+   (backpressuring upstream while waiting)."
+  [src duration]
+  (op src delay (->duration duration) (org.apache.pekko.stream.DelayOverflowStrategy/backpressure)))
 
 (defn buffer
   "Buffer elements when downstream is slower.
@@ -726,27 +727,27 @@
 (defn grouped-within
   "Batch elements by count OR time, whichever comes first.
    n: maximum batch size
-   d: maximum duration to wait"
-  [src n ^Duration d]
-  (op src groupedWithin (int n) d))
+   d: maximum time to wait, ms or a java.time.Duration"
+  [src n d]
+  (op src groupedWithin (int n) (->duration d)))
 
 (defn take-within
-  "Take elements for a duration from stream start."
-  [src ^Duration d]
-  (op src takeWithin d))
+  "Take elements for a duration (ms or a java.time.Duration) from stream start."
+  [src d]
+  (op src takeWithin (->duration d)))
 
 (defn drop-within
-  "Drop elements for a duration from stream start."
-  [src ^Duration d]
-  (op src dropWithin d))
+  "Drop elements for a duration (ms or a java.time.Duration) from stream start."
+  [src d]
+  (op src dropWithin (->duration d)))
 
 (defn keep-alive
   "Inject elements on idle to prevent timeout.
-   d: maximum idle time before injecting
+   d: maximum idle time before injecting, ms or a java.time.Duration
    inject-fn: function to create the element to inject"
-  [src ^Duration d inject-fn]
-  (op src keepAlive d (reify org.apache.pekko.japi.function.Creator
-                        (create [_] (inject-fn)))))
+  [src d inject-fn]
+  (op src keepAlive (->duration d) (reify org.apache.pekko.japi.function.Creator
+                                     (create [_] (inject-fn)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Phase 5: Backpressure Strategies
