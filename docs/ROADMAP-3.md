@@ -60,7 +60,7 @@ performance note, see H16).
 | H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | DONE | — | low |
 | H16 | Docstring corrections + micro-polish batch | Hardening | DONE | — | trivial |
 | H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | DONE | — | low |
-| H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | TODO | — | low |
+| H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | DONE | — | low |
 | N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | TODO | B19 | medium |
 | N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | TODO | — | low |
 | N22 | Stash for persistent actors | New | TODO | — | low |
@@ -376,7 +376,23 @@ is not doc-only, it compiles to a cast). **Fix:** retag to `^ActorRefFactory`
 `(persistence/spawn (core/context) def args)`; it recovers and replies; parent
 stop tears it down.
 
-### H18 · Odds and ends — `TODO`
+### H18 · Odds and ends — `DONE`
+**Decisions recorded:**
+- **Dead graph junctions** — DELETED `stream/broadcast`/`balance`/`merge-n`/
+  `partition` (unusable without a GraphDSL to wire into; no src/test used them).
+  Removed their now-unused imports and the `partition` `:refer-clojure :exclude`.
+  `fan-out`/`balance-work` cover the common cases.
+- **`completion->promise`** — now unwraps `.getCause`, so `:error` is the real
+  exception (matching `await-completion`); added a failure test.
+- **`client/get-json`/`post-json`** — chose the breaking-better path: they now
+  marshal via `pekko-clj.http.marshalling` (`get-json` parses the response to
+  Clojure data; `post-json` takes Clojure `data`, encodes it, parses the reply).
+  No callers existed, so the break is free. Integration round-trip test added.
+- **Duplicate `then`/`then-apply`** — FOLDED: `client`'s are now re-export `def`s
+  of `pekko-clj.http.core`'s (one implementation), keeping the client API stable.
+
+`lein check` stays fully clean; `lein lint` clean.
+
 **Deps:** none. Small items, one session:
 - **Dead API:** `stream/broadcast`, `balance`, `merge-n`, `partition`
   (`stream.clj:798-823`) return raw GraphDSL junctions, but the ns exposes no

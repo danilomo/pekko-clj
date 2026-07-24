@@ -3,7 +3,8 @@
 
    Provides simple HTTP request functions with async response handling."
   (:require [pekko-clj.http.response :as resp]
-            [pekko-clj.http.core :as http])
+            [pekko-clj.http.core :as http]
+            [pekko-clj.http.marshalling :as marshal])
   (:import [org.apache.pekko.http.javadsl Http HttpsConnectionContext]
            [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse HttpMethods
             HttpHeader ResponseEntity ContentType$NonBinary]
@@ -261,23 +262,20 @@
 ;; Async Utilities
 ;; ---------------------------------------------------------------------------
 
-(defn then
-  "Chain a function after a CompletionStage completes.
-   f receives the result and should return a CompletionStage."
-  [^CompletionStage stage f]
-  (.thenCompose stage
-                (reify Function
-                  (apply [_ result]
-                    (f result)))))
+;; H18: these were byte-for-byte duplicates of pekko-clj.http.core's; re-export
+;; them so there is one implementation. Kept here so `client/then` /
+;; `client/then-apply` stay a stable part of the client API.
+(def ^{:arglists '([stage f])
+       :doc "Chain a function after a CompletionStage completes (thenCompose): `f`
+   receives the result and should return a CompletionStage. See
+   `pekko-clj.http.core/then`."}
+  then http/then)
 
-(defn then-apply
-  "Transform the result of a CompletionStage synchronously.
-   f receives the result and returns a new value."
-  [^CompletionStage stage f]
-  (.thenApply stage
-              (reify Function
-                (apply [_ result]
-                  (f result)))))
+(def ^{:arglists '([stage f])
+       :doc "Transform a CompletionStage's result synchronously (thenApply): `f`
+   receives the result and returns a new value. See
+   `pekko-clj.http.core/then-apply`."}
+  then-apply http/then-apply)
 
 (defn on-complete
   "Add a callback for when a CompletionStage completes.
@@ -305,24 +303,29 @@
 ;; ---------------------------------------------------------------------------
 
 (defn get-json
-  "Make a GET request and parse the response as JSON (returns string).
-   Returns CompletionStage<String>.
+  "GET `url` with an application/json Accept header and parse the response body as
+   JSON into Clojure data (keywordized keys, via `pekko-clj.http.marshalling`).
+   Returns a CompletionStage of the parsed data.
 
-   For actual JSON parsing, use a library like cheshire with the result."
+   (H18: previously returned the raw body string despite the name; it now parses,
+   matching `post-json` and the marshalling layer.)"
   [system url]
   (-> (GET system url {:headers {"Accept" "application/json"}})
-      (then (fn [resp]
-              (response-body resp system)))))
+      (then (fn [resp] (response-body resp system)))
+      (then-apply marshal/json->)))
 
 (defn post-json
-  "Make a POST request with JSON body.
-   Returns CompletionStage<String> of response body."
-  [system url body-string]
-  (-> (POST system url {:body body-string
+  "POST Clojure `data` as a JSON body to `url` and parse the JSON response into
+   Clojure data (keywordized keys). Returns a CompletionStage of the parsed data.
+
+   (H18: `data` is now Clojure data, encoded here — previously this took a
+   pre-encoded body string and returned the raw response string.)"
+  [system url data]
+  (-> (POST system url {:body (marshal/->json data)
                         :content-type :json
                         :headers {"Accept" "application/json"}})
-      (then (fn [resp]
-              (response-body resp system)))))
+      (then (fn [resp] (response-body resp system)))
+      (then-apply marshal/json->)))
 
 (defn successful?
   "Check if a response status indicates success (2xx)."

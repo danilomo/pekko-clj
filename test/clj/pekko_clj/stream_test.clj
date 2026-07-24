@@ -302,6 +302,18 @@
         result (deref p 3000 :timeout)]
     (is (= {:value 15} result))))
 
+(deftest completion-to-promise-unwraps-failure
+  ;; H18: :error is the exception the stage failed with, unwrapped from its
+  ;; CompletionException wrapper (matching await-completion), not the wrapper.
+  (let [p (-> (s/source-failed (ex-info "boom" {:k 1}))
+              (s/run-fold 0 + *mat*)
+              (s/completion->promise))
+        {:keys [error]} (deref p 3000 {:error :timeout})]
+    (is (instance? clojure.lang.ExceptionInfo error)
+        "unwrapped to the original exception, not a CompletionException")
+    (is (= "boom" (.getMessage ^Throwable error)))
+    (is (= {:k 1} (ex-data error)))))
+
 (deftest await-completion-timeout
   (let [slow-stream (-> (s/source-tick (java.time.Duration/ofSeconds 10)
                                        (java.time.Duration/ofSeconds 10)

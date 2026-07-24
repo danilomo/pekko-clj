@@ -674,6 +674,25 @@
           ;; a code outside the registry still round-trips, body and all
           (is (= [289 "odd-body"] (get-status+body (url "/unregistered")))))))))
 
+(deftest client-json-helpers-parse-round-trip
+  ;; H18: get-json / post-json now marshal — post Clojure data, get Clojure data
+  ;; back (keywordized), instead of returning the raw body string.
+  (let [routes (routing/routes
+                 (routing/GET "/thing" [] (routing/complete-json {:id 1 :name "ada"}))
+                 (routing/POST "/echo" []
+                   (routing/with-json-body
+                    (fn [data] (routing/complete-json {:got data}))))
+                 (routing/not-found "nope"))]
+    (with-test-server routes
+      (fn []
+        (is (= {:id 1 :name "ada"}
+               (-> (client/get-json *system* (url "/thing")) (client/await-response 5000)))
+            "get-json parses the response body into Clojure data")
+        (is (= {:got {:k ["a" "b"]}}
+               (-> (client/post-json *system* (url "/echo") {:k ["a" "b"]})
+                   (client/await-response 5000)))
+            "post-json encodes the request and parses the response")))))
+
 (deftest from-resource-serves-a-classpath-file
   (let [routes (routing/routes
                  (routing/path "style.css" (routing/from-resource "public/css/app.css"))

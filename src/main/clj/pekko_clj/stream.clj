@@ -38,14 +38,14 @@
            (smap inc)
            (sfilter even?)
            (run-foreach println mat)))"
-  (:refer-clojure :exclude [concat dedupe drop drop-while interleave mapcat take take-while merge distinct partition group-by])
+  (:refer-clojure :exclude [concat dedupe drop drop-while interleave mapcat take take-while merge distinct group-by])
   (:import [org.apache.pekko.stream Materializer OverflowStrategy
             ActorAttributes Attributes CompletionStrategy IOResult KillSwitch
             KillSwitches RestartSettings SharedKillSwitch Supervision
             SystemMaterializer]
            [org.apache.pekko.stream.javadsl Source Flow Sink Keep RunnableGraph
             AsPublisher
-            Broadcast Balance Merge Partition SubSource SubFlow
+            SubSource SubFlow
             FileIO StreamConverters Framing FramingTruncation
             RestartSource RestartFlow RestartSink RetryFlow]
            [org.apache.pekko.actor ActorSystem ActorRef]
@@ -584,14 +584,17 @@
      (catch java.util.concurrent.TimeoutException _ nil))))
 
 (defn completion->promise
-  "Convert a CompletionStage to a Clojure promise."
+  "Convert a CompletionStage to a Clojure promise, delivering {:value result} on
+   success or {:error cause} on failure. The failure is unwrapped from its
+   CompletionException wrapper (`.getCause`), matching `await-completion`'s
+   convention, so `:error` is the exception the stage actually failed with."
   [^CompletionStage stage]
   (let [p (promise)]
     (.whenComplete stage
                    (reify java.util.function.BiConsumer
                      (accept [_ result exception]
                        (if exception
-                         (deliver p {:error exception})
+                         (deliver p {:error (or (.getCause ^Throwable exception) exception)})
                          (deliver p {:value result})))))
     p))
 
@@ -796,39 +799,13 @@
                          (.iterator ^Iterable result)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Phase 6: Graph DSL
+;; Additional Sources
 ;; ---------------------------------------------------------------------------
-
-(defn broadcast
-  "Create a Broadcast junction that fans out to all outputs.
-   n: number of output ports"
-  [n]
-  (Broadcast/create (int n)))
-
-(defn balance
-  "Create a Balance junction for load-balancing fan-out.
-   n: number of output ports"
-  [n]
-  (Balance/create (int n)))
-
-(defn merge-n
-  "Create a Merge junction that combines n inputs.
-   n: number of input ports"
-  [n]
-  (Merge/create (int n)))
-
-(defn partition
-  "Create a Partition junction for conditional routing.
-   n: number of output ports
-   partition-fn: function that returns the output port index (0 to n-1)"
-  [n partition-fn]
-  (Partition/create (int n)
-                    (reify org.apache.pekko.japi.function.Function
-                      (apply [_ x] (int (partition-fn x))))))
-
-;; ---------------------------------------------------------------------------
-;; Phase 7: Additional Sources
-;; ---------------------------------------------------------------------------
+;;
+;; (The former "Phase 6: Graph DSL" junction builders — broadcast/balance/merge-n/
+;; partition — were removed in H18: they returned raw GraphDSL junctions but this
+;; ns exposes no GraphDSL to wire them into, so they were unusable as shipped.
+;; `fan-out` and `balance-work` cover the common fan-out cases.)
 
 (defn source-future
   "Create a Source that emits a single element from a CompletionStage."
