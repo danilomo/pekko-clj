@@ -195,7 +195,10 @@
 
 (defn unhandled
   "Mark `msg` as unhandled: publishes it to the actor system's event stream as an
-   UnhandledMessage (and, for an unwatched Terminated, throws DeathPactException).
+   UnhandledMessage. For a watched actor's Terminated that no clause consumed,
+   this throws DeathPactException instead (Pekko's death-pact contract), which by
+   default stops the watcher — even though `defactor` presents Terminated to
+   handlers as a [:terminated ref] vector, the raw Terminated is restored here.
    `defactor` calls this automatically for a message matching no `handle` clause,
    unless you supply your own catch-all. Returns nil (state is left unchanged)."
   [msg]

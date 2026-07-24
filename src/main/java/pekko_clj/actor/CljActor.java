@@ -42,6 +42,11 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   private final LinkedList<StashedMessage> stash = new LinkedList<>();
   private Object currentMessage;
   private ActorRef currentSender;
+  // The raw, untranslated message currently being handled. Kept alongside
+  // currentMessage so unhandled() can restore the real Terminated instance
+  // (currentMessage holds its [:terminated ref] translation) and re-arm the
+  // death pact. See unhandled().
+  private Object currentRawMessage;
 
   public static Props create(ILookup props) {
     return Props.create(CljActor.class, () -> {
@@ -85,8 +90,10 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       translatedMessage = PersistentVector.create(TERMINATED, t.getActor());
     }
 
-    // Track current message and sender for stashing
+    // Track current message and sender for stashing (translated) and for the
+    // death-pact restore in unhandled() (raw).
     currentMessage = translatedMessage;
+    currentRawMessage = message;
     currentSender = getSender();
 
     try {
@@ -101,7 +108,11 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       //    handler is set it recovers the actor IN PLACE, so the parent's
       //    supervisor strategy never sees the failure; otherwise it is rethrown
       //    so supervision can decide (restart/resume/stop/escalate).
-      if (t instanceof Error || t instanceof InterruptedException) {
+      //  - DeathPactException is never routed to on-error: like upstream Pekko,
+      //    an unhandled Terminated is not a recoverable handler error — it must
+      //    propagate to supervision (which stops this watcher by default).
+      if (t instanceof Error || t instanceof InterruptedException
+          || t instanceof DeathPactException) {
         throw t;
       }
       if (errorHandler != null) {
@@ -113,6 +124,7 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       }
     } finally {
       currentMessage = null;
+      currentRawMessage = null;
       currentSender = null;
     }
   }
@@ -257,12 +269,27 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   /**
    * Mark a message as unhandled. Delegates to Pekko's default handling, which
    * publishes an {@link org.apache.pekko.actor.UnhandledMessage} to the actor
-   * system's event stream (and throws {@code DeathPactException} for an
-   * unwatched {@code Terminated}). Used by the {@code defactor} catch-all so an
-   * unmatched message does not crash the actor with a {@code MatchError}.
+   * system's event stream (and throws {@code DeathPactException} for a watched
+   * actor's {@code Terminated} that no handler consumed). Used by the
+   * {@code defactor} catch-all so an unmatched message does not crash the actor
+   * with a {@code MatchError}.
+   *
+   * <p>Because {@link #onReceive} translates a {@code Terminated} to a
+   * {@code [:terminated ref]} vector before matching (so a handler can
+   * pattern-match it), the catch-all hands us that vector — and
+   * {@code super.unhandled} only re-arms the death pact for a real
+   * {@code Terminated} instance. So when the message being marked unhandled is
+   * the translation of the {@code Terminated} we are currently handling, we
+   * delegate the raw {@code Terminated} instead, restoring the death pact
+   * exactly as upstream (default supervision then stops this watcher).
    */
   @Override
   public void unhandled(Object message) {
+    if (currentRawMessage instanceof Terminated
+        && currentMessage != null && currentMessage.equals(message)) {
+      super.unhandled(currentRawMessage);
+      return;
+    }
     super.unhandled(message);
   }
 

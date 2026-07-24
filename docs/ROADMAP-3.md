@@ -53,7 +53,7 @@ performance note, see H16).
 |----|-------|-----------|--------|------|------|
 | B19 | `(stream/source [])` throws NPE | Bugs | DONE | — | trivial |
 | B20 | Integer status codes produce 500s | Bugs | DONE | — | low |
-| B21 | Death-pact not honored for unmatched Terminated | Bugs | TODO | — | medium |
+| B21 | Death-pact not honored for unmatched Terminated | Bugs | DONE | — | medium |
 | B22 | Singleton hand-over stalls under `:restart-with-stop` supervision | Bugs | TODO | — | medium |
 | H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | TODO | — | medium |
 | H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | TODO | — | low |
@@ -135,7 +135,17 @@ documented primary form.
 exactly like `:created` (status + body); an int outside the registry (e.g. 599)
 still round-trips with its body; `(resp/response 204 nil)` stays body-less.
 
-### B21 · Death-pact not honored for unmatched Terminated — `TODO`
+### B21 · Death-pact not honored for unmatched Terminated — `DONE`
+**Done:** `CljActor` now keeps the raw message alongside the `[:terminated ref]`
+translation (`currentRawMessage`); `unhandled` detects when the catch-all passes
+back the translated form of the Terminated being handled and delegates
+`super.unhandled(rawTerminated)`, restoring Pekko's DeathPactException (default
+supervision then stops the watcher). DeathPactException is added to the
+onReceive rethrow list so `on-error` never intercepts it. `watchWith` markers are
+unaffected (not translated → ordinary UnhandledMessage). `core/unhandled`
+docstring corrected. Tests (test-first, key regression verified failing on
+HEAD): bare watcher death-pacts and is stopped; handled `[:terminated]` clause
+survives; unmatched watchWith marker does not death-pact.
 **Deps:** none. **VERIFIED live (2026-07-24):** a `defactor` that `core/watch`es
 another actor but has **no** `[:terminated _]` handle clause **survives** the
 watched actor's death (the message is published as an UnhandledMessage and life

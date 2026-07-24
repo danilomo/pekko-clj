@@ -1,7 +1,7 @@
 (ns pekko-clj.deathwatch-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core]
-            [pekko-clj.test-support :refer [eventually]])
+            [pekko-clj.test-support :as ts :refer [eventually]])
   (:import [org.apache.pekko.actor ActorRef]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
@@ -161,6 +161,59 @@
     (is (= :watching (await-ask watcher [:watch target])))
     (.tell target poison-pill no-sender)
     (is (= {:gone :my-marker} (deref received 3000 :timeout)))))
+
+;; ---------------------------------------------------------------------------
+;; B21: death pact for an unhandled Terminated
+;; ---------------------------------------------------------------------------
+
+(deftest unhandled-terminated-death-pacts-watcher
+  ;; B21: a defactor that watches an actor but has NO [:terminated _] clause must
+  ;; NOT silently survive the watched actor's death. Pekko's contract is that an
+  ;; unhandled Terminated throws DeathPactException, which default supervision
+  ;; turns into a stop of the watcher. (Before the fix the message was matched as
+  ;; the translated [:terminated ref] vector, so the death-pact branch of
+  ;; super.unhandled was unreachable and the watcher lived on.)
+  (core/defactor b21-bare-watcher
+    (init [target] (core/watch target) nil)
+    (handle :ping (core/reply :pong)))
+  (let [target (core/new-actor *system* {:function (fn [_ _] nil) :state nil})
+        watcher (core/spawn *system* b21-bare-watcher target)]
+    (is (= :pong (core/<! watcher :ping 3000)) "watcher is alive and watching")
+    (core/poison-pill target)
+    (is (ts/stopped-within? *system* watcher 5000)
+        "the unhandled Terminated fired the death pact and stopped the watcher")))
+
+(deftest handled-terminated-does-not-death-pact
+  ;; B21: a watcher WITH a [:terminated ref] clause consumes the message — no
+  ;; death pact, and the actor keeps running afterwards.
+  (let [terminated (promise)]
+    (core/defactor b21-good-watcher
+      (init [target] (core/watch target) nil)
+      (handle :ping (core/reply :pong))
+      (handle [:terminated ref] (deliver terminated ref) nil))
+    (let [target (core/new-actor *system* {:function (fn [_ _] nil) :state nil})
+          watcher (core/spawn *system* b21-good-watcher target)]
+      (is (= :pong (core/<! watcher :ping 3000)))
+      (core/poison-pill target)
+      (is (= target (deref terminated 3000 :timeout)) "the terminated clause fired")
+      (is (= :pong (core/<! watcher :ping 3000)) "watcher survived — no death pact"))))
+
+(deftest unmatched-watchwith-marker-does-not-death-pact
+  ;; B21: watchWith delivers a custom message, not a Terminated. An *unmatched*
+  ;; marker is an ordinary UnhandledMessage — never a death pact (matches Pekko,
+  ;; where the custom message is just a message). The watcher survives.
+  (core/defactor b21-watchwith-watcher
+    (init [target] (core/watch target {:gone true}) nil)
+    (handle :ping (core/reply :pong)))
+  (let [target (core/new-actor *system* {:function (fn [_ _] nil) :state nil})
+        watcher (core/spawn *system* b21-watchwith-watcher target)]
+    (is (= :pong (core/<! watcher :ping 3000)))
+    (core/poison-pill target)
+    ;; give the marker ample time to be (mis)delivered: if it death-pacted, the
+    ;; watcher would stop within this window.
+    (is (not (ts/stopped-within? *system* watcher 1500))
+        "an unmatched watchWith marker must not stop the watcher")
+    (is (= :pong (core/<! watcher :ping 3000)) "watcher is still responsive")))
 
 (deftest watch-multiple-actors
   (let [terminated-actors (atom #{})
