@@ -15,26 +15,36 @@
    Used by !, reply, sender, self, parent, spawn."
   nil)
 
+(defn- current-actor
+  "The current CljActor, or a friendly IllegalStateException if called outside an
+   actor handler / init (where *current-actor* is nil — a bare NPE otherwise).
+   `fn-name` is the public fn being guarded. Allocation-free on the bound path."
+  ^CljActor [fn-name]
+  (or *current-actor*
+      (throw (IllegalStateException.
+              (str "pekko-clj.core/" fn-name " must be called inside an actor "
+                   "handler or init (there is no current actor here)")))))
+
 (defn self
   "Returns the ActorRef of the current actor."
   []
-  (.selfRef *current-actor*))
+  (.selfRef (current-actor "self")))
 
 (defn sender
   "Returns the ActorRef of the message sender."
   []
-  (.senderRef *current-actor*))
+  (.senderRef (current-actor "sender")))
 
 (defn parent
   "Returns the ActorRef of the current actor's parent."
   []
-  (.parentRef *current-actor*))
+  (.parentRef (current-actor "parent")))
 
 (defn context
   "Returns the current actor's ActorContext (valid only during message handling
    or init). Used for actor-selection, stop, sharding/passivate, etc."
   ^ActorContext []
-  (.getContext *current-actor*))
+  (.getContext (current-actor "context")))
 
 (defn !
   "Send a message to an actor. Inside any actor handler the sender is self, so the
@@ -292,6 +302,12 @@
    duplicate of a clause that may only appear once."
   [name body]
   (doseq [clause body]
+    ;; A stray non-list clause (a bare keyword/string in the body) would make
+    ;; (first clause) throw "Don't know how to create ISeq"; name it instead.
+    (when-not (seq? clause)
+      (throw (ex-info (str "defactor " name ": unknown clause `" (pr-str clause)
+                           "` — every clause must be a list like (init ...) or (handle ...)")
+                      {:clause clause})))
     (let [head (first clause)]
       (when-not (contains? actor-clause-heads head)
         (throw (ex-info (str "defactor " name ": unknown clause `" (pr-str clause)
@@ -480,7 +496,7 @@
   "Schedule a function to run once after a delay (a java.time.Duration or a number
    of milliseconds)."
   [duration f]
-  (.scheduleOnce *current-actor* (->duration duration) f))
+  (.scheduleOnce (current-actor "schedule-once") (->duration duration) f))
 
 ;; Timer functions
 (defn start-timer
@@ -490,9 +506,9 @@
    message: message to send to self
    Optional initial-delay: ms or java.time.Duration before first message"
   ([key interval message]
-   (.startTimer *current-actor* key (->duration interval) message))
+   (.startTimer (current-actor "start-timer") key (->duration interval) message))
   ([key initial-delay interval message]
-   (.startTimerWithInitialDelay *current-actor* key (->duration initial-delay)
+   (.startTimerWithInitialDelay (current-actor "start-timer") key (->duration initial-delay)
                                 (->duration interval) message)))
 
 (defn start-single-timer
@@ -501,22 +517,22 @@
    delay: ms or java.time.Duration before message is sent
    message: message to send to self"
   [key delay message]
-  (.startSingleTimer *current-actor* key (->duration delay) message))
+  (.startSingleTimer (current-actor "start-single-timer") key (->duration delay) message))
 
 (defn cancel-timer
   "Cancel a timer by key."
   [key]
-  (.cancelTimer *current-actor* key))
+  (.cancelTimer (current-actor "cancel-timer") key))
 
 (defn timer-active?
   "Check if a timer is active."
   [key]
-  (.isTimerActive *current-actor* key))
+  (.isTimerActive (current-actor "timer-active?") key))
 
 (defn cancel-all-timers
   "Cancel all timers for this actor."
   []
-  (.cancelAllTimers *current-actor*))
+  (.cancelAllTimers (current-actor "cancel-all-timers")))
 
 ;; ReceiveTimeout
 (def receive-timeout
@@ -583,7 +599,7 @@
    stops for good, whatever is still stashed becomes dead letters, visible via
    `pekko-clj.event-stream/subscribe-dead-letters`."
   []
-  (.stash *current-actor*)
+  (.stash (current-actor "stash"))
   nil)
 
 (defn unstash-all
@@ -596,7 +612,7 @@
    unstash' pattern this is equivalent; it differs only if other messages queued
    up between stashing and unstashing and their relative order matters."
   []
-  (.unstashAll *current-actor*)
+  (.unstashAll (current-actor "unstash-all"))
   nil)
 
 (defn unstash
@@ -604,17 +620,17 @@
    at the tail of the mailbox (see `unstash-all` for the ordering note).
    Returns nil (doesn't affect state)."
   []
-  (.unstash *current-actor*)
+  (.unstash (current-actor "unstash"))
   nil)
 
 (defn stash-size
   "Returns the number of stashed messages."
   []
-  (.stashSize *current-actor*))
+  (.stashSize (current-actor "stash-size")))
 
 (defn clear-stash
   "Clear all stashed messages without processing them.
    Returns nil (doesn't affect state)."
   []
-  (.clearStash *current-actor*)
+  (.clearStash (current-actor "clear-stash"))
   nil)

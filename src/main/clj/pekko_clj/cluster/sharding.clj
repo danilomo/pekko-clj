@@ -239,6 +239,8 @@
   ^Props [actor-def opts]
   (if (= :persistent-actor (:type actor-def))
     (let [props-map (:entity-props actor-def)]
+      ;; Belt-and-braces: defactor-persistent now rejects a missing :persistence-id
+      ;; at macro-expansion (H15), so this only trips for a hand-built actor-def map.
       (when-not (:persistence-id-fn props-map)
         (throw (IllegalArgumentException.
                 (str "A sharded persistent entity needs a :persistence-id clause — it is "

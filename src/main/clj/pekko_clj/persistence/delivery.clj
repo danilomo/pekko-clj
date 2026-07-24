@@ -49,6 +49,16 @@
    handled. Used by reply/self/deliver/confirm-delivery! and friends."
   nil)
 
+(defn- current-actor
+  "The current CljAtLeastOnceDeliveryActor, or a friendly IllegalStateException if
+   called outside a command/event/lifecycle body (where *current-delivery-actor*
+   is nil — a bare NPE otherwise). `fn-name` is the public fn being guarded."
+  ^CljAtLeastOnceDeliveryActor [fn-name]
+  (or *current-delivery-actor*
+      (throw (IllegalStateException.
+              (str "pekko-clj.persistence.delivery/" fn-name " must be called "
+                   "inside a delivery actor's command/event/lifecycle body")))))
+
 ;; Re-exported persist helpers — plain markers, so they work here unchanged. See
 ;; pekko-clj.persistence for their full docstrings.
 (def ^{:doc "See pekko-clj.persistence/persist."} persist p/persist)
@@ -282,17 +292,17 @@
 (defn self
   "This actor's own ActorRef."
   ^ActorRef []
-  (.selfRef ^CljAtLeastOnceDeliveryActor *current-delivery-actor*))
+  (.selfRef (current-actor "self")))
 
 (defn sender
   "The ActorRef that sent the command being handled."
   ^ActorRef []
-  (.senderRef ^CljAtLeastOnceDeliveryActor *current-delivery-actor*))
+  (.senderRef (current-actor "sender")))
 
 (defn context
   "This actor's ActorContext."
   ^org.apache.pekko.actor.ActorContext []
-  (.actorContext ^CljAtLeastOnceDeliveryActor *current-delivery-actor*))
+  (.actorContext (current-actor "context")))
 
 (defn tell
   "Send `msg` to `target` with this actor as sender."

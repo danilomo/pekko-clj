@@ -48,6 +48,16 @@
   ^Duration [d]
   (if (instance? Duration d) d (Duration/ofMillis (long d))))
 
+(defn- current-actor
+  "The current CljPersistentActor, or a friendly IllegalStateException if called
+   outside a command/event/lifecycle body (where *current-persistent-actor* is
+   nil — a bare NPE otherwise). `fn-name` is the public fn being guarded."
+  ^CljPersistentActor [fn-name]
+  (or *current-persistent-actor*
+      (throw (IllegalStateException.
+              (str "pekko-clj.persistence/" fn-name " must be called inside a "
+                   "persistent actor's command/event/lifecycle body")))))
+
 ;; ---------------------------------------------------------------------------
 ;; Recovery settings
 ;; ---------------------------------------------------------------------------
@@ -346,6 +356,12 @@
         clauses   (if docstring (rest clauses) clauses)
         _ (validate-persistent-clauses name clauses)
         persistence-id-fn (parse-persistence-id clauses)
+        ;; Guard at expansion time (like defactor-delivery) rather than letting a
+        ;; missing id NPE at runtime inside :make-props.
+        _ (when-not persistence-id-fn
+            (throw (ex-info (str "defactor-persistent " name ": a :persistence-id "
+                                 "clause is required (:persistence-id (fn [args] ...))")
+                            {:name name})))
         init-fn (parse-init clauses)
         commands (parse-commands clauses)
         events (parse-events clauses)
@@ -588,17 +604,17 @@
 (defn self
   "The current persistent actor's own ActorRef."
   ^org.apache.pekko.actor.ActorRef []
-  (.selfRef ^CljPersistentActor *current-persistent-actor*))
+  (.selfRef (current-actor "self")))
 
 (defn sender
   "The ActorRef that sent the command being handled."
   ^org.apache.pekko.actor.ActorRef []
-  (.senderRef ^CljPersistentActor *current-persistent-actor*))
+  (.senderRef (current-actor "sender")))
 
 (defn context
   "The current persistent actor's ActorContext."
   ^org.apache.pekko.actor.ActorContext []
-  (.actorContext ^CljPersistentActor *current-persistent-actor*))
+  (.actorContext (current-actor "context")))
 
 (defn tell
   "Send `msg` to `target` with this actor as the sender."
@@ -630,32 +646,30 @@
    replaces it. Timers are cancelled automatically when the actor stops or
    restarts."
   ([key interval message]
-   (.startTimer ^CljPersistentActor *current-persistent-actor*
-                key (->duration interval) message))
+   (.startTimer (current-actor "start-timer") key (->duration interval) message))
   ([key initial-delay interval message]
-   (.startTimerWithInitialDelay ^CljPersistentActor *current-persistent-actor*
+   (.startTimerWithInitialDelay (current-actor "start-timer")
                                 key (->duration initial-delay) (->duration interval) message)))
 
 (defn start-single-timer
   "Deliver `message` to self once after `delay` (ms or a java.time.Duration)."
   [key delay message]
-  (.startSingleTimer ^CljPersistentActor *current-persistent-actor*
-                     key (->duration delay) message))
+  (.startSingleTimer (current-actor "start-single-timer") key (->duration delay) message))
 
 (defn cancel-timer
   "Cancel the timer registered under `key`."
   [key]
-  (.cancelTimer ^CljPersistentActor *current-persistent-actor* key))
+  (.cancelTimer (current-actor "cancel-timer") key))
 
 (defn timer-active?
   "True while a timer is registered under `key`."
   [key]
-  (.isTimerActive ^CljPersistentActor *current-persistent-actor* key))
+  (.isTimerActive (current-actor "timer-active?") key))
 
 (defn cancel-all-timers
   "Cancel every timer this actor has started."
   []
-  (.cancelAllTimers ^CljPersistentActor *current-persistent-actor*))
+  (.cancelAllTimers (current-actor "cancel-all-timers")))
 
 ;; ---------------------------------------------------------------------------
 ;; Actor State Access

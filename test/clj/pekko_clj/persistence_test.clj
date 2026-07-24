@@ -1128,6 +1128,30 @@
             (throw (.getCause e)))))))
 
 ;; ---------------------------------------------------------------------------
+;; H15: friendly errors
+;; ---------------------------------------------------------------------------
+
+(deftest defactor-persistent-requires-persistence-id
+  ;; A missing :persistence-id used to NPE at runtime inside :make-props; now it
+  ;; is rejected at macro-expansion, naming the clause.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #":persistence-id"
+        (try
+          (macroexpand-1 '(pekko-clj.persistence/defactor-persistent no-id
+                            (init [_] {})
+                            (command :x (p/persist [:e]))
+                            (event [:e] state)))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
+
+(deftest persistence-out-of-context-calls-name-the-fn
+  ;; Accessor/timer fns called outside a persistent handler throw a friendly
+  ;; IllegalStateException naming the fn, not a bare NPE.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence/self" (p/self)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence/context" (p/context)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence/start-timer"
+        (p/start-timer :k 10 :m))))
+
+;; ---------------------------------------------------------------------------
 ;; H13: core/! resolves the sender inside a persistent command handler
 ;; ---------------------------------------------------------------------------
 

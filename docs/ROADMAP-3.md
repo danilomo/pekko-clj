@@ -57,7 +57,7 @@ performance note, see H16).
 | B22 | Singleton hand-over stalls under `:restart-with-stop` supervision | Bugs | DONE | — | medium |
 | H13 | `core/!` silently sends as noSender inside persistent/delivery actors | Hardening | DONE | — | medium |
 | H14 | Duration-convention sweep: accept ms-or-Duration everywhere | Hardening | DONE | — | low |
-| H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | TODO | — | low |
+| H15 | Friendly errors for out-of-context calls + missing `:persistence-id` | Hardening | DONE | — | low |
 | H16 | Docstring corrections + micro-polish batch | Hardening | TODO | — | trivial |
 | H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | TODO | — | low |
 | H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | TODO | — | low |
@@ -294,8 +294,18 @@ nothing breaks. Update docstrings to say "ms or java.time.Duration" uniformly.
 **Tests:** one per fn family with a plain number (fails today with a
 ClassCastException); existing Duration-passing tests stay green.
 
-### H15 · Friendly errors: out-of-context calls + missing `:persistence-id` — `TODO`
-**Deps:** none.
+### H15 · Friendly errors: out-of-context calls + missing `:persistence-id` — `DONE`
+**Done:** (1) each of `core`, `persistence`, `persistence.delivery` gained a
+private nil-checking `(current-actor fn-name)` accessor (typed return → hot path
+allocation-free and reflection-free); `self`/`sender`/`parent`/`context`/`stash`
++ timer fns now route through it and throw `IllegalStateException` naming the fn
+and the rule instead of a bare NPE. (2) `defactor-persistent` now guards a
+missing `:persistence-id` at macro-expansion (like `defactor-delivery`);
+`sharding/start`'s runtime guard is annotated as belt-and-braces (only trips for
+a hand-built actor-def). (3) `validate-actor-clauses` guards a non-seq clause
+with `seq?` and reports "unknown clause" instead of "Don't know how to create
+ISeq". Tests: out-of-context error per ns (message names the fn), missing-id as a
+macroexpand-time test, non-list clause guard. **Deps:** none.
 - `core/self`/`sender`/`context`/`stash`/timers (and the persistence/delivery
   counterparts) called outside a handler → bare NPE on the nil dynamic var. Throw
   `IllegalStateException` naming the fn and the rule ("call inside an actor

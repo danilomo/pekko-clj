@@ -204,3 +204,13 @@
             "the probe saw the delivery entity as sender (noSender before the fix)"))
       (finally
         (terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; H15: friendly errors
+;; ---------------------------------------------------------------------------
+
+(deftest delivery-out-of-context-calls-name-the-fn
+  ;; self/sender/context called outside a delivery handler throw a friendly
+  ;; IllegalStateException naming the fn, not a bare NPE.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence\.delivery/self" (d/self)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.persistence\.delivery/context" (d/context))))

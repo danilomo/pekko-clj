@@ -408,3 +408,32 @@
     (is (= 7 (.getInt (.config (.settings sys)) "my.key")))
     ;; shutdown-system returns the Terminated event
     (is (some? (core/shutdown-system sys 10000)))))
+
+;; ---------------------------------------------------------------------------
+;; H15: friendly errors
+;; ---------------------------------------------------------------------------
+
+(deftest out-of-context-calls-name-the-fn
+  ;; Accessor/timer/stash fns called outside an actor handler must throw an
+  ;; IllegalStateException naming the fn and the rule, not a bare NPE on the nil
+  ;; *current-actor*.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/self" (core/self)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/sender" (core/sender)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/parent" (core/parent)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/context" (core/context)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/stash" (core/stash)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/start-timer"
+        (core/start-timer :k 10 :m)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/schedule-once"
+        (core/schedule-once 10 (fn [])))))
+
+(deftest defactor-rejects-non-list-clause
+  ;; A stray non-list clause used to throw a cryptic "Don't know how to create
+  ;; ISeq"; now it is named as an unknown clause.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown clause"
+        (try
+          (macroexpand-1 '(pekko-clj.core/defactor bad-clause
+                            (init [_] {})
+                            :stray-keyword))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))
