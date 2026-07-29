@@ -61,7 +61,7 @@ performance note, see H16).
 | H16 | Docstring corrections + micro-polish batch | Hardening | DONE | — | trivial |
 | H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | DONE | — | low |
 | H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | DONE | — | low |
-| N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | TODO | B19 | medium |
+| N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | DONE | B19 | medium |
 | N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | DONE | — | low |
 | N22 | Stash for persistent actors | New | DONE | — | low |
 | N23 | Persistence event adapters (schema evolution) | New | TODO | — | medium |
@@ -417,7 +417,34 @@ stop tears it down.
 
 ## Milestone N — Parity
 
-### N20 · Streams operator batch 3 — `TODO`
+### N20 · Streams operator batch 3 — `DONE`
+**Done:** all listed operators landed in `pekko-clj.stream`, each javap-confirmed on
+javadsl Source AND Flow (so the `op` macro stays reflection-free on both branches).
+Timeout guards `idle-timeout`/`completion-timeout`/`initial-timeout`/
+`backpressure-timeout`; splitters `split-when`/`split-after` (SubSource/SubFlow —
+recombine with the existing `merge-substreams`/`concat-substreams`); combinators
+`also-to-all` (array-hinted to pick the `Graph...` varargs over the `Seq` overload),
+`also-to-mat`/`wire-tap-mat` (keep-mat combiner), `merge-all`, `merge-sorted`
+(2-arity `compare`, 3-arity comparator fn), `zip-latest`/`zip-latest-with` (Pair →
+Clojure vector), `flat-map-prefix`, `concat-lazy`, `initial-delay`; failure/resource
+`on-error-complete` (0-arg / Class / predicate arities — predicate is
+`java.util.function.Predicate`, not the japi one) and `map-with-resource`
+(create/map/close, close emits an optional final element); sources
+`source-from-iterator` (fresh iterator per run, coerces a Clojure coll) and
+`source-from-java-stream`. **Native replacements:** `dedupe` now calls Pekko's
+`dropRepeated()` (behaviour identical; the hand-rolled statefulMapConcat version
+retired). `dedupe-by` stays hand-rolled — `dropRepeated`'s only keyed overload takes
+an *equality comparator*, not a key fn, so it isn't a clean drop-in. `stateful-map`
+gained a 4-arity backed by native `statefulMap` with the onComplete emission hook the
+statefulMapConcat 3-arity can't offer (existing 3-arity unchanged). **Semantics
+pinned live before documenting:** `flatMapPrefix` consumes the prefix and its Flow
+transforms only the *rest* of the stream (verified `[1 2 3 4 5]` prefix-2 identity →
+`[3 4 5]`); docstring/test corrected from the wrong "prefix included" guess.
+`zipLatest` completes as soon as *any* input completes (tests keep the other side
+open via `concat source-never`). Skipped deliberately (niche): `optionalVia`,
+`aggregateWithBoundary`. 24 driving tests (timeout ops both ways, split ops through
+Source and Flow); `lein test` 667/1485 green, `lein lint` clean, `lein check`
+reflection-clean.
 **Deps:** B19 (touches the same ns; land the bug fix first).
 Every operator below was **javap-confirmed present** on javadsl `Source` in
 pekko-stream 1.6.0 (2026-07-24). Same wrapping conventions as N13 (op macro,

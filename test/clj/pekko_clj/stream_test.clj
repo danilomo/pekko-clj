@@ -1431,3 +1431,278 @@
     (.write ^OutputStream os (.getBytes "xy" "UTF-8"))
     (.close ^OutputStream os)
     (is (= "xy" (apply str (map s/byte-string->string (s/await-completion done 3000)))))))
+
+;; ---------------------------------------------------------------------------
+;; N20: Streams operator batch 3 (timeouts, splits, zips, resources)
+;; ---------------------------------------------------------------------------
+
+;; --- Timeout guards (asserted both ways: fires vs doesn't) ---
+
+(deftest idle-timeout-fires-and-passes
+  ;; fires: emits once then stalls forever -> fails after the idle window
+  (is (thrown? Exception
+        (-> (s/source [1])
+            (s/concat (s/source-never))
+            (s/idle-timeout 200)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000))))
+  ;; passes: a stream that keeps flowing and completes is fine
+  (is (= [1 2 3] (vec (-> (s/source [1 2 3])
+                          (s/idle-timeout 2000)
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest completion-timeout-fires-and-passes
+  (is (thrown? Exception
+        (-> (s/source-never)
+            (s/completion-timeout 200)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000))))
+  (is (= [1 2] (vec (-> (s/source [1 2])
+                        (s/completion-timeout 2000)
+                        (s/run-to-seq *mat*)
+                        (s/await-completion 3000))))))
+
+(deftest initial-timeout-fires-and-passes
+  (is (thrown? Exception
+        (-> (s/source-never)
+            (s/initial-timeout 200)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000))))
+  (is (= [1] (vec (-> (s/source [1])
+                      (s/initial-timeout 2000)
+                      (s/run-to-seq *mat*)
+                      (s/await-completion 3000))))))
+
+(deftest backpressure-timeout-fires-and-passes
+  ;; fires: a throttle downstream withholds demand longer than the window
+  (is (thrown? Exception
+        (-> (s/source [1 2 3])
+            (s/backpressure-timeout 100)
+            (s/throttle 1 500)
+            (s/run-to-seq *mat*)
+            (s/await-completion 5000))))
+  (is (= [1 2 3] (vec (-> (s/source [1 2 3])
+                          (s/backpressure-timeout 2000)
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+;; --- Substream splitters (through both a Source and a Flow) ---
+
+(deftest split-after-ends-substream-after-match
+  ;; Source path
+  (is (= [[1 2] [3 4] [5]]
+         (mapv vec (-> (s/source [1 2 3 4 5])
+                       (s/split-after even?)
+                       (s/fold [] conj)
+                       (s/concat-substreams)
+                       (s/run-to-seq *mat*)
+                       (s/await-completion 3000)))))
+  ;; Flow path (regression: SubFlow, not SubSource)
+  (let [flow (-> (s/flow)
+                 (s/split-after even?)
+                 (s/fold [] conj)
+                 (s/concat-substreams))]
+    (is (= [[1 2] [3 4] [5]]
+           (mapv vec (-> (s/source [1 2 3 4 5])
+                         (s/via flow)
+                         (s/run-to-seq *mat*)
+                         (s/await-completion 3000)))))))
+
+(deftest split-when-starts-substream-at-match
+  (is (= [[1 2 3] [1 2]]
+         (mapv vec (-> (s/source [1 2 3 1 2])
+                       (s/split-when #(= 1 %))
+                       (s/fold [] conj)
+                       (s/concat-substreams)
+                       (s/run-to-seq *mat*)
+                       (s/await-completion 3000)))))
+  (let [flow (-> (s/flow)
+                 (s/split-when #(= 1 %))
+                 (s/fold [] conj)
+                 (s/concat-substreams))]
+    (is (= [[1 2 3] [1 2]]
+           (mapv vec (-> (s/source [1 2 3 1 2])
+                         (s/via flow)
+                         (s/run-to-seq *mat*)
+                         (s/await-completion 3000)))))))
+
+;; --- Combinators ---
+
+(deftest also-to-all-tees-to-every-sink
+  (let [a (atom [])
+        b (atom [])
+        result (-> (s/source [1 2 3])
+                   (s/also-to-all [(s/sink-foreach #(swap! a conj %))
+                                   (s/sink-foreach #(swap! b conj %))])
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= [1 2 3] (vec result)) "main flow continues")
+    (is (eventually (= [1 2 3] @a)))
+    (is (eventually (= [1 2 3] @b)))))
+
+(deftest also-to-mat-keeps-the-side-value
+  (let [side (-> (s/source [1 2 3]) (s/also-to-mat (s/sink-fold 0 +) :right))
+        [side-done seq-done] (s/run-mat side (s/sink-seq) :both *mat*)]
+    (is (= 6 (s/await-completion side-done 3000)) "the fold sink's value survives")
+    (is (= [1 2 3] (vec (s/await-completion seq-done 3000))))))
+
+(deftest wire-tap-mat-plumbs-the-side-value
+  (let [side (-> (s/source [1 2 3]) (s/wire-tap-mat (s/sink-fold 0 +) :right))
+        [side-done seq-done] (s/run-mat side (s/sink-seq) :both *mat*)]
+    ;; wire-tap is best-effort so we don't assert its sum, only that the value is
+    ;; plumbed through and the main flow is untouched.
+    (is (number? (s/await-completion side-done 3000)))
+    (is (= [1 2 3] (vec (s/await-completion seq-done 3000))))))
+
+(deftest merge-all-merges-many-sources
+  (is (= #{1 2 3 4 5 6}
+         (set (-> (s/source [1 2])
+                  (s/merge-all [(s/source [3 4]) (s/source [5 6])] false)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))))
+
+(deftest merge-sorted-keeps-order
+  (is (= [1 2 3 4 5 6]
+         (vec (-> (s/source [1 3 5])
+                  (s/merge-sorted (s/source [2 4 6]))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000)))))
+  (is (= [6 5 4 3 2 1]
+         (vec (-> (s/source [5 3 1])
+                  (s/merge-sorted (s/source [6 4 2]) #(compare %2 %1))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))
+      "3-arity takes a custom comparator fn"))
+
+(deftest zip-latest-and-zip-latest-with
+  ;; Throttle the numbers so the other side's value is always the latest; keep the
+  ;; other side open (concat source-never) so it doesn't complete the zip early —
+  ;; zip-latest completes as soon as *any* input completes.
+  (is (= [[1 :x] [2 :x] [3 :x]]
+         (mapv vec (-> (s/source [1 2 3])
+                       (s/throttle 1 100)
+                       (s/zip-latest (s/concat (s/source-single :x) (s/source-never)))
+                       (s/run-to-seq *mat*)
+                       (s/await-completion 5000)))))
+  (is (= [11 12 13]
+         (vec (-> (s/source [1 2 3])
+                  (s/throttle 1 100)
+                  (s/zip-latest-with (s/concat (s/source-single 10) (s/source-never)) +)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 5000))))))
+
+(deftest flat-map-prefix-shapes-flow-from-prefix
+  ;; First 2 elements (1,2) decide a base offset; the flow applies to the REST
+  ;; (3,4,5) — the prefix itself is consumed, not re-emitted.
+  (is (= [6 7 8]
+         (vec (-> (s/source [1 2 3 4 5])
+                  (s/flat-map-prefix 2 (fn [prefix]
+                                         (let [base (reduce + prefix)] ;; 1+2=3
+                                           (s/smap (s/flow) #(+ base %)))))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))))
+
+(deftest concat-lazy-appends-other
+  (is (= [1 2 3 4]
+         (vec (-> (s/source [1 2])
+                  (s/concat-lazy (s/source [3 4]))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))))
+
+(deftest initial-delay-holds-the-first-element
+  (let [start (System/nanoTime)
+        result (-> (s/source [1 2 3])
+                   (s/initial-delay 300)
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))
+        elapsed-ms (/ (- (System/nanoTime) start) 1e6)]
+    (is (= [1 2 3] (vec result)))
+    (is (>= elapsed-ms 250) "the first element was held ~300ms")))
+
+;; --- Failure / resource ---
+
+(deftest on-error-complete-swallows-matching-failures
+  ;; 0-arg: any failure becomes normal completion of what was emitted so far
+  (is (= [1 2]
+         (vec (-> (s/source [1 2 3])
+                  (s/smap (fn [x] (if (= x 3) (throw (RuntimeException. "boom")) x)))
+                  (s/on-error-complete)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000)))))
+  ;; class arity: only that class (and subclasses) is swallowed
+  (is (= [10 5]
+         (vec (-> (s/source [1 2 0])
+                  (s/smap #(long (/ 10 %)))
+                  (s/on-error-complete ArithmeticException)
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000)))))
+  ;; predicate arity
+  (is (= [10 5]
+         (vec (-> (s/source [1 2 0])
+                  (s/smap #(long (/ 10 %)))
+                  (s/on-error-complete #(instance? ArithmeticException %))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000)))))
+  ;; a non-matching class does NOT swallow -> the stream still fails
+  (is (thrown? Exception
+        (-> (s/source [1 2 0])
+            (s/smap #(long (/ 10 %)))
+            (s/on-error-complete IllegalStateException)
+            (s/run-to-seq *mat*)
+            (s/await-completion 3000)))))
+
+(deftest map-with-resource-opens-maps-closes
+  (let [closed (atom false)
+        result (-> (s/source [1 2 3])
+                   (s/map-with-resource
+                    (fn [] (atom 0))
+                    (fn [r x] (swap! r inc) (* x 10))
+                    (fn [_] (reset! closed true) nil))
+                   (s/run-to-seq *mat*)
+                   (s/await-completion 3000))]
+    (is (= [10 20 30] (vec result)))
+    (is (eventually @closed) "the resource was released"))
+  ;; close-fn may emit one final element
+  (is (= [1 2 :final]
+         (vec (-> (s/source [1 2])
+                  (s/map-with-resource (fn [] :res) (fn [_ x] x) (fn [_] :final))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))))
+
+;; --- Sources ---
+
+(deftest source-from-iterator-emits-and-is-reusable
+  (let [src (s/source-from-iterator (fn [] (.iterator (java.util.ArrayList. [1 2 3]))))]
+    (is (= [1 2 3] (vec (s/await-completion (s/run-to-seq src *mat*) 3000))))
+    (is (= [1 2 3] (vec (s/await-completion (s/run-to-seq src *mat*) 3000)))
+        "a fresh iterator per run makes the Source reusable"))
+  ;; a Clojure collection is coerced to an iterator too
+  (is (= [4 5 6] (vec (-> (s/source-from-iterator (fn [] [4 5 6]))
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+(deftest source-from-java-stream-emits
+  (is (= [1 2 3] (vec (-> (s/source-from-java-stream (fn [] (.stream (java.util.List/of 1 2 3))))
+                          (s/run-to-seq *mat*)
+                          (s/await-completion 3000))))))
+
+;; --- Native replacements ---
+
+(deftest stateful-map-with-on-complete-hook
+  ;; running sum per element, then emit the final total on completion
+  (is (= [1 3 6 6]
+         (vec (-> (s/source [1 2 3])
+                  (s/stateful-map (fn [] 0)
+                                  (fn [acc x] (let [n (+ acc x)] [n n]))
+                                  (fn [final] final))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000)))))
+  ;; on-complete returning nil emits nothing extra
+  (is (= [1 3 6]
+         (vec (-> (s/source [1 2 3])
+                  (s/stateful-map (fn [] 0)
+                                  (fn [acc x] (let [n (+ acc x)] [n n]))
+                                  (fn [_] nil))
+                  (s/run-to-seq *mat*)
+                  (s/await-completion 3000))))))

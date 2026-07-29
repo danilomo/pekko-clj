@@ -914,20 +914,16 @@
 (defn dedupe
   "Drop **consecutive** duplicate elements, like clojure.core/dedupe.
 
+   Backed by Pekko's native `dropRepeated` (N20 replaced the hand-rolled
+   statefulMapConcat version — behaviour is identical). `dedupe-by` stays
+   hand-rolled: `dropRepeated`'s only keyed overload takes an equality comparator,
+   not a key fn.
+
    (Named `distinct` before N13, which was a misnomer: clojure.core/distinct drops
    every repeat, not just adjacent ones. `distinct`/`distinct-by` remain as
    deprecated aliases.)"
   [src]
-  (op src statefulMapConcat
-      (reify org.apache.pekko.japi.function.Creator
-        (create [_]
-          (let [prev (atom ::none)]
-            (reify org.apache.pekko.japi.function.Function
-              (apply [_ x]
-                (if (= @prev x)
-                  []
-                  (do (reset! prev x)
-                      [x])))))))))
+  (op src dropRepeated))
 
 (defn dedupe-by
   "Drop consecutive elements with the same key. See `dedupe`."
@@ -1037,17 +1033,35 @@
 (defn stateful-map
   "Apply a stateful transformation to each element.
    create-fn: no-arg function that returns initial state
-   f: function (state, element) -> [new-state, emitted-element]"
-  [src create-fn f]
-  (op src statefulMapConcat
-      (reify org.apache.pekko.japi.function.Creator
-        (create [_]
-          (let [state (atom (create-fn))]
-            (reify org.apache.pekko.japi.function.Function
-              (apply [_ x]
-                (let [[new-state result] (f @state x)]
-                  (reset! state new-state)
-                  [result]))))))))
+   f: function (state, element) -> [new-state, emitted-element]
+
+   The 4-arity adds `on-complete-fn`, a function of the final state returning one
+   last element to emit (or nil for none) when the upstream completes — Pekko's
+   native `statefulMap` onComplete hook, which the statefulMapConcat-based 3-arity
+   cannot offer. Each `f` call must emit exactly one element in this arity."
+  ([src create-fn f]
+   (op src statefulMapConcat
+       (reify org.apache.pekko.japi.function.Creator
+         (create [_]
+           (let [state (atom (create-fn))]
+             (reify org.apache.pekko.japi.function.Function
+               (apply [_ x]
+                 (let [[new-state result] (f @state x)]
+                   (reset! state new-state)
+                   [result]))))))))
+  ([src create-fn f on-complete-fn]
+   (op src statefulMap
+       (reify org.apache.pekko.japi.function.Creator
+         (create [_] (create-fn)))
+       (reify org.apache.pekko.japi.function.Function2
+         (apply [_ state x]
+           (let [[new-state result] (f state x)]
+             (Pair. new-state result))))
+       (reify org.apache.pekko.japi.function.Function
+         (apply [_ state]
+           (if-some [v (on-complete-fn state)]
+             (Optional/of v)
+             (Optional/empty)))))))
 
 (defn watch-termination
   "Add a callback for when the stream terminates.
@@ -1687,3 +1701,217 @@
   ([] (lines 65536))
   ([max-line-length]
    (smap (frame-delimiter "\n" max-line-length) byte-string->string)))
+
+;; ---------------------------------------------------------------------------
+;; N20: Streams operator batch 3 (timeouts, splits, zips, resources)
+;; ---------------------------------------------------------------------------
+;;
+;; Every operator here was javap-confirmed present on javadsl Source AND Flow in
+;; pekko-stream 1.6.0. Same conventions as N13: the `op` macro for Source/Flow
+;; polymorphism, Clojure vectors instead of japi.Pair, ms-or-Duration everywhere.
+
+;; --- Timeout guards ---
+
+(defn idle-timeout
+  "Fail the stream with a TimeoutException if no element passes for longer than `d`
+   (ms or a java.time.Duration) between consecutive elements."
+  [src d]
+  (op src idleTimeout (->duration d)))
+
+(defn completion-timeout
+  "Fail the stream with a TimeoutException if it has not completed within `d`
+   (ms or a java.time.Duration) of the stream starting."
+  [src d]
+  (op src completionTimeout (->duration d)))
+
+(defn initial-timeout
+  "Fail the stream with a TimeoutException if the first element does not arrive
+   within `d` (ms or a java.time.Duration) of the stream starting."
+  [src d]
+  (op src initialTimeout (->duration d)))
+
+(defn backpressure-timeout
+  "Fail the stream with a TimeoutException if it stays backpressured (no downstream
+   demand) for longer than `d` (ms or a java.time.Duration)."
+  [src d]
+  (op src backpressureTimeout (->duration d)))
+
+;; --- Substream splitters (return a SubSource/SubFlow — merge or concat them) ---
+
+(defn split-when
+  "Split into sub-streams, starting a NEW sub-stream at every element for which
+   `pred` is true (that element begins the next sub-stream).
+
+   Returns a SubSource (from a Source) or SubFlow (from a Flow); recombine with
+   `merge-substreams` or `concat-substreams`."
+  [src pred]
+  (op src splitWhen (reify org.apache.pekko.japi.function.Predicate
+                      (test [_ x] (boolean (pred x))))))
+
+(defn split-after
+  "Split into sub-streams, ending the current sub-stream AFTER every element for
+   which `pred` is true (that element is the last of its sub-stream).
+
+   Returns a SubSource/SubFlow — see `split-when`."
+  [src pred]
+  (op src splitAfter (reify org.apache.pekko.japi.function.Predicate
+                       (test [_ x] (boolean (pred x))))))
+
+;; --- Combinators ---
+
+(defn also-to-all
+  "Send every element to each of `sinks` while continuing the main flow —
+   `also-to` for more than one secondary sink at once."
+  [src sinks]
+  ;; The array hint picks the varargs `alsoToAll(Graph...)` over `alsoToAll(Seq)`;
+  ;; without it an untyped array is ambiguous and resolves reflectively.
+  (op src alsoToAll ^"[Lorg.apache.pekko.stream.Graph;" (into-array org.apache.pekko.stream.Graph sinks)))
+
+(defn also-to-mat
+  "Like `also-to`, but combine the main stream's materialized value with the
+   sink's using `which` (:left, :right, :both or :none — see keep-mat), so a
+   secondary sink's materialized value can survive downstream."
+  [src sink which]
+  (op src alsoToMat sink (keep-mat which)))
+
+(defn wire-tap-mat
+  "Like `wire-tap`, but combine the main stream's materialized value with the
+   sink's using `which` (:left, :right, :both or :none — see keep-mat)."
+  [src sink which]
+  (op src wireTapMat sink (keep-mat which)))
+
+(defn merge-all
+  "Merge this stream with all of `others` (a collection of Sources) into one.
+
+   eager-complete?: when true the merged stream completes as soon as ANY input
+   completes; when false it waits for all of them."
+  [src others eager-complete?]
+  (op src mergeAll ^java.util.List (vec others) (boolean eager-complete?)))
+
+(defn merge-sorted
+  "Merge with another already-sorted Source, keeping the output sorted.
+
+   Both inputs must already be sorted by the same ordering. The 2-arity uses
+   clojure.core/compare; the 3-arity takes a comparator fn of (a b) -> negative,
+   zero or positive."
+  ([src other] (merge-sorted src other compare))
+  ([src other cmp-fn]
+   (op src mergeSorted other
+       (reify java.util.Comparator
+         (compare [_ a b] (int (cmp-fn a b)))))))
+
+(defn zip-latest
+  "Combine with another Source, emitting [this-latest other-latest] whenever
+   EITHER side emits (using each side's most recent element).
+
+   Pekko emits a japi.Pair; this maps it to a Clojure vector, as `zip` does."
+  [src other]
+  (-> (op src zipLatest other)
+      (smap (fn [^Pair p] [(.first p) (.second p)]))))
+
+(defn zip-latest-with
+  "Like `zip-latest`, but combine the two latest elements with `f` instead of
+   pairing them: emits (f this-latest other-latest) whenever either side emits."
+  [src other f]
+  (op src zipLatestWith other
+      (reify org.apache.pekko.japi.function.Function2
+        (apply [_ a b] (f a b)))))
+
+(defn flat-map-prefix
+  "Buffer the first `n` elements, then call `f` with them (as a seq) to build the
+   Flow that processes the REST of the stream.
+
+   The prefix elements are consumed to build the Flow and are not themselves
+   re-emitted — only the elements after the prefix flow through `f`'s Flow. Lets
+   the downstream shape depend on the stream's prefix, e.g. read a header line,
+   then choose how to parse the body. `f` returns a Flow (see `flow`)."
+  [src n f]
+  (op src flatMapPrefix (int n)
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ prefix] (f (seq prefix))))))
+
+(defn concat-lazy
+  "Concatenate `other` after this stream completes, like `concat`, but materialize
+   `other` lazily — only once this stream has finished."
+  [src other]
+  (op src concatLazy other))
+
+(defn initial-delay
+  "Hold the stream for `d` (ms or a java.time.Duration) before letting the first
+   element through; later elements are unaffected."
+  [src d]
+  (op src initialDelay (->duration d)))
+
+;; --- Failure / resource ---
+
+(defn on-error-complete
+  "Complete the stream normally instead of failing, when it would fail with a
+   matching error — the failure is swallowed and downstream sees completion.
+
+   0-arg: any Throwable. 1-arg: a Throwable Class (only that class and subclasses)
+   or a predicate fn of Throwable -> truthy."
+  ([src] (op src onErrorComplete))
+  ([src class-or-pred]
+   (if (class? class-or-pred)
+     (op src onErrorComplete ^Class class-or-pred)
+     (op src onErrorComplete (reify java.util.function.Predicate
+                               (test [_ ex] (boolean (class-or-pred ex))))))))
+
+(defn map-with-resource
+  "Map each element through `map-fn` with access to a resource opened once when
+   the stream runs and closed when it ends.
+
+   create-fn: no-arg fn opening the resource
+   map-fn:    (resource, element) -> emitted-element
+   close-fn:  (resource) -> one final element to emit (or nil for none); always
+              called on completion or failure to release the resource.
+
+   The resource never touches the stream elements' type, so a DB connection, file
+   handle, etc. can be shared across the whole run without a per-element open."
+  [src create-fn map-fn close-fn]
+  (op src mapWithResource
+      (reify org.apache.pekko.japi.function.Creator
+        (create [_] (create-fn)))
+      (reify org.apache.pekko.japi.function.Function2
+        (apply [_ resource x] (map-fn resource x)))
+      (reify org.apache.pekko.japi.function.Function
+        (apply [_ resource]
+          (if-some [v (close-fn resource)]
+            (Optional/of v)
+            (Optional/empty))))))
+
+;; --- Sources ---
+
+(defn- ->iterator
+  "Coerce a Clojure collection/seq (or an existing Iterator/Iterable) to a
+   java.util.Iterator."
+  ^java.util.Iterator [x]
+  (cond
+    (instance? java.util.Iterator x) x
+    (instance? Iterable x)           (.iterator ^Iterable x)
+    :else                            (clojure.lang.RT/iter x)))
+
+(defn source-from-iterator
+  "A Source that emits the elements of the iterator `f` returns.
+
+   `f` is a no-arg fn called once per materialization (so the Source is reusable —
+   each run gets a fresh iterator). It may return a java.util.Iterator or any
+   Clojure collection/seq, which is coerced to one.
+
+   Unlike `source`, which snapshots an Iterable, this defers producing the
+   iterator until run time."
+  [f]
+  (Source/fromIterator
+   (reify org.apache.pekko.japi.function.Creator
+     (create [_] (->iterator (f))))))
+
+(defn source-from-java-stream
+  "A Source that emits the elements of the java.util.stream.BaseStream (e.g. a
+   java.util.stream.Stream or IntStream) that `f` returns.
+
+   `f` is a no-arg fn called once per materialization; the stream it returns is
+   consumed and closed by the Source."
+  [f]
+  (Source/fromJavaStream
+   (reify org.apache.pekko.japi.function.Creator
+     (create [_] (f)))))
