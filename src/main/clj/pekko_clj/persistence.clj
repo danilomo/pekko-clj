@@ -642,6 +642,45 @@
   (.unwatch ^CljPersistentActor *current-persistent-actor* actor-ref)
   nil)
 
+;; ---------------------------------------------------------------------------
+;; Stash (Pekko's persistent-actor stash)
+;; ---------------------------------------------------------------------------
+;;
+;; These call Pekko's own AbstractPersistentActor stash — NOT pekko-clj.core's
+;; CljActor stash (a LinkedList re-sent to self). The behaviours differ, so mind
+;; the asymmetry:
+;;   - core/unstash-all re-sends to self, so messages land at the TAIL of the
+;;     mailbox (after anything already queued);
+;;   - Pekko's unstash-all PREPENDS the stashed messages to the FRONT of the
+;;     mailbox (ahead of messages that arrived while they were stashed).
+;; Pekko integrates this user stash with its internal persist-stash correctly on
+;; its own. The canonical use is stashing commands until on-recovery-complete has
+;; warmed the state. Stash capacity comes from the mailbox config; exceeding it
+;; raises StashOverflowException (per the mailbox's stash-capacity setting).
+
+(defn stash
+  "Stash the command currently being handled, to process later. Call inside a
+   command handler. Returns nil. See this section's note on the front-of-mailbox
+   unstash semantics (which differ from pekko-clj.core/stash)."
+  []
+  (.stash (current-actor "stash"))
+  nil)
+
+(defn unstash
+  "Re-enqueue the oldest stashed command at the FRONT of the mailbox (Pekko
+   prepend semantics). Returns nil."
+  []
+  (.unstash (current-actor "unstash"))
+  nil)
+
+(defn unstash-all
+  "Re-enqueue all stashed commands, in stash order, at the FRONT of the mailbox
+   (Pekko prepend semantics — the opposite of pekko-clj.core/unstash-all's tail
+   append). Returns nil."
+  []
+  (.unstashAll (current-actor "unstash-all"))
+  nil)
+
 (defn start-timer
   "Start a repeating timer under `key` at a fixed RATE, delivering `message` to
    self every `interval` (ms or a java.time.Duration). After a pause it may fire

@@ -243,3 +243,35 @@
         (is (ts/stopped-within? sys child 5000) "parent stop tore down the child"))
       (finally
         (terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; N22: stash for delivery actors
+;; ---------------------------------------------------------------------------
+
+(d/defactor-delivery n22-delivery-stash
+  :persistence-id (fn [args] (str "n22-del-stash-" (:id args)))
+  (init [_] {:ready false :log []})
+  (command [:work x]
+    (if (:ready state)
+      (d/persist [:worked x])
+      (do (d/stash) nil)))
+  (command :go
+    (d/unstash-all)
+    (d/persist [:ready-now]))
+  (command :get (d/reply (:log state)) nil)
+  (event [:worked x] (update state :log conj x))
+  (event [:ready-now] (assoc state :ready true)))
+
+(deftest delivery-stash-defers-until-ready-then-applies-in-order
+  ;; N22: the same stash / unstash-all round trip for a delivery actor.
+  (let [sys (create-test-system "n22-delivery-stash")]
+    (try
+      (let [actor (d/spawn sys n22-delivery-stash {:id (unique-id)})]
+        (core/! actor [:work 1])
+        (core/! actor [:work 2])
+        (core/! actor [:work 3])
+        (is (= [] (core/<! actor :get 3000)) "work commands are stashed until ready")
+        (core/! actor :go)
+        (is (ts/poll-until #(= [1 2 3] (core/<! actor :get 3000)) 5000)
+            "unstashed commands processed in stash order"))
+      (finally (terminate-system sys)))))

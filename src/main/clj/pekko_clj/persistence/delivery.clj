@@ -325,6 +325,30 @@
   (.unwatch ^CljAtLeastOnceDeliveryActor *current-delivery-actor* actor-ref)
   nil)
 
+;; Stash — Pekko's persistent-actor stash (AbstractPersistentActor, inherited by
+;; the delivery base). Same asymmetry note as pekko-clj.persistence: unstash
+;; PREPENDS to the mailbox front, unlike pekko-clj.core's tail append. Canonical
+;; use: stash commands until on-recovery-complete warms the state. Capacity is the
+;; mailbox's stash-capacity; overflow raises StashOverflowException.
+(defn stash
+  "Stash the command currently being handled, to process later. Returns nil."
+  []
+  (.stash (current-actor "stash"))
+  nil)
+
+(defn unstash
+  "Re-enqueue the oldest stashed command at the FRONT of the mailbox. Returns nil."
+  []
+  (.unstash (current-actor "unstash"))
+  nil)
+
+(defn unstash-all
+  "Re-enqueue all stashed commands, in stash order, at the FRONT of the mailbox
+   (prepend — opposite of pekko-clj.core/unstash-all). Returns nil."
+  []
+  (.unstashAll (current-actor "unstash-all"))
+  nil)
+
 (defn deliver
   "Send `(id->message delivery-id)` to `destination` (an ActorRef or ActorPath),
    redelivering on the actor's redeliver-interval until `confirm-delivery!` is

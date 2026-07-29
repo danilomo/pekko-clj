@@ -1230,3 +1230,40 @@
         (is (ts/stopped-within? sys child 5000) "parent stop tore down the child"))
       (finally
         (terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; N22: stash for persistent actors
+;; ---------------------------------------------------------------------------
+
+(p/defactor-persistent n22-stash-actor
+  :persistence-id (fn [args] (str "n22-stash-" (:id args)))
+  (init [_] {:ready false :log []})
+  (command [:work x]
+    ;; Until :go warms `ready`, defer the work command (Pekko's stash).
+    (if (:ready state)
+      (p/persist [:worked x])
+      (do (p/stash) nil)))
+  (command :go
+    ;; unstash the deferred work (prepended; Eventsourced holds it until this
+    ;; persist's event applies), then persist the ready flag (returned marker).
+    (p/unstash-all)
+    (p/persist [:ready-now]))
+  (command :get (p/reply (:log state)) nil)
+  (event [:worked x] (update state :log conj x))
+  (event [:ready-now] (assoc state :ready true)))
+
+(deftest persistent-stash-defers-until-ready-then-applies-in-order
+  ;; N22: commands stashed before the actor is ready are re-processed in order
+  ;; after unstash-all, each persisting its event — exercising stash /
+  ;; unstash-all and their interaction with persist.
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (let [actor (p/spawn sys n22-stash-actor {:id (unique-id)})]
+        (core/! actor [:work 1])
+        (core/! actor [:work 2])
+        (core/! actor [:work 3])
+        (is (= [] (core/<! actor :get 3000)) "work commands are stashed until ready")
+        (core/! actor :go)
+        (is (eventually (= [1 2 3] (core/<! actor :get 3000)))
+            "unstashed commands processed in stash order, persisting events in order"))
+      (finally (terminate-system sys)))))

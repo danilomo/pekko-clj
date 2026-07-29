@@ -63,7 +63,7 @@ performance note, see H16).
 | H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | DONE | — | low |
 | N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | TODO | B19 | medium |
 | N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | DONE | — | low |
-| N22 | Stash for persistent actors | New | TODO | — | low |
+| N22 | Stash for persistent actors | New | DONE | — | low |
 | N23 | Persistence event adapters (schema evolution) | New | TODO | — | medium |
 | N24 | HTTP: SSE, client IP, async-route directives | New | TODO | — | medium |
 
@@ -470,8 +470,18 @@ docstrings. H14's ms-or-Duration applies.
 **Tests:** fires periodically; replaces on same key; cancel works — for both
 classic and persistent actors.
 
-### N22 · Stash for persistent actors — `TODO`
-**Deps:** none.
+### N22 · Stash for persistent actors — `DONE`
+**Done:** added `stash`/`unstash`/`unstash-all` fns to `pekko-clj.persistence` and
+`pekko-clj.persistence.delivery`, calling Pekko's inherited
+`AbstractPersistentActor` `stash()`/`unstash()`/`unstashAll()` (javap-confirmed
+public; probed reflection-free). **No Java pass-throughs:** a same-named method on
+`CljPersistentActor` would OVERRIDE Pekko's `Eventsourced.stash()` and break its
+persist-stash integration — the inherited methods are directly callable, so the
+Clojure fns call them. Documented the asymmetry honestly: Pekko's unstash
+PREPENDS to the mailbox front, whereas `pekko-clj.core`'s CljActor stash re-sends
+to self (TAIL append); StashOverflowException / mailbox stash-capacity noted.
+Tests: stash-until-ready round trip → unstash-all reprocesses in order, each
+persisting its event (classic persistent and delivery). **Deps:** none.
 `defactor-persistent` bodies have no stash: `core/stash` explodes on the CljActor
 hint (documented), and `CljPersistentActor` exposes nothing — yet
 `AbstractPersistentActor` **has** public `stash()`/`unstash()`/`unstashAll()`
