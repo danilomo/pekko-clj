@@ -62,7 +62,7 @@ performance note, see H16).
 | H17 | Let persistent/delivery actors spawn as children (ActorRefFactory) | Hardening | DONE | — | low |
 | H18 | Odds and ends: dead graph junctions, promise unwrap, client JSON helpers | Hardening | DONE | — | low |
 | N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | TODO | B19 | medium |
-| N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | TODO | — | low |
+| N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | DONE | — | low |
 | N22 | Stash for persistent actors | New | TODO | — | low |
 | N23 | Persistence event adapters (schema evolution) | New | TODO | — | medium |
 | N24 | HTTP: SSE, client IP, async-route directives | New | TODO | — | medium |
@@ -446,8 +446,17 @@ Skipped deliberately (niche, note in ns docstring if asked): `optionalVia`,
 **Tests:** one driving test per operator (N13 style); timeout ops asserted both
 ways (fires vs doesn't); split ops through both a Source and a Flow.
 
-### N21 · Fixed-delay timers — `TODO`
-**Deps:** none.
+### N21 · Fixed-delay timers — `DONE`
+**Done:** `CljActor` and `CljPersistentActor` gained `startTimerWithFixedDelay`
+(3-arg) + `startTimerWithFixedDelayAndInitial` (4-arg) pass-throughs to
+`TimerScheduler.startTimerWithFixedDelay` (javap-confirmed java.time.Duration
+overloads), mirroring the fixed-rate pair. **Choice:** exposed as a sibling fn
+`start-timer-fixed-delay` (2 arities) in both `core` and `persistence`, matching
+the flat fn style rather than an opts arg. `start-timer`'s docstring now names it
+as fixed-RATE and points at the delay variant; both docstrings explain the
+difference. H14's ms-or-Duration applies. Tests: fires periodically (both
+arities), replaces on same key, cancel works — classic and persistent. **Deps:**
+none.
 `CljActor`/`CljPersistentActor` only expose `startTimerAtFixedRate`
 (`CljActor.java:277-300`), but Pekko's own guidance prefers **fixed-delay** for
 most periodic work (fixed-rate bursts to catch up after pauses/GC);

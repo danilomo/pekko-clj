@@ -505,7 +505,10 @@
 
 ;; Timer functions
 (defn start-timer
-  "Start a periodic timer that sends a message to self at fixed intervals.
+  "Start a periodic timer that sends a message to self at a fixed RATE: ticks are
+   scheduled on a fixed schedule, so after a pause (GC, a slow handler) several
+   may fire in quick succession to catch up. For most periodic work prefer
+   `start-timer-fixed-delay`, which spaces ticks by the interval instead.
    key: timer key for cancellation/checking
    interval: ms or java.time.Duration between messages
    message: message to send to self
@@ -515,6 +518,23 @@
   ([key initial-delay interval message]
    (.startTimerWithInitialDelay (current-actor "start-timer") key (->duration initial-delay)
                                 (->duration interval) message)))
+
+(defn start-timer-fixed-delay
+  "Start a periodic timer that sends a message to self with a fixed DELAY between
+   ticks: each tick is scheduled `interval` after the previous one is delivered,
+   so ticks never bunch up to catch up after a pause (GC, a slow handler). This is
+   Pekko's recommended mode for most periodic work; contrast `start-timer`
+   (fixed RATE). Starting a timer with an existing key replaces it.
+   key: timer key for cancellation/checking
+   interval: ms or java.time.Duration between messages
+   message: message to send to self
+   Optional initial-delay: ms or java.time.Duration before first message"
+  ([key interval message]
+   (.startTimerWithFixedDelay (current-actor "start-timer-fixed-delay")
+                              key (->duration interval) message))
+  ([key initial-delay interval message]
+   (.startTimerWithFixedDelayAndInitial (current-actor "start-timer-fixed-delay")
+                                        key (->duration initial-delay) (->duration interval) message)))
 
 (defn start-single-timer
   "Start a single-shot timer that sends a message to self after a delay.

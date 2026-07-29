@@ -310,6 +310,18 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
     getTimers().startTimerAtFixedRate(key, message, initialDelay, interval);
   }
 
+  // Fixed-DELAY variants: the next tick is scheduled `interval` after the previous
+  // one *completes*, so ticks never bunch up to catch up after a pause/GC (unlike
+  // the fixed-RATE startTimer/startTimerWithInitialDelay above). Pekko recommends
+  // fixed-delay for most periodic work.
+  public void startTimerWithFixedDelay(Object key, java.time.Duration interval, Object message) {
+    getTimers().startTimerWithFixedDelay(key, message, interval);
+  }
+
+  public void startTimerWithFixedDelayAndInitial(Object key, java.time.Duration initialDelay, java.time.Duration interval, Object message) {
+    getTimers().startTimerWithFixedDelay(key, message, initialDelay, interval);
+  }
+
   public void startSingleTimer(Object key, java.time.Duration delay, Object message) {
     getTimers().startSingleTimer(key, message, delay);
   }

@@ -466,6 +466,18 @@ public class CljPersistentActor extends AbstractPersistentActorWithTimers implem
     timers().startTimerAtFixedRate(key, message, initialDelay, interval);
   }
 
+  // Fixed-DELAY variants: the next tick fires `interval` after the previous one
+  // completes, so ticks don't bunch up after a pause/GC (unlike the fixed-RATE
+  // methods above). Pekko recommends fixed-delay for most periodic work.
+  public void startTimerWithFixedDelay(Object key, java.time.Duration interval, Object message) {
+    timers().startTimerWithFixedDelay(key, message, interval);
+  }
+
+  public void startTimerWithFixedDelayAndInitial(Object key, java.time.Duration initialDelay,
+                                                 java.time.Duration interval, Object message) {
+    timers().startTimerWithFixedDelay(key, message, initialDelay, interval);
+  }
+
   public void startSingleTimer(Object key, java.time.Duration delay, Object message) {
     timers().startSingleTimer(key, message, delay);
   }

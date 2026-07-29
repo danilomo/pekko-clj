@@ -878,6 +878,11 @@
     (p/start-single-timer :once ms :tick)
     (p/reply :once-set)
     nil)
+  ;; N21: fixed-delay periodic timer.
+  (command [:start-fixed-delay ms]
+    (p/start-timer-fixed-delay :tick ms :tick)
+    (p/reply :ticking)
+    nil)
   (command :tick
     (p/persist [:ticked]))
   (command :stop-ticking
@@ -928,6 +933,18 @@
         (is (eventually (<= 3 (or (core/<! actor :get-ticks 3000) 0))))
         (is (false? (core/<! actor :stop-ticking 3000))
             "cancel-timer removed the timer"))
+      (finally (terminate-system sys)))))
+
+(deftest persistent-fixed-delay-timer-works
+  ;; N21: p/start-timer-fixed-delay fires periodically and cancel-timer stops it,
+  ;; for a persistent actor.
+  (let [sys (create-test-system "persistence-test")]
+    (try
+      (let [actor (p/spawn sys lifecycle-actor {:id (unique-id)})]
+        (is (= :ticking (core/<! actor [:start-fixed-delay 30] 3000)))
+        (is (eventually (<= 3 (or (core/<! actor :get-ticks 3000) 0)))
+            "fixed-delay ticks were journalled")
+        (is (false? (core/<! actor :stop-ticking 3000)) "cancel removed the timer"))
       (finally (terminate-system sys)))))
 
 (deftest persistent-timers-accept-millis

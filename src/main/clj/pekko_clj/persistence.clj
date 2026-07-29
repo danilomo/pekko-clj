@@ -643,15 +643,29 @@
   nil)
 
 (defn start-timer
-  "Start a repeating timer under `key`, delivering `message` to self every
-   `interval` (ms or a java.time.Duration). Starting a timer with an existing key
-   replaces it. Timers are cancelled automatically when the actor stops or
-   restarts."
+  "Start a repeating timer under `key` at a fixed RATE, delivering `message` to
+   self every `interval` (ms or a java.time.Duration). After a pause it may fire
+   several ticks to catch up; prefer `start-timer-fixed-delay` for most work.
+   Starting a timer with an existing key replaces it. Timers are cancelled
+   automatically when the actor stops or restarts."
   ([key interval message]
    (.startTimer (current-actor "start-timer") key (->duration interval) message))
   ([key initial-delay interval message]
    (.startTimerWithInitialDelay (current-actor "start-timer")
                                 key (->duration initial-delay) (->duration interval) message)))
+
+(defn start-timer-fixed-delay
+  "Start a repeating timer under `key` with a fixed DELAY between ticks: each tick
+   fires `interval` (ms or a java.time.Duration) after the previous is delivered,
+   so ticks never bunch up to catch up after a pause. Pekko's recommended mode for
+   most periodic work; contrast `start-timer` (fixed RATE). Replaces any timer
+   already under `key`; cancelled automatically on stop/restart."
+  ([key interval message]
+   (.startTimerWithFixedDelay (current-actor "start-timer-fixed-delay")
+                              key (->duration interval) message))
+  ([key initial-delay interval message]
+   (.startTimerWithFixedDelayAndInitial (current-actor "start-timer-fixed-delay")
+                                        key (->duration initial-delay) (->duration interval) message)))
 
 (defn start-single-timer
   "Deliver `message` to self once after `delay` (ms or a java.time.Duration)."

@@ -213,3 +213,54 @@
                 :state nil})]
     (core/! actor :setup)
     (is (true? (deref fired 2000 false)))))
+
+;; ---------------------------------------------------------------------------
+;; N21: fixed-delay timers
+;; ---------------------------------------------------------------------------
+
+(deftest fixed-delay-timer-fires-and-cancels
+  ;; start-timer-fixed-delay fires periodically (both the 3-arg and 4-arg/
+  ;; initial-delay arities) and cancel-timer stops it.
+  (let [ticks (atom 0)
+        actor (core/new-actor
+               *system*
+               {:function (fn [this msg]
+                            (binding [core/*current-actor* this]
+                              (case msg
+                                :setup (do (core/start-timer-fixed-delay :fd 20 :tick) nil)
+                                :setup-initial (do (core/start-timer-fixed-delay :fd 10 20 :tick) nil)
+                                :tick (do (swap! ticks inc) nil)
+                                :cancel (do (core/cancel-timer :fd) nil)
+                                nil)))
+                :state nil})]
+    (core/! actor :setup)
+    (is (eventually (>= @ticks 3)) "fixed-delay timer fires periodically")
+    (core/! actor :cancel)
+    (let [c @ticks]
+      (Thread/sleep 100)
+      (is (<= @ticks (+ c 1)) "cancel stopped the fixed-delay timer"))
+    ;; the initial-delay (4-arg) arity also fires
+    (reset! ticks 0)
+    (core/! actor :setup-initial)
+    (is (eventually (>= @ticks 2)) "the initial-delay arity fires too")
+    (core/! actor :cancel)))
+
+(deftest fixed-delay-timer-replaces-on-same-key
+  ;; Starting a fixed-delay timer with an existing key replaces it.
+  (let [ticks (atom 0)
+        actor (core/new-actor
+               *system*
+               {:function (fn [this msg]
+                            (binding [core/*current-actor* this]
+                              (case msg
+                                :fast (do (core/start-timer-fixed-delay :fd 20 :tick) nil)
+                                :slow (do (core/start-timer-fixed-delay :fd 10000 :tick) nil)
+                                :tick (do (swap! ticks inc) nil)
+                                nil)))
+                :state nil})]
+    (core/! actor :fast)
+    (is (eventually (>= @ticks 2)))
+    (core/! actor :slow) ; replace the fast timer under :fd with a slow one
+    (let [c @ticks]
+      (Thread/sleep 200)
+      (is (<= @ticks (+ c 1)) "the same-key restart replaced the fast timer"))))
