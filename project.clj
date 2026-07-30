@@ -22,10 +22,16 @@
                  ;; classic API (see pekko-clj.cluster.daemon)
                  [org.apache.pekko/pekko-cluster-sharding-typed_3 "1.6.0"]
                  ;; HTTP
-                 [org.apache.pekko/pekko-http_3 "1.3.0"]
+                 [org.apache.pekko/pekko-http_3 "1.4.0"]
                  ;; TestKit — powers the pekko-clj.test companion namespace
                  [org.apache.pekko/pekko-testkit_3 "1.6.0"]
                  [org.apache.pekko/pekko-stream-testkit_3 "1.6.0"]]
+
+  ;; pekko-actor 1.6.0 pulls scala3-library 3.3.7; pekko-http 1.4.0 was built
+  ;; against 3.3.8. Nearest-wins would silently resolve to 3.3.7 — i.e. run
+  ;; pekko-http on an older stdlib than it compiled against. 3.3.x is the Scala
+  ;; LTS line, so the newer patch is binary-compatible with both; pin it up.
+  :managed-dependencies [[org.scala-lang/scala3-library_3 "3.3.8"]]
   :java-source-paths ["src/main/java"]
   :source-paths ["src/main/clj"]
 

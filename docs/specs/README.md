@@ -102,7 +102,7 @@ Current dependencies in `project.clj`:
 [org.apache.pekko/pekko-stream_3 "1.6.0"]
 [org.apache.pekko/pekko-persistence_3 "1.6.0"]
 [org.apache.pekko/pekko-persistence-query_3 "1.6.0"]
-[org.apache.pekko/pekko-http_3 "1.3.0"]
+[org.apache.pekko/pekko-http_3 "1.4.0"]
 [org.apache.pekko/pekko-testkit_3 "1.6.0"]
 [org.apache.pekko/pekko-stream-testkit_3 "1.6.0"]
 [com.cognitect/transit-clj "1.0.333"]  ;; Transit serializer (pekko-clj.serialization)

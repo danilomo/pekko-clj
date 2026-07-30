@@ -85,7 +85,7 @@ pekko-clj includes these Apache Pekko modules:
 | `pekko-cluster-tools_3` | 1.6.0 | Singletons, pub-sub |
 | `pekko-distributed-data_3` | 1.6.0 | CRDTs (`pekko-clj.cluster.ddata`) |
 | `pekko-cluster-sharding-typed_3` | 1.6.0 | ShardedDaemonProcess (`pekko-clj.cluster.daemon`) |
-| `pekko-http_3` | 1.3.0 | HTTP server/client, websockets |
+| `pekko-http_3` | 1.4.0 | HTTP server/client, websockets |
 | `pekko-testkit_3` | 1.6.0 | `pekko-clj.test` companion |
 | `pekko-stream-testkit_3` | 1.6.0 | Stream test probes |
 

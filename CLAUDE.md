@@ -295,12 +295,14 @@ pekko {
 | `test/resources/cluster-test.conf` | Cluster test Pekko configuration |
 | `test/resources/persistence-test.conf` | Persistence test Pekko configuration |
 | `docs/ROADMAP.md` | Epic 1 tracker (complete — parity/hardening/bug work) |
-| `docs/ROADMAP-2.md` | Epic 2 tracker (ACTIVE — final review audit, per-story status) |
+| `docs/ROADMAP-2.md` | Epic 2 tracker (complete) |
+| `docs/ROADMAP-3.md` | Epic 3 tracker (complete) |
+| `docs/ROADMAP-4.md` | Epic 4 tracker (ACTIVE — final review audit, serious bugs only) |
 | `docs/specs/README.md` | Feature parity overview |
 
 ## Version Information
 
 - Clojure: 1.11.1
 - Apache Pekko: 1.6.0
-- Apache Pekko HTTP: 1.3.0
+- Apache Pekko HTTP: 1.4.0
 - Scala: 3.x (binary compatibility via `_3` suffix)
