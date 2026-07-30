@@ -36,7 +36,19 @@
 
    Idle entities can be passivated automatically (see `start`'s :passivation and
    `passivation-settings`) or on request (`passivate`). For always-on workers that
-   are not addressed by entity id, see `pekko-clj.cluster.daemon`."
+   are not addressed by entity id, see `pekko-clj.cluster.daemon`.
+
+   Entity ids are arbitrary strings. Pekko names each entity actor
+   `URLEncoder.encode(id, \"utf-8\")` so any id is a legal actor name, and never
+   decodes it again — so `entity-id` and a persistent entity's `:persistence-id`
+   function decode the path name themselves. Ids are therefore reported and
+   journalled exactly as sent, including `/`, spaces, `@`, `:` and non-ASCII.
+
+   Migration note: before this decoding was added, an entity id containing such a
+   character journalled under its *encoded* spelling (`order%2F2026`, not
+   `order/2026`). Journals written by that older version are orphaned — a
+   pre-1.0 break, and only for ids that encoding actually changes; plain-ASCII
+   ids are unaffected."
   (:require [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorSystem ActorRef Props]
            [org.apache.pekko.cluster.sharding ClusterSharding ClusterShardingSettings
@@ -54,6 +66,8 @@
             ShardRegion$ShardState]
            [pekko_clj.actor CljActor CljPersistentActor]
            [com.typesafe.config Config ConfigFactory]
+           [java.net URLDecoder]
+           [java.nio.charset StandardCharsets]
            [java.time Duration]
            [scala.concurrent.duration FiniteDuration]
            [java.util.concurrent TimeUnit]))
@@ -75,9 +89,16 @@
   "Create a message envelope addressing `message` to a specific entity.
 
    The envelope is a plain map, `{::entity-id id ::message message}`; the
-   message extractor unwraps it, so entity actors never see it."
+   message extractor unwraps it, so entity actors never see it.
+
+   `entity-id` is coerced with `str` — Pekko declares
+   `ShardRegion.MessageExtractor.entityId` as returning a String, so a numeric or
+   keyword id would otherwise fail inside the extractor and the message would be
+   dropped rather than delivered. `entity-ref` coerces the same way, so `42` and
+   `\"42\"` address one entity. nil is left alone: the extractor reports it as
+   \"no entity id\", which is how Pekko drops a message that addresses none."
   [entity-id message]
-  {::entity-id entity-id
+  {::entity-id (some-> entity-id str)
    ::message message})
 
 (defn entity-message?
@@ -110,10 +131,15 @@
         message))))
 
 (defn entity-id
-  "Return the current sharded entity's id — its actor-path name, which Pekko sets
-   to the entity id. Call inside an entity actor's handler or init body."
+  "Return the current sharded entity's id. Call inside an entity actor's handler
+   or init body.
+
+   Pekko names the entity actor `URLEncoder.encode(id, \"utf-8\")` and keeps the
+   raw id only in its own state, so the path name is decoded back here. The
+   result is the id exactly as passed to `tell`/`ask`/`entity-ref` — identity for
+   plain-ASCII ids, and the exact inverse of Pekko's encoding otherwise."
   []
-  (.name (.path ^ActorRef (core/self))))
+  (URLDecoder/decode (.name (.path ^ActorRef (core/self))) StandardCharsets/UTF_8))
 
 ;; ---------------------------------------------------------------------------
 ;; Passivation strategies

@@ -17,6 +17,7 @@
 | `state->map` | `CurrentShardRegionState` → Clojure map | ✅ Complete |
 | `graceful-shutdown!` | `ShardRegion.gracefulShutdownInstance` | ✅ Complete |
 | `entity-message` | Envelope (plain map, `::entity-id`/`::message`) | ✅ Complete |
+| `entity-id` | Entity id inside the entity (path name, URL-decoded) | ✅ Complete |
 
 ### Implemented Options
 
@@ -346,6 +347,7 @@ dependency; nothing user-facing becomes typed.
 | Remember-entities store | ✅ Implemented | `:remember-entities-store`, `sharding-settings` |
 | Hand-off stop message | ✅ Implemented | `start` `:stop-message` |
 | Persistent entities | ✅ Implemented | `start` takes a `defactor-persistent` def; id/init get the entity id |
+| Arbitrary entity ids | ✅ Implemented | Ids coerced with `str`; the path name Pekko URL-encodes is decoded back, so `/`, space, `@`, `:`, `+` and non-ASCII ids report and journal unchanged |
 | Region graceful shutdown | ✅ Implemented | `graceful-shutdown!` |
 | Sharded daemon process | ✅ Implemented | `pekko-clj.cluster.daemon/start` (typed shim) |
 | External allocation | ❌ Not implemented | Kafka co-location use case |
@@ -398,6 +400,13 @@ Tests in `test/clj/pekko_clj/cluster/sharding_test.clj`:
 - `idle-passivation-stops-entity-test` - An idle entity is passivated and recreated
 - `manual-passivate-recreates-entity-test` - `passivate` + stop-message round trip
 - `start-with-stop-message-and-remember-entities-test` - Hand-off stop message overload
+- `entity-id-decodes-the-url-encoded-actor-name-test` - `entity-id` returns the raw id
+  for `/`, space, `@`, `:`, `%`, `+`, `~` and non-ASCII ids; plain ids unchanged; an id
+  and its encoded spelling stay distinct entities
+- `persistent-entity-id-with-special-chars-keeps-one-journal-key-test` - A special-char
+  entity's `:persistence-id` and `init` get the raw id, and it replays after passivation
+- `entity-message-coerces-the-id-to-a-string-test` - Numeric/keyword ids coerced, nil preserved
+- `numeric-entity-id-round-trips-test` - `(tell region 42 …)` addresses the same entity as `"42"`
 
 Daemon process tests in `test/clj/pekko_clj/cluster/daemon_test.clj`:
 

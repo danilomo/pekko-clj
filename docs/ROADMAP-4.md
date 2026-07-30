@@ -46,18 +46,50 @@ assertions / 0 failures, `lein lint` clean, `lein check` zero reflection warning
 
 | ID | Title | Milestone | Status | Deps | Risk |
 |----|-------|-----------|--------|------|------|
-| B23 | Sharded entity ids are URL-encoded, never decoded | Bugs | TODO | — | medium |
+| B23 | Sharded entity ids are URL-encoded, never decoded | Bugs | DONE | — | medium |
 | B24 | Bump pekko-http 1.3.0 → 1.4.0 (latest stable) | Bugs | DONE | — | low |
 
 **Definition of done for this epic:** both B stories `DONE`; `doc/`+`docs/` reflect
 reality; `lein test` + `lein lint` green, `lein check` reflection-clean for src/.
 When done, mark this epic COMPLETE — no further review epics are planned.
 
+## EPIC COMPLETE (2026-07-30)
+
+Both stories `DONE`. Final state: **679 tests / 1543 assertions / 0 failures**,
+`lein lint` clean (0 errors, 0 warnings, formatting clean), `lein check`
+reflection-free for `src/`. Pins are at the latest stable of both lines
+(Pekko `1.6.0`, pekko-http `1.4.0`). No further review epics are planned; the
+minor observations below were left unfixed by design and remain the standing
+backlog for whoever next touches those files.
+
 ---
 
 ## Milestone B — Correctness bugs
 
-### B23 · Sharded entity ids are URL-encoded, never decoded — `TODO`
+### B23 · Sharded entity ids are URL-encoded, never decoded — `DONE`
+**Done (2026-07-30):** re-verified the audit's bytecode claim independently before
+touching anything — `URLEncoder` appears in `Shard.class` (the child name) with the
+raw id going to `entityProps`, and `URLDecoder` appears in **no** class in
+`pekko-cluster-sharding_3-1.6.0`. Both derivation sites now decode UTF-8:
+`sharding/entity-id` and `CljPersistentActor`'s entity branch (which feeds both
+`persistence-id-fn` and `init-fn`). `entity-message` coerces the id with `str`
+(nil preserved, so the extractor's "no id → drop" behavior is unchanged).
+Migration caveat is in the `pekko-clj.cluster.sharding` ns docstring.
+
+Tests written first and confirmed failing pre-fix (9 / 5 / 3 assertion failures
+across the three integration tests): `entity-id-decodes-the-url-encoded-actor-name-test`,
+`persistent-entity-id-with-special-chars-keeps-one-journal-key-test`,
+`entity-message-coerces-the-id-to-a-string-test`, `numeric-entity-id-round-trips-test`.
+Suite 675/1511 → **679/1543 green**, `lein lint` clean, `lein check` reflection-free.
+Docs: `doc/04-cluster.md` gained an "Entity ids" section;
+`docs/specs/sharding-parity-spec.md` gained the `entity-id` row, an
+"Arbitrary entity ids" feature row, and the four test entries.
+
+One correction to the audit's framing, found by the tests: `~` is **not** an
+unreserved character to `URLEncoder` (it encodes to `%7E`), so the set of ids
+affected is slightly wider than "`/`, space, `@`, `:`, `+`, non-ASCII" — only
+alphanumerics and `. - * _` pass through untouched.
+
 **Deps:** none. **VERIFIED via bytecode (2026-07-30)** against the pinned
 `pekko-cluster-sharding_3-1.6.0` jar: `javap -c` on
 `org.apache.pekko.cluster.sharding.Shard` shows the entity actor being created

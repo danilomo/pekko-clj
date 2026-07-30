@@ -645,3 +645,105 @@
             "the echo entity's reply returned to the persistent caller"))
       (finally
         (ts/terminate-system sys)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: B23 — entity ids survive Pekko's URL encoding of the actor name
+;; ---------------------------------------------------------------------------
+
+;; Pekko's Shard creates each entity child under
+;; `URLEncoder.encode(entityId, "utf-8")` (javap-confirmed on
+;; pekko-cluster-sharding_3 1.6.0) and hands the *raw* id to the entity Props.
+;; It never decodes: nothing in the sharding jar references URLDecoder, because
+;; Pekko keeps the raw id in its own state maps. Anything deriving the id back
+;; out of the path name — `entity-id` and CljPersistentActor's entity branch —
+;; has to decode it itself, or every id containing a character encoding touches
+;; (/ space @ : + non-ASCII) silently reads back mangled.
+
+(deftest entity-id-decodes-the-url-encoded-actor-name-test
+  (let [sys (ts/create-cluster-system "entity-id-decoding-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys counter-entity {:type-name "IdEcho"
+                                                       :num-shards 10})]
+        ;; The headline case: before the fix this came back as "a%2Fb+c%40d".
+        (is (eventually (= "a/b c@d" (await-result (sharding/ask region "a/b c@d" [:get-id]))))
+            "an entity reads back the id it was addressed with")
+        ;; Round trips only if decode is a true inverse of Pekko's encode —
+        ;; note `+` (encode's spelling of space) and `%` (its escape char).
+        (doseq [id ["100%" "a+b" "x&y=z" "1/2/3" "a:b" "user@example.com" "münchen" "~x"]]
+          (is (= id (await-result (sharding/ask region id [:get-id])))
+              (str "round trip for " (pr-str id))))
+        ;; Regression guard: ids URL-encoding leaves alone (only alphanumerics and
+        ;; . - * _ are unreserved to URLEncoder — `~` is not) are untouched.
+        (doseq [id ["plain" "counter-1" "order_9.2" "a*b"]]
+          (is (= id (await-result (sharding/ask region id [:get-id])))
+              (str "plain id unchanged: " (pr-str id))))
+        ;; Decoding must not collapse an id onto its own encoded spelling:
+        ;; "a/b" is named "a%2Fb", and "a%2Fb" is named "a%252Fb".
+        (sharding/tell region "a/b" [:inc])
+        (sharding/tell region "a%2Fb" [:inc])
+        (sharding/tell region "a%2Fb" [:inc])
+        (is (eventually (= 1 (await-result (sharding/ask region "a/b" [:get])))))
+        (is (= 2 (await-result (sharding/ask region "a%2Fb" [:get])))
+            "a raw id and its encoded spelling stay distinct entities"))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest persistent-entity-id-with-special-chars-keeps-one-journal-key-test
+  ;; The serious half of B23: the persistence id is derived from the path name,
+  ;; so a special-char entity id filed its journal under the *encoded* form.
+  ;; Nothing errors — events just land under a key no one queries by.
+  (let [sys (ts/create-cluster-system "sharded-persistent-encoded-id-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (reset! recoveries {})
+      (let [region (sharding/start sys account-entity {:type-name "EncodedAccount"
+                                                       :num-shards 10})
+            id "acct/2026 a@b"
+            pid (str "account-" id)]
+        (sharding/tell region id [:deposit 100])
+        ;; init-fn is called with the entity id too — same bug, same fix.
+        (is (eventually (= {:id id :balance 100}
+                           (await-result (sharding/ask region id :get))))
+            "`init` received the raw entity id")
+        (is (= pid (await-result (sharding/ask region id :get-persistence-id)))
+            "the journal key comes from the raw id, not the encoded actor name")
+        (is (= 1 (get @recoveries pid)) "recovered once, on creation")
+        ;; Passivate and revive: the replay has to find the same journal key.
+        (is (= :passivating (await-result (sharding/ask region id :passivate))))
+        (is (eventually (= {:id id :balance 100}
+                           (await-result (sharding/ask region id :get))))
+            "state came back from the journal under the same key")
+        (is (eventually (= 2 (get @recoveries pid)))
+            "a second recovery ran — the entity really was stopped and replayed"))
+      (finally
+        (ts/terminate-system sys)))))
+
+(deftest entity-message-coerces-the-id-to-a-string-test
+  ;; ShardRegion$MessageExtractor.entityId is declared to return String, so a
+  ;; non-string id blows up inside the extractor proxy. `entity-ref` already
+  ;; coerced; `entity-message` (and thus tell/ask) did not.
+  (is (= "42" (::sharding/entity-id (sharding/entity-message 42 [:x]))))
+  (is (= "order-7" (::sharding/entity-id (sharding/entity-message "order-7" [:x]))))
+  (is (= ":kw" (::sharding/entity-id (sharding/entity-message :kw [:x]))))
+  (is (nil? (::sharding/entity-id (sharding/entity-message nil [:x])))
+      "nil stays nil — the extractor reports 'no id' and Pekko drops the message")
+  (is (= [:x] (::sharding/message (sharding/entity-message 42 [:x])))
+      "the payload is untouched"))
+
+(deftest numeric-entity-id-round-trips-test
+  (let [sys (ts/create-cluster-system "numeric-entity-id-test")]
+    (try
+      (is (ts/wait-for-cluster-up sys))
+      (let [region (sharding/start sys counter-entity {:type-name "NumericCounter"
+                                                       :num-shards 10})]
+        (sharding/tell region 42 [:inc])
+        (sharding/tell region 42 [:inc])
+        (is (eventually (= 2 (await-result (sharding/ask region 42 [:get]))))
+            "a numeric id addresses one entity instead of throwing in the extractor")
+        (is (= "42" (await-result (sharding/ask region 42 [:get-id])))
+            "the entity sees the stringified id")
+        (is (= 2 (await-result (sharding/ask region "42" [:get])))
+            "42 and \"42\" are the same entity"))
+      (finally
+        (ts/terminate-system sys)))))

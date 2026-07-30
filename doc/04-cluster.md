@@ -105,6 +105,25 @@ envelope is unwrapped before delivery — and reads its own id at runtime with
 (sharding/tell-entity cart-123 [:add "Orange"])
 ```
 
+#### Entity ids
+
+An entity id is any string, and it is coerced with `str` — so `42` and `"42"`
+address the same entity. Pekko names each entity actor
+`URLEncoder.encode(id, "utf-8")` so that arbitrary ids are legal actor names, but
+it never decodes that name again; `pekko-clj` does, so `(sharding/entity-id)`
+always returns the id exactly as you sent it:
+
+```clojure
+(sharding/tell region "order/2026 a@b" [:add "Apple"])
+;; inside the entity: (sharding/entity-id) => "order/2026 a@b"
+;; (the actor is really named "order%2F2026+a%40b")
+```
+
+This matters most for persistent entities below, whose journal key is derived
+from the id: `/`, spaces, `@`, `:`, `+` and non-ASCII are all ordinary in emails,
+order keys and dates, and they journal under the id you chose rather than under
+its encoded spelling.
+
 ### Persistent Entities (Event-Sourced Aggregates)
 
 The canonical sharding pattern is one *event-sourced* aggregate per entity id:

@@ -297,7 +297,7 @@ pekko {
 | `docs/ROADMAP.md` | Epic 1 tracker (complete — parity/hardening/bug work) |
 | `docs/ROADMAP-2.md` | Epic 2 tracker (complete) |
 | `docs/ROADMAP-3.md` | Epic 3 tracker (complete) |
-| `docs/ROADMAP-4.md` | Epic 4 tracker (ACTIVE — final review audit, serious bugs only) |
+| `docs/ROADMAP-4.md` | Epic 4 tracker (complete — final review audit, serious bugs only) |
 | `docs/specs/README.md` | Feature parity overview |
 
 ## Version Information

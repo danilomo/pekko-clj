@@ -12,6 +12,8 @@ import clojure.lang.IFn;
 import clojure.lang.Keyword;
 import clojure.lang.ILookup;
 import clojure.lang.ISeq;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -90,7 +92,13 @@ public class CljPersistentActor extends AbstractPersistentActorWithTimers implem
       // can be baked into it: both are derived from the entity id, which Pekko uses
       // as the entity actor's path name. self() is already available here — the
       // Actor trait initializes it before this constructor body runs.
-      Object entityId = getSelf().path().name();
+      //
+      // Pekko's Shard names the child URLEncoder.encode(entityId, "utf-8") and never
+      // decodes it (it keeps the raw id in its own state maps), so decode here.
+      // Without this an id containing / space @ : + or non-ASCII silently journals
+      // under its encoded spelling — "order%2F2026" rather than "order/2026" —
+      // and no query by the natural id ever finds those events.
+      Object entityId = URLDecoder.decode(getSelf().path().name(), StandardCharsets.UTF_8);
       Object id = persistenceIdFn.invoke(entityId);
       this.persistenceId = id == null ? null : id.toString();
       IFn initFn = (IFn) props.valAt(INIT_FN, null);
