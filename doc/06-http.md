@@ -199,6 +199,54 @@ The strict-entity buffering timeouts in `http/entity->string` / `entity->bytes`
 and `client/response-body` / `response-body-bytes` also take an explicit
 millisecond argument as their last parameter.
 
+## Server-sent events
+
+`sse` completes a route with a `text/event-stream`, driven by a stream `Source`
+of events — each a string (data only) or a `{:data … :event … :id … :retry …}`
+map. Wrap it in `without-request-timeout` for an unbounded stream:
+
+```clojure
+(r/path "events"
+  (r/without-request-timeout
+    (r/sse (stream/source-tick 0 1000 {:data "tick" :event "clock"}))))
+```
+
+Read the framed stream back on the client with `stream/lines` (or
+`stream/frame-delimiter`) over the response's `getDataBytes` — chunk boundaries
+do not line up with events, so framing is what re-joins them.
+
+## Async routes: drive an actor without blocking
+
+`on-success` and `on-complete` build the Route from a `CompletionStage` (an actor
+`core/<?>`, say) once it resolves, so a handler never blocks a dispatcher thread:
+
+```clojure
+(r/GET "/users/:id" [id]
+  (r/on-success (core/<?> user-actor [:get id] 3000)
+    (fn [user] (r/complete-json user))))
+```
+
+`on-complete` also sees failures — its fn receives `{:success true :value v}` or
+`{:success false :error throwable}`, so a failed ask becomes a chosen response
+instead of a bare 500:
+
+```clojure
+(r/on-complete (core/<?> actor :risky 3000)
+  (fn [{:keys [success value error]}]
+    (if success (r/complete-json value)
+        (r/complete :internal-server-error (.getMessage error)))))
+```
+
+## Client IP
+
+`extract-client-ip` yields the peer IP as a string — but only when the server
+config sets `pekko.http.server.remote-address-attribute = on`; without it Pekko
+never captures the address and the value is `nil`.
+
+```clojure
+(r/extract-client-ip (fn [ip] (r/complete (str "hello from " ip))))
+```
+
 ## Marshalling: strings are values, not pre-encoded bodies
 
 `->json` / `->edn` (and therefore `resp/json`, `complete-json`, …) encode every

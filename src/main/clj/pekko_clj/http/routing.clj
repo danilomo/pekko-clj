@@ -16,6 +16,10 @@
    - compression: `encode-response`/`decode-request` (gzip/deflate negotiated)
    - timeouts: `with-request-timeout`/`without-request-timeout`
    - websockets: `websocket` over a stream Flow of Messages (`text-flow`)
+   - server-sent events: `sse` over a stream Source of events
+   - async routes: `on-success`/`on-complete` drive a CompletionStage (an actor
+     `<?>`) into a Route without blocking
+   - client IP: `extract-client-ip` (needs `remote-address-attribute = on`)
 
    Example:
      (routes
@@ -35,12 +39,18 @@
            [org.apache.pekko.http.javadsl.server.directives
             SecurityDirectives$ProvidedCredentials]
            [org.apache.pekko.http.javadsl.model ContentType HttpResponse HttpEntity$Strict
-            HttpRequest ResponseEntity Uri
+            HttpRequest RemoteAddress ResponseEntity StatusCode Uri
             StatusCodes]
+           [org.apache.pekko.http.javadsl.model.sse ServerSentEvent]
            [org.apache.pekko.http.javadsl.model.ws Message TextMessage]
+           [org.apache.pekko.http.javadsl.marshalling Marshaller]
+           [org.apache.pekko.http.javadsl.marshalling.sse EventStreamMarshalling]
            [org.apache.pekko.http.javadsl.coding Coder]
+           [org.apache.pekko.stream.javadsl Source]
            [org.apache.pekko.japi.pf FI$Apply]
+           [java.net InetAddress]
            [java.time Duration]
+           [java.util Optional OptionalInt]
            [java.util.function Supplier Function]
            [java.util.concurrent CompletionStage]))
 
@@ -909,6 +919,105 @@
    (path \"chat\" (websocket flow \"chat-v1\"))   ;; require a subprotocol"
   ([flow] (.handleWebSocketMessages directives flow))
   ([flow ^String protocol] (.handleWebSocketMessagesForProtocol directives flow protocol)))
+
+;; ---------------------------------------------------------------------------
+;; Server-Sent Events (SSE)
+;; ---------------------------------------------------------------------------
+
+(defn- opt-str ^Optional [v] (if (some? v) (Optional/of (str v)) (Optional/empty)))
+(defn- opt-int ^OptionalInt [v] (if (some? v) (OptionalInt/of (int v)) (OptionalInt/empty)))
+
+(defn ->server-sent-event
+  "Coerce a Clojure value to a Pekko ServerSentEvent (a ServerSentEvent passes
+   through). A string becomes a data-only event; a map may carry :data (the payload,
+   required), :event (the event type/name), :id (the last-event-id), and :retry (the
+   client reconnection delay in ms)."
+  ^ServerSentEvent [event]
+  (cond
+    (instance? ServerSentEvent event) event
+    (string? event) (ServerSentEvent/create ^String event)
+    (map? event) (ServerSentEvent/create ^String (str (:data event))
+                                         (opt-str (:event event))
+                                         (opt-str (:id event))
+                                         (opt-int (:retry event)))
+    :else (throw (IllegalArgumentException.
+                  (str "SSE event must be a ServerSentEvent, a string, or a "
+                       "{:data … :event … :id … :retry …} map, got " (pr-str event))))))
+
+(defn sse
+  "Complete the route with a Server-Sent Events (`text/event-stream`) response.
+
+   `events` is a stream Source whose elements are events — each a ServerSentEvent, a
+   string (data only), or a `{:data … :event … :id … :retry …}` map (see
+   `->server-sent-event`). The connection stays open for the life of the Source, so
+   wrap the route in `without-request-timeout` for an unbounded stream.
+
+   (without-request-timeout
+     (sse (stream/source-tick 0 1000 {:data \"tick\"})))"
+  [events]
+  (.complete directives
+             ^StatusCode StatusCodes/OK
+             ^Source (stream/smap events ->server-sent-event)
+             ^Marshaller (EventStreamMarshalling/toEventStream)))
+
+;; ---------------------------------------------------------------------------
+;; Async routes (drive a CompletionStage, e.g. an actor ask, without blocking)
+;; ---------------------------------------------------------------------------
+
+(defn on-success
+  "Wait for `stage` (a CompletionStage — e.g. `core/<?>` against an actor) to
+   complete SUCCESSFULLY, bind its value, and build the inner Route from it. If the
+   stage fails, Pekko routes the failure to the exception handler (a 500 by
+   default); use `on-complete` to handle the failure yourself.
+
+   (on-success (core/<?> actor :get 3000)
+     (fn [reply] (complete-json reply)))"
+  [^CompletionStage stage inner-fn]
+  (.onSuccess directives stage
+              (reify Function
+                (apply [_ value] (inner-fn value)))))
+
+(defn on-complete
+  "Wait for `stage` (a CompletionStage) to complete either way, then build the inner
+   Route. `inner-fn` receives a map: `{:success true :value v}` on success, or
+   `{:success false :error throwable}` on failure — so you can turn a failed actor
+   ask into a chosen response instead of a bare 500.
+
+   (on-complete (core/<?> actor :get 3000)
+     (fn [{:keys [success value error]}]
+       (if success (complete-json value)
+                   (complete :internal-server-error (.getMessage error)))))"
+  [^CompletionStage stage inner-fn]
+  (.onComplete directives stage
+               (reify Function
+                 (apply [_ result]
+                   (let [^scala.util.Try t result]
+                     (inner-fn (if (.isSuccess t)
+                                 {:success true :value (.get t)}
+                                 {:success false :error (.get (.failed t))})))))))
+
+;; ---------------------------------------------------------------------------
+;; Client IP
+;; ---------------------------------------------------------------------------
+
+(defn extract-client-ip
+  "Extract the client's IP address as a string, passing it (or nil when unknown) to
+   `inner-fn`.
+
+   REQUIRES `pekko.http.server.remote-address-attribute = on` in the server config;
+   without it Pekko never captures the peer address and the IP is always nil. Behind
+   a reverse proxy the directive also honours a trusted `X-Forwarded-For` /
+   `Remote-Address` per Pekko's rules.
+
+   (extract-client-ip (fn [ip] (complete (str \"hello from \" ip))))"
+  [inner-fn]
+  (.extractClientIP directives
+                    (reify Function
+                      (apply [_ remote-address]
+                        (let [^RemoteAddress ra remote-address
+                              ^Optional addr (.getAddress ra)]
+                          (inner-fn (when (.isPresent addr)
+                                      (.getHostAddress ^InetAddress (.get addr)))))))))
 
 (defn handle-request
   "Create a route from a request handler function.

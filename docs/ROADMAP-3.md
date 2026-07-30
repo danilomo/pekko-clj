@@ -65,12 +65,15 @@ performance note, see H16).
 | N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | DONE | — | low |
 | N22 | Stash for persistent actors | New | DONE | — | low |
 | N23 | Persistence event adapters (schema evolution) | New | DONE | — | medium |
-| N24 | HTTP: SSE, client IP, async-route directives | New | TODO | — | medium |
+| N24 | HTTP: SSE, client IP, async-route directives | New | DONE | — | medium |
 
 **Definition of done for this epic:** all B stories `DONE`; H13–H16 `DONE`
 (H17/H18 strongly recommended, cheap); N20–N22 `DONE` (N23/N24
 prioritized-optional); `doc/`+`docs/` reflect reality; `lein test` + `lein lint`
 green, `lein check` reflection-clean for src/.
+
+**Epic COMPLETE (2026-07-30):** every story `DONE`, including the optional N23/N24.
+`lein test` 675/1511 green, `lein lint` clean, `lein check` reflection-clean.
 
 ---
 
@@ -569,7 +572,27 @@ one-to-many `EventSeq` split; manifest round trip. LevelDB honors
 `event-adapters` config (verify early — if it does not, document which test
 journal to use before sinking time).
 
-### N24 · HTTP: SSE, client IP, async-route directives — `TODO`
+### N24 · HTTP: SSE, client IP, async-route directives — `DONE`
+**Done:** all three landed in `pekko-clj.http.routing`, every signature
+javap-confirmed on javadsl first (B11's lesson). **SSE:** `sse` completes a route
+via `complete(StatusCode, Source, EventStreamMarshalling/toEventStream)`; a public
+`->server-sent-event` coerces each element (a `ServerSentEvent`, a string, or a
+`{:data :event :id :retry}` map → the 4-arg `ServerSentEvent/create` with
+`Optional`/`OptionalInt`) and is `smap`-ped over the source. Pairs with
+`without-request-timeout`; client side (EventSource) skipped — the streaming client
++ `stream/lines` framing already reads it, shown in the test. **Client IP:**
+`extract-client-ip` over `extractClientIP`, passing the peer IP **string** (nil when
+unknown) rather than the raw `RemoteAddress` — friendlier and the 90% case; the
+docstring names the required `remote-address-attribute = on` and the test pins both
+on (→ `127.0.0.1`) and off (→ nil). **Async routes:** `on-success`
+(`onSuccess(CompletionStage, Function)`) binds the value; `on-complete`
+(`onComplete(CompletionStage, Function<Try,Route>)`) hands the fn a Clojure map
+`{:success true :value v}` / `{:success false :error throwable}` (the `scala.util.Try`
+unwrapped in the wrapper) so a failed actor ask becomes a chosen response, not a bare
+500. `core/<?>` already returns a `CompletableFuture`, so it feeds them directly. 4
+integration tests (SSE framing, on-success actor round trip, on-complete
+success+failure, client-ip on/off); `doc/06-http.md` gains a section for each.
+`lein test` 675/1511 green, `lein lint` clean, `lein check` reflection-clean.
 **Deps:** none. Optional. Verify each signature with javap before wrapping (B11's
 lesson: route-layer code can look fine and never match).
 - **Server-sent events:** javadsl `EventStreamMarshalling` + `ServerSentEvent` —

@@ -13,8 +13,10 @@
             [pekko-clj.http.tls :as tls]
             [pekko-clj.test-support :as ts])
   (:import [org.apache.pekko.http.javadsl Http]
+           [org.apache.pekko.http.javadsl.model HttpResponse]
            [org.apache.pekko.http.javadsl.model.ws WebSocketRequest]
            [org.apache.pekko.stream.javadsl Flow]
+           [com.typesafe.config ConfigFactory]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]
            [java.net ServerSocket]
@@ -967,3 +969,102 @@
             (is (= "timed body"
                    (-> (client/response-body response *system* 3000)
                        (client/await-response 5000))))))))))
+
+;; ---------------------------------------------------------------------------
+;; N24: server-sent events, async routes, client IP
+;; ---------------------------------------------------------------------------
+
+(deftest sse-stream-test
+  (testing "sse serves a text/event-stream a framing client can read back"
+    (let [routes (routing/path "events"
+                   (routing/method-get
+                     (routing/sse (stream/source [{:data "one" :event "greeting"}
+                                                  {:data "two"}
+                                                  {:data "three" :id "42"}]))))]
+      (with-test-server routes
+        (fn []
+          (let [response (-> (client/GET *system* (url "/events")) (client/await-response 5000))]
+            (is (= 200 (client/response-status response)))
+            (is (str/includes? (str (.getContentType (.entity ^HttpResponse response)))
+                               "text/event-stream")
+                "the response advertises the SSE content type")
+            ;; Re-frame the chunked byte stream into lines (N14) — the point of a
+            ;; streaming client: chunk boundaries do not line up with events.
+            (let [lines (-> (.getDataBytes (.entity ^HttpResponse response))
+                            (stream/via (stream/lines))
+                            (stream/run-to-seq *mat*)
+                            (stream/await-completion 5000)
+                            vec)
+                  text (str/join "\n" lines)]
+              (is (some #(str/starts-with? % "data") lines) "events are `data:` framed")
+              (is (str/includes? text "one"))
+              (is (str/includes? text "two"))
+              (is (str/includes? text "three"))
+              (is (str/includes? text "greeting") "the :event type is rendered")
+              (is (str/includes? text "42") "the :id is rendered"))))))))
+
+(core/defactor n24-greeter
+  (init [_] {})
+  (handle [:greet who] (core/reply (str "hello " who))))
+
+(deftest on-success-drives-an-actor-ask
+  (testing "on-success builds the Route from an actor <?> reply without blocking"
+    (let [actor (core/spawn *system* n24-greeter nil)
+          routes (routing/GET "/greet/:who" [who]
+                   (routing/on-success (core/<?> actor [:greet who] 3000)
+                                       (fn [reply] (routing/complete reply))))]
+      (with-test-server routes
+        (fn []
+          (is (= [200 "hello ada"] (get-status+body (url "/greet/ada")))))))))
+
+(deftest on-complete-handles-success-and-failure
+  (testing "on-complete turns a failed stage into a chosen response, not a bare 500"
+    (let [actor (core/spawn *system* n24-greeter nil)
+          routes (routing/routes
+                   (routing/GET "/ok/:who" [who]
+                     (routing/on-complete (core/<?> actor [:greet who] 3000)
+                                          (fn [{:keys [success value]}]
+                                            (if success
+                                              (routing/complete (str "ok:" value))
+                                              (routing/complete :internal-server-error "unreachable")))))
+                   (routing/GET "/fail" []
+                     (routing/on-complete (doto (CompletableFuture.)
+                                            (.completeExceptionally (RuntimeException. "kaboom")))
+                                          (fn [{:keys [success error]}]
+                                            (if success
+                                              (routing/complete "unexpected success")
+                                              (routing/complete :internal-server-error
+                                                                (str "failed: " (.getMessage ^Throwable error))))))))]
+      (with-test-server routes
+        (fn []
+          (is (= [200 "ok:hello ada"] (get-status+body (url "/ok/ada"))))
+          (is (= [500 "failed: kaboom"] (get-status+body (url "/fail")))))))))
+
+(deftest extract-client-ip-test
+  (testing "extract-client-ip yields the peer IP only when remote-address-attribute is on"
+    (let [make-routes (fn [] (routing/path "whoami"
+                               (routing/method-get
+                                 (routing/extract-client-ip
+                                  (fn [ip] (routing/complete (str "ip=" (pr-str ip))))))))
+          run (fn [sys]
+                (let [port (find-free-port)
+                      binding (-> (http/bind-server sys "127.0.0.1" port (make-routes))
+                                  (stream/await-completion 5000))]
+                  (try
+                    (-> (client/GET sys (str "http://127.0.0.1:" port "/whoami"))
+                        (client/await-response 5000)
+                        (client/response-body sys)
+                        (client/await-response 5000))
+                    (finally (stream/await-completion (http/unbind binding) 5000)))))]
+      ;; With the attribute enabled, the loopback peer address is captured.
+      (let [sys (core/actor-system "client-ip-on"
+                                   (ConfigFactory/parseString
+                                    "pekko.http.server.remote-address-attribute = on"))]
+        (try
+          (is (= "ip=\"127.0.0.1\"" (run sys)))
+          (finally (core/shutdown-system sys))))
+      ;; Without it (the default), the IP is unknown -> nil.
+      (let [sys (core/actor-system "client-ip-off")]
+        (try
+          (is (= "ip=nil" (run sys)) "no address captured without the config")
+          (finally (core/shutdown-system sys)))))))
