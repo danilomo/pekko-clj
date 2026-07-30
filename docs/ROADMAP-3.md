@@ -64,7 +64,7 @@ performance note, see H16).
 | N20 | Streams operator batch 3 (timeouts, splits, zips, resources) | New | DONE | B19 | medium |
 | N21 | Fixed-delay timers (`startTimerWithFixedDelay`) | New | DONE | — | low |
 | N22 | Stash for persistent actors | New | DONE | — | low |
-| N23 | Persistence event adapters (schema evolution) | New | TODO | — | medium |
+| N23 | Persistence event adapters (schema evolution) | New | DONE | — | medium |
 | N24 | HTTP: SSE, client IP, async-route directives | New | TODO | — | medium |
 
 **Definition of done for this epic:** all B stories `DONE`; H13–H16 `DONE`
@@ -527,7 +527,29 @@ Boundedness: Pekko's stash capacity comes from mailbox config — surface the
 **Tests:** stash-until-recovery-complete round trip; unstash-all order; a
 persistent actor stashing and then persisting still applies events in order.
 
-### N23 · Persistence event adapters — `TODO`
+### N23 · Persistence event adapters — `DONE`
+**Done:** new `pekko_clj.actor.CljEventAdapter` (implements `EventAdapter`, an
+`(ExtendedActorSystem)` ctor) resolves `to-journal`/`from-journal`/`manifest` — each
+optional, a `"ns/var"` string — from a **fixed** config root
+`pekko-clj.persistence.adapter`, plus a `pekko-clj.persistence.adapter/config` HOCON
+builder (mirrors `mailbox/priority-mailbox-config`) that also emits the
+`event-adapters` registration + `event-adapter-bindings` (default binding
+`java.lang.Object`). **Deviation from the sketch's `<name>` path:** javap of
+`EventAdapters$.instantiate` confirmed Pekko instantiates an adapter *name-blind* —
+it passes only the `ExtendedActorSystem`, never the adapter's own config section
+(unlike a mailbox's `(Settings, Config)`), so the instance cannot know its logical
+binding name. Hence ONE adapter per ActorSystem reading a fixed root; branch inside
+the fns on event shape / manifest instead of registering several. Documented
+honestly in the ns + Java docstrings. **`fromJournal` return contract:** `nil` →
+drop (`EventSeq.empty`), a value tagged by `(adapter/many coll)` → one event per
+element (split), anything else → single — even a Clojure vector, so
+`[:v1 x]` → `[:v2 x default]` is never mis-split. The `EventSeq` is built in **Java**
+(the `create(Object…)` vs `create(Seq)` overload is ambiguous from Clojure); the
+split marker is metadata (`::split`) checked via `IMeta`/`RT.toArray`. **LevelDB
+honors `event-adapters`** — verified live by the recovery test (not just asserted).
+Tests (4/13): config shape + `:journal-plugin` guard; `[:v1 x]` → `[:v2 x :default]`
+upcast on recovery; one-to-many split; manifest round trip. `lein test` 671/1498
+green, `lein lint` clean, `lein check` reflection-clean.
 **Deps:** none. Optional but high-value for real CQRS apps.
 No wrapper for Pekko's `EventAdapter`/`ReadEventAdapter`/`WriteEventAdapter` —
 the schema-evolution seam (upcasting old journal events, splitting one event into
