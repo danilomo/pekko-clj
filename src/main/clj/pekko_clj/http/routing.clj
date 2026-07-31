@@ -462,8 +462,8 @@
    - realm: named in the `WWW-Authenticate` challenge sent with the 401
    - authenticator: (fn [user verify] principal-or-nil). `user` is the supplied
      username; `verify` is a predicate taking *your* known secret for that user and
-     returning true when it matches what the client sent. Return any value to
-     accept (it is handed to inner-fn) or nil to reject.
+     returning true when it matches what the client sent. Return any **truthy**
+     value to accept (it is handed to inner-fn); `nil` or `false` rejects.
    - inner-fn: (fn [principal] route)
 
    The supplied password is deliberately not reachable: Pekko exposes only
@@ -487,10 +487,16 @@
      (apply [_ opt-credentials]
        (let [^java.util.Optional opt opt-credentials]
          (if (.isPresent opt)
-           (let [^SecurityDirectives$ProvidedCredentials creds (.get opt)]
-             (java.util.Optional/ofNullable
-              (authenticator (.identifier creds)
-                             (fn [secret] (.verify creds (str secret))))))
+           (let [^SecurityDirectives$ProvidedCredentials creds (.get opt)
+                 ;; Clojure truthiness, not Optional/ofNullable's nil check: a
+                 ;; predicate-style authenticator returning `false` means "reject",
+                 ;; and treating it as a present principal would authenticate the
+                 ;; request with `false` as the principal.
+                 principal (authenticator (.identifier creds)
+                                          (fn [secret] (.verify creds (str secret))))]
+             (if principal
+               (java.util.Optional/of principal)
+               (java.util.Optional/empty)))
            (java.util.Optional/empty)))))
    (reify Function
      (apply [_ principal] (inner-fn principal)))))
@@ -856,16 +862,32 @@
   (.handleRejections directives handler (reify Supplier (get [_] route))))
 
 (defn exception-handler
-  "Build a Pekko ExceptionHandler from a map of Throwable class -> (fn [ex] route),
+  "Build a Pekko ExceptionHandler from Throwable class -> (fn [ex] route) entries,
    or from a single (fn [ex] route) applied to any Throwable.
+
+   Entries are registered in order and matching is **first match wins**, so a
+   supertype registered before a subtype shadows it. Accepts either:
+
+   - a map — convenient, but note that a literal map of more than 8 entries is a
+     hash-map, whose seq order is undefined; with that many handlers the relative
+     order of two classes in the same hierarchy is not something you control.
+   - a sequence of [class f] pairs — order is exactly as written. Use this when
+     you have more than 8 entries, or whenever precedence actually matters.
 
    Example:
      (exception-handler
        {IllegalArgumentException (fn [e] (complete :bad-request (.getMessage e)))
-        Throwable                (fn [_] (complete :internal-server-error \"boom\"))})"
+        Throwable                (fn [_] (complete :internal-server-error \"boom\"))})
+
+     ;; explicit precedence: the specific case is tried first
+     (exception-handler
+       [[IllegalArgumentException (fn [e] (complete :bad-request (.getMessage e)))]
+        [Throwable                (fn [_] (complete :internal-server-error \"boom\"))]])"
   ^ExceptionHandler [handlers]
   (let [builder (ExceptionHandler/newBuilder)]
-    (if (map? handlers)
+    ;; A vector is IFn (it looks up by index), so the fn branch cannot be the
+    ;; fallback for sequential input — test for it explicitly.
+    (if (or (map? handlers) (sequential? handlers))
       (do (doseq [[klass f] handlers]
             (.match builder klass (reify FI$Apply (apply [_ ex] (f ex)))))
           (.build builder))

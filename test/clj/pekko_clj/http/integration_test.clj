@@ -563,6 +563,46 @@
             (is (= 500 (client/response-status response)))
             (is (= "unexpected" (get-body response)))))))))
 
+(deftest h19-exception-handler-takes-ordered-pairs
+  ;; H19: matching is first-match-wins, so registration order IS precedence — but
+  ;; a literal map of more than 8 entries is a hash-map with undefined seq order,
+  ;; leaving precedence up to hashing. A sequence of [class f] pairs registers in
+  ;; the order written, so a specific case can be guaranteed to beat Throwable.
+  (let [;; Throwable is written LAST here, so IllegalArgumentException wins. Padded
+        ;; past 8 entries: as a literal map this ordering would not be reliable.
+        pairs (into [[IllegalArgumentException
+                      (fn [e] (routing/complete :bad-request (str "specific: " (.getMessage e))))]]
+                    (concat
+                     (map (fn [klass]
+                            [klass (fn [_] (routing/complete :conflict "other"))])
+                          [ArithmeticException ClassCastException NumberFormatException
+                           IndexOutOfBoundsException UnsupportedOperationException
+                           NullPointerException java.io.IOException])
+                     [[Throwable (fn [_] (routing/complete :internal-server-error "catch-all"))]]))
+        routes (routing/handle-exceptions
+                (routing/exception-handler pairs)
+                 (routing/routes
+                   (routing/path "specific"
+                     (routing/method-get
+                       (routing/path-end
+                         (routing/handle-request
+                          (fn [_] (throw (IllegalArgumentException. "nope")))))))
+                   (routing/path "fallback"
+                     (routing/method-get
+                       (routing/path-end
+                         (routing/handle-request
+                          (fn [_] (throw (Exception. "other")))))))))]
+    (is (> (count pairs) 8) "past the array-map threshold, where a literal map loses order")
+    (with-test-server routes
+      (fn []
+        (let [response (-> (client/GET *system* (url "/specific")) (client/await-response 5000))]
+          (is (= 400 (client/response-status response))
+              "the earlier, more specific entry wins over the later Throwable")
+          (is (= "specific: nope" (get-body response))))
+        (let [response (-> (client/GET *system* (url "/fallback")) (client/await-response 5000))]
+          (is (= 500 (client/response-status response)))
+          (is (= "catch-all" (get-body response))))))))
+
 (deftest rejection-handler-test
   (testing "custom not-found rejection handling"
     (let [routes (routing/handle-rejections
@@ -774,6 +814,30 @@
           (is (= 401 (client/response-status response)))
           (is (str/includes? (str (client/response-headers response)) "test realm")
               "the realm reaches the WWW-Authenticate challenge"))))))
+
+(deftest h19-basic-auth-rejects-a-false-principal
+  ;; H19: the authenticator's result used to go through Optional/ofNullable, so
+  ;; only nil rejected — a predicate-style authenticator returning `false`
+  ;; authenticated the request with `false` as the principal. Any falsey value
+  ;; rejects now.
+  (let [routes (routing/path "secret"
+                 (routing/basic-auth
+                  "test realm"
+                  ;; deliberately predicate-shaped: returns true/false, not a map
+                  (fn [user verify]
+                    (boolean (when-let [secret (get test-users user)]
+                               (verify secret))))
+                  (fn [principal]
+                    (routing/complete (str "principal=" (pr-str principal))))))]
+    (with-test-server routes
+      (fn []
+        (is (= [200 "principal=true"]
+               (get-status+body (str "http://127.0.0.1:" *port* "/secret")
+                                {:headers (basic-header "ada" "lovelace")}))
+            "a truthy principal still authenticates")
+        (is (= 401 (first (get-status+body (str "http://127.0.0.1:" *port* "/secret")
+                                           {:headers (basic-header "ada" "wrong")})))
+            "false rejects instead of authenticating with `false` as the principal")))))
 
 (deftest bearer-token-extracts-or-passes-nil
   (let [routes (routing/path "whoami"

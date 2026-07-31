@@ -49,14 +49,18 @@
 
 ;; --- Lobby actor ---
 
+;; Pairs joiners two at a time: the first to arrive plays white, the second black.
+;; The keys handed to `game` are the ones its `init` destructures — a lobby that
+;; invents its own names would leave every binding nil and silently start a game
+;; with no players.
 (defactor lobby
   (init [_] :empty)
 
   (handle [:join callback]
     (if (= :empty state)
-      {:first {:ref (sender) :cb callback}}
+      {:white-ref (sender) :white-cb callback}
       (do
-        (spawn game (merge state {:second {:ref (sender) :cb callback}}))
+        (spawn game (assoc state :black-ref (sender) :black-cb callback))
         :empty))))
 
 (comment

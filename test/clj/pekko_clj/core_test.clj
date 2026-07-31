@@ -427,6 +427,32 @@
   (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/schedule-once"
         (core/schedule-once 10 (fn [])))))
 
+(deftest h19-out-of-context-messaging-and-deathwatch-fns-name-the-fn
+  ;; H19: H15 stopped at the accessors — reply/forward/unhandled/watch/unwatch and
+  ;; spawn's child arities still dereferenced a nil *current-actor* and bare-NPE'd.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/reply" (core/reply :x)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/forward"
+        (core/forward nil :x)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/unhandled"
+        (core/unhandled :x)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/watch" (core/watch nil)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/watch"
+        (core/watch nil :gone))
+      "the watchWith arity too")
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/unwatch" (core/unwatch nil)))
+  ;; spawn's child arities dispatch on "first arg is not an ActorSystem", so the
+  ;; error also points at the arity the caller almost certainly meant.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/spawn"
+        (core/spawn {:make-props (fn [_] {})} nil)))
+  (is (thrown-with-msg? IllegalStateException #"spawn system actor-def"
+        (core/spawn {:make-props (fn [_] {})} nil {:name "n"}))
+      "and names the top-level arity as the likely fix")
+  ;; NPEs are what this replaces — make sure none of them slipped through.
+  (doseq [f [#(core/reply :x) #(core/forward nil :x) #(core/unhandled :x)
+             #(core/watch nil) #(core/unwatch nil)]]
+    (is (not (instance? NullPointerException (try (f) (catch Throwable t t))))
+        "no bare NPE survives")))
+
 (deftest defactor-rejects-non-list-clause
   ;; A stray non-list clause used to throw a cryptic "Don't know how to create
   ;; ISeq"; now it is named as an unknown clause.

@@ -39,7 +39,15 @@
    The Config produced by `config` must be present in the ActorSystem's
    configuration (pass it to `core/actor-system`, or merge it via
    `cluster/create-system`'s `:extra-config`; it merges onto your journal's own
-   config with `withFallback`)."
+   config with `withFallback`).
+
+   Combining with a `(tagger …)` clause: the two are NOT symmetric. Actor-side
+   tagging wraps first, so `to-journal` receives an
+   `org.apache.pekko.persistence.journal.Tagged` — `(.payload t)` is your event and
+   `(.tags t)` the tag set — while on the way back the journal has already
+   unwrapped it, so `from-journal` sees the bare payload. A `to-journal` that
+   assumes its own event shape will not match under a tagger; branch on `Tagged`
+   (rewriting `(.payload t)` and re-wrapping) if you use both."
   (:import [com.typesafe.config Config ConfigFactory]))
 
 (def ^:private adapter-class "pekko_clj.actor.CljEventAdapter")

@@ -127,10 +127,15 @@ which compares your known secret against it in constant time:
   (r/basic-auth "admin area"
     (fn [user verify]
       (when-let [secret (get users user)]
-        (when (verify secret) {:user user})))         ; nil rejects
+        (when (verify secret) {:user user})))         ; any falsey value rejects
     (fn [principal]
       (complete (str "hi " (:user principal))))))
 ```
+
+The authenticator's return value is read with Clojure truthiness: return anything
+truthy to accept — it becomes the `principal` handed to the inner function — and
+`nil` or `false` to reject. A predicate-shaped authenticator that returns
+`true`/`false` therefore works as written.
 
 `bearer-token` is extraction only — it hands the inner function the token from
 an `Authorization: Bearer …` header, or nil when the header is absent or uses

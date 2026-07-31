@@ -48,19 +48,26 @@ assertions / 0 failures, `lein lint` clean, `lein check` zero reflection warning
 |----|-------|-----------|--------|------|------|
 | B23 | Sharded entity ids are URL-encoded, never decoded | Bugs | DONE | — | medium |
 | B24 | Bump pekko-http 1.3.0 → 1.4.0 (latest stable) | Bugs | DONE | — | low |
+| H19 | Audit-note loose ends (the five recorded minor observations) | Hardening | DONE | B23, B24 | low |
 
 **Definition of done for this epic:** both B stories `DONE`; `doc/`+`docs/` reflect
 reality; `lein test` + `lein lint` green, `lein check` reflection-clean for src/.
 When done, mark this epic COMPLETE — no further review epics are planned.
 
-## EPIC COMPLETE (2026-07-30)
+## EPIC COMPLETE (2026-07-30; reopened and re-closed 2026-07-31)
 
-Both stories `DONE`. Final state: **679 tests / 1543 assertions / 0 failures**,
-`lein lint` clean (0 errors, 0 warnings, formatting clean), `lein check`
-reflection-free for `src/`. Pins are at the latest stable of both lines
-(Pekko `1.6.0`, pekko-http `1.4.0`). No further review epics are planned; the
-minor observations below were left unfixed by design and remain the standing
-backlog for whoever next touches those files.
+Closed 2026-07-30 with both B stories `DONE`. **Reopened 2026-07-31** to promote
+the audit's five unfixed minor observations into H19 rather than leave them as a
+standing backlog — which turned out to be worth doing: one of them (`basic-auth`
+treating `false` as a principal) was an authentication bypass the audit had
+filed as a style nit.
+
+Final state: all three stories `DONE`, **683 tests / 1568 assertions / 0
+failures**, `lein lint` clean (0 errors, 0 warnings, formatting clean),
+`lein check` reflection-free for `src/`. Pins are at the latest stable of both
+lines (Pekko `1.6.0`, pekko-http `1.4.0`). Nothing from the audit is left
+unaddressed; the only open items are the known-deferred features listed at the
+end of this file.
 
 ---
 
@@ -184,6 +191,73 @@ behavior change — if it does, pin it with a test and record it here).
 
 ---
 
+## Milestone H — Hardening
+
+### H19 · Audit-note loose ends — `DONE`
+**Done (2026-07-31):** all five, plus `unhandled`. Suite 679/1543 → **683/1568
+green**, `lein lint` clean, `lein check` reflection-free.
+
+**The audit under-rated note 2.** It reads as a style nit ("un-Clojurey"), but the
+regression test shows it is an **authentication bypass**: with a predicate-shaped
+authenticator (`(fn [user verify] (boolean …))`, the natural way to write one),
+a *wrong password* returned **200**, because `false` was a present principal to
+`Optional/ofNullable`. Verified by running the new test against the pre-fix
+`routing.clj`: `expected 401, actual 200`. Any code using that authenticator shape
+was letting every request through. Fixed to Clojure truthiness.
+
+Notes 1/3/5 landed as described; note 3 went one step past the suggested doc
+sentence — `exception-handler` now also accepts an ordered `[[class f] …]`
+sequence, so first-match-wins precedence is expressible rather than only
+documented (`doseq` already destructured pairs; it needed a `sequential?` arm
+because a vector is itself `IFn` and would otherwise hit the catch-all branch).
+Note 4 is documentation only, but the `Tagged` ordering claim was re-verified in
+`CljPersistentActor` first: `persist(withTags(event), …)` wraps before the journal
+write path runs adapters, so `to-journal` really does see `Tagged`.
+
+Tests (each confirmed failing pre-fix where it is a behavior change):
+`h19-out-of-context-messaging-and-deathwatch-fns-name-the-fn` (core_test),
+`h19-basic-auth-rejects-a-false-principal` + `h19-exception-handler-takes-ordered-pairs`
+(http/integration_test), and a new `pekko-clj.examples.chess-test` — the chess
+example now runs end to end as far as its stubs allow (4 of its 5 assertions fail
+against the old lobby).
+
+**Deps:** B23, B24 (both `DONE`). Promoted 2026-07-31 from the "minor observations
+recorded without stories" list below, by request. The epic's serious-bugs-only rule
+kept these out; with both B stories closed there is nothing left for them to block,
+so they are worked as one small story rather than five.
+
+Scope — the five recorded notes, plus one the audit itself missed:
+
+1. **`core` friendly errors (extends H15).** `reply`, `forward`, `watch`/`unwatch`
+   and `spawn`'s inside-actor branches bare-NPE outside a handler. H15 introduced
+   the `current-actor` guard for `self`/`sender`/`parent`/`context`/`stash`/timers
+   but stopped there. `unhandled` has the same gap and is **not** in the audit
+   list — same one-line fix, include it rather than leave one site arbitrarily
+   unguarded. `spawn` also gets a hint: outside an actor the caller almost always
+   meant the `(spawn system actor-def …)` arity.
+2. **`routing/basic-auth`.** `Optional/ofNullable` means only `nil` rejects, so an
+   authenticator returning `false` authenticates with `false` as the principal.
+   Reject on any falsey value.
+3. **`routing/exception-handler`.** A literal map of >8 entries is a hash-map, so
+   handler registration order — which is first-match-wins precedence — becomes
+   undefined. The audit suggested a doc sentence; also accept an ordered sequence
+   of `[class f]` pairs, which makes precedence expressible instead of merely
+   documented. `doseq` already destructures pairs, so this is a predicate change.
+4. **`persistence.adapter` doc note.** With a persistent actor's `(tagger …)`
+   clause, actor-side tagging wraps first: `to-journal` sees the `Tagged` wrapper
+   while `from-journal` sees the bare payload.
+5. **`examples/chess.clj`.** The lobby passes `{:first … :second …}`; `game`'s init
+   destructures `white-ref`/`black-ref`/`white-cb`/`black-cb`, so every binding is
+   nil and the example cannot run even as far as its stubs allow.
+
+**Tests:** each guarded fn throws `IllegalStateException` naming itself when called
+outside an actor (and still works inside one); a `false`-returning authenticator
+gets 401; ordered pairs give deterministic first-match-wins precedence where a
+>8-entry literal map does not; the chess lobby/game handoff runs end to end as far
+as the stubs allow. Notes 4 is documentation only.
+
+---
+
 ## Audit notes (what was checked, how — 2026-07-30)
 
 Fresh-eyes pass at commit `1c18bfc` over **everything**: full reads of all 29
@@ -199,7 +273,10 @@ null-entityId drop behavior was also confirmed accurate against
 for B24.
 
 Minor observations recorded **without stories** (per this epic's serious-bugs-only
-rule; fix opportunistically if a story touches the file):
+rule; fix opportunistically if a story touches the file). **All five were promoted
+into H19 on 2026-07-31 and are now fixed** — kept here as the record of what the
+audit saw, including where it under-rated something (note 2 was an auth bypass,
+not a style nit):
 
 - `core/reply`, `core/forward`, `core/watch`/`unwatch`, and `spawn`'s
   inside-actor branches still bare-NPE when called outside a handler — H15's

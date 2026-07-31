@@ -18,12 +18,15 @@
 (defn- current-actor
   "The current CljActor, or a friendly IllegalStateException if called outside an
    actor handler / init (where *current-actor* is nil — a bare NPE otherwise).
-   `fn-name` is the public fn being guarded. Allocation-free on the bound path."
-  ^CljActor [fn-name]
-  (or *current-actor*
-      (throw (IllegalStateException.
-              (str "pekko-clj.core/" fn-name " must be called inside an actor "
-                   "handler or init (there is no current actor here)")))))
+   `fn-name` is the public fn being guarded; `hint` is an optional sentence
+   appended to the message. Allocation-free on the bound path."
+  (^CljActor [fn-name] (current-actor fn-name nil))
+  (^CljActor [fn-name hint]
+   (or *current-actor*
+       (throw (IllegalStateException.
+               (str "pekko-clj.core/" fn-name " must be called inside an actor "
+                    "handler or init (there is no current actor here)"
+                    (when hint (str ". " hint))))))))
 
 (defn self
   "Returns the ActorRef of the current actor."
@@ -66,7 +69,7 @@
   "Reply to the sender of the current message. Returns nil (so it doesn't
    affect handler return value / state)."
   [msg]
-  (.reply *current-actor* msg)
+  (.reply (current-actor "reply") msg)
   nil)
 
 (defn actor-system
@@ -107,6 +110,12 @@
     (.actorOf factory props ^String name)
     (.actorOf factory props)))
 
+;; `spawn` picks the child-vs-top-level branch by testing whether the first
+;; argument is an ActorSystem, so calling the child arity outside an actor is a
+;; plain mistake in the call, not just missing context — say which arity was meant.
+(def ^:private spawn-outside-hint
+  "To spawn from outside an actor, pass the system: (spawn system actor-def args)")
+
 (defn spawn
   "Spawn a new actor. An optional trailing opts map supports {:name \"child-name\"}
    to give the actor a stable path (e.g. \"/user/child-name\"), which is what lets
@@ -128,13 +137,15 @@
      ;; (spawn system actor-def) — top-level, no args
      (spawn first-arg second-arg nil)
      ;; (spawn actor-def args) — inside actor context
-     (actor-of (.getContext *current-actor*) (make-props first-arg second-arg) nil)))
+     (actor-of (.getContext (current-actor "spawn" spawn-outside-hint))
+               (make-props first-arg second-arg) nil)))
   ([first-arg second-arg third-arg]
    (if (instance? ActorSystem first-arg)
      ;; (spawn system actor-def args) — top-level
      (actor-of first-arg (make-props second-arg third-arg) nil)
      ;; (spawn actor-def args opts) — inside actor context, optionally named
-     (actor-of (.getContext *current-actor*) (make-props first-arg second-arg) (:name third-arg))))
+     (actor-of (.getContext (current-actor "spawn" spawn-outside-hint))
+               (make-props first-arg second-arg) (:name third-arg))))
   ([^ActorSystem system actor-def args opts]
    (actor-of system (make-props actor-def args) (:name opts))))
 
@@ -210,7 +221,7 @@
 (defn forward
   "Forward the current message to another actor, preserving original sender."
   [target msg]
-  (.forward *current-actor* target msg))
+  (.forward (current-actor "forward") target msg))
 
 (defn unhandled
   "Mark `msg` as unhandled: publishes it to the actor system's event stream as an
@@ -221,7 +232,7 @@
    `defactor` calls this automatically for a message matching no `handle` clause,
    unless you supply your own catch-all. Returns nil (state is left unchanged)."
   [msg]
-  (.unhandled *current-actor* msg)
+  (.unhandled (current-actor "unhandled") msg)
   nil)
 
 (defn become
@@ -603,14 +614,14 @@
      `msg` is delivered through the normal handler and is NOT translated to a
      [:terminated ...] vector."
   ([actor-ref]
-   (.watch *current-actor* actor-ref))
+   (.watch (current-actor "watch") actor-ref))
   ([actor-ref msg]
-   (.watchWith *current-actor* actor-ref msg)))
+   (.watchWith (current-actor "watch") actor-ref msg)))
 
 (defn unwatch
   "Stop watching an actor for termination."
   [actor-ref]
-  (.unwatch *current-actor* actor-ref))
+  (.unwatch (current-actor "unwatch") actor-ref))
 
 ;; Stash functions
 (defn stash
