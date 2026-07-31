@@ -1,8 +1,8 @@
 (ns pekko-clj.core-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [pekko-clj.core :as core])
   (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [pekko_clj.actor BecomeResult CljActor]
+           [pekko_clj.actor BecomeResult]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -28,7 +28,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: dynamic vars
@@ -82,7 +82,7 @@
   ;; ! outside actor context should use noSender and not throw
   (let [received (promise)
         actor (core/new-actor *system*
-                              (fn [this msg]
+                              (fn [_this msg]
                                 (deliver received msg)
                                 nil)
                               nil)]
@@ -91,7 +91,7 @@
 
 (deftest tell-outside-context-returns-nil
   (let [actor (core/new-actor *system*
-                              (fn [this msg] nil)
+                              (fn [_this _msg] nil)
                               nil)]
     (is (nil? (core/! actor :any)))))
 
@@ -99,25 +99,35 @@
 ;; Tests: <?> (ask)
 ;; ---------------------------------------------------------------------------
 
-(deftest ask-returns-scala-future
+(deftest ask-returns-completion-stage
   (let [actor  (core/new-actor *system*
-                               (fn [this msg] (.reply this :pong) nil)
+                               (fn [this _msg] (.reply this :pong) nil)
                                nil)
         future (core/<?> actor :ping 3000)]
-    (is (instance? scala.concurrent.Future future))))
+    (is (instance? java.util.concurrent.CompletionStage future))
+    ;; A CompletableFuture, so it is also derefable and composable.
+    (is (instance? java.util.concurrent.CompletableFuture future))))
 
-(deftest ask-future-resolves-to-reply
+(deftest ask-future-derefs-to-reply
   (let [actor  (core/new-actor *system*
-                               (fn [this msg] (.reply this :pong) nil)
+                               (fn [this _msg] (.reply this :pong) nil)
+                               nil)]
+    ;; @ works because <?> returns a CompletableFuture.
+    (is (= :pong @(core/<?> actor :ping 3000)))))
+
+(deftest ask-future-composes-with-then-apply
+  (let [actor  (core/new-actor *system*
+                               (fn [this _msg] (.reply this :pong) nil)
                                nil)
-        future (core/<?> actor :ping 3000)
-        result (Await/result future timeout-duration)]
-    (is (= :pong result))))
+        stage  (.thenApply (core/<?> actor :ping 3000)
+                           (reify java.util.function.Function
+                             (apply [_ v] (name v))))]
+    (is (= "pong" @stage))))
 
 (deftest ask-uses-dynamic-timeout
   (binding [core/*timeout* 5000]
     (let [actor (core/new-actor *system*
-                                (fn [this msg] (.reply this :ok) nil)
+                                (fn [this _msg] (.reply this :ok) nil)
                                 nil)]
       (is (= :ok (await-ask actor :go))))))
 
@@ -135,16 +145,54 @@
 
 (deftest blocking-ask-with-explicit-timeout
   (let [actor (core/new-actor *system*
-                              (fn [this msg] (.reply this :done) nil)
+                              (fn [this _msg] (.reply this :done) nil)
                               nil)]
     (is (= :done (core/<! *system* actor :go 5000)))))
+
+(deftest blocking-ask-two-arg-form
+  ;; B2: new ergonomic form without a leading ActorSystem.
+  (let [actor (core/new-actor *system*
+                              (fn [this msg] (.reply this (str "hi:" msg)) nil)
+                              nil)]
+    (is (= "hi:x" (core/<! actor "x")))
+    (is (= "hi:y" (core/<! actor "y" 3000)))))
+
+(deftest blocking-ask-surfaces-failure-reply
+  ;; B2: a genuine failure (here a Status/Failure reply) must be rethrown, not
+  ;; silently turned into nil (which was indistinguishable from a timeout).
+  (let [actor (core/new-actor *system*
+                              (fn [this _]
+                                (.reply this (org.apache.pekko.actor.Status$Failure.
+                                              (ex-info "boom" {:k 1})))
+                                nil)
+                              nil)]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"boom"
+          (core/<! actor :go 3000)))))
+
+(deftest blocking-ask-timeout-returns-nil
+  ;; An actor that never replies: the ask times out (AskTimeoutException) and <!
+  ;; returns nil — distinct from a surfaced failure.
+  (let [actor (core/new-actor *system*
+                              (fn [_ _] nil) ; never replies
+                              nil)]
+    (is (nil? (core/<! actor :go 300)))))
+
+(deftest blocking-ask-cancelled-future-returns-nil
+  ;; H12: a cancelled future surfaces as CancellationException from .get, not
+  ;; ExecutionException/TimeoutException — treated the same as a timeout (nil)
+  ;; since there's no reply to return either way, rather than escaping raw.
+  (let [actor (core/new-actor *system* (fn [_ _] nil) nil) ; never replies
+        cancelled-future (doto (java.util.concurrent.CompletableFuture.)
+                           (.cancel true))]
+    (with-redefs [core/<?> (fn [& _] cancelled-future)]
+      (is (nil? (core/<! actor :go 300))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: become
 ;; ---------------------------------------------------------------------------
 
 (deftest become-returns-become-result
-  (let [handler-fn (fn [this msg] nil)
+  (let [handler-fn (fn [_this _msg] nil)
         actor-def  {:receive handler-fn}
         result     (core/become actor-def :new-state)]
     (is (instance? BecomeResult result))
@@ -210,12 +258,12 @@
   ;; report the sender it observed.
   (let [observed-sender (promise)
         receiver (core/new-actor *system*
-                                 (fn [this msg]
+                                 (fn [this _msg]
                                    (deliver observed-sender (.senderRef this))
                                    nil)
                                  nil)
         sending-actor (core/new-actor *system*
-                                      (fn [this msg]
+                                      (fn [this _msg]
                                         (binding [core/*current-actor* this]
                                           (core/! receiver :payload)
                                           (.reply this :done)
@@ -272,3 +320,146 @@
         child        (await-ask parent-actor :spawn-child)]
     (is (instance? ActorRef child))
     (is (= :echo (await-ask child :echo)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: named actors (H9) — spawn's/spawn-props' trailing opts {:name ...}
+;; ---------------------------------------------------------------------------
+
+(deftest spawn-with-name-resolves-via-actor-selection
+  (let [actor (core/spawn *system* echo-actor-def nil {:name "h9-named-top"})
+        sel (core/actor-selection *system* "/user/h9-named-top")]
+    (is (= actor @(core/identify sel 3000)))
+    (is (= :hello (await-ask actor :hello)))))
+
+(deftest spawn-with-name-inside-context-resolves-as-child
+  (let [spawner-handler
+        (fn [this msg]
+          (binding [core/*current-actor* this]
+            (case msg
+              :spawn-child (let [child (core/spawn echo-actor-def nil {:name "h9-named-child"})]
+                             (.reply this child)
+                             nil)
+              nil)))
+        parent-actor (core/new-actor *system* spawner-handler nil)
+        child (await-ask parent-actor :spawn-child)
+        sel (core/actor-selection *system* (str (.path ^ActorRef parent-actor) "/h9-named-child"))]
+    (is (= child @(core/identify sel 3000)))))
+
+(deftest spawn-props-with-name-resolves-via-actor-selection
+  (let [props (core/actor-props echo-actor-def)
+        actor (core/spawn-props *system* props {:name "h9-named-props"})
+        sel (core/actor-selection *system* "/user/h9-named-props")]
+    (is (= actor @(core/identify sel 3000)))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: DX polish (H5) — context, stop, poison-pill, graceful-stop,
+;;        actor-selection/identify, actor-system Config arity, shutdown-system
+;; ---------------------------------------------------------------------------
+
+(core/defactor h5-context-reporter
+  (handle :ctx? (core/reply (instance? org.apache.pekko.actor.ActorContext (core/context)))))
+
+(core/defactor h5-echo
+  (handle msg (core/reply msg)))
+
+(deftest context-returns-actor-context
+  (let [a (core/spawn *system* h5-context-reporter nil)]
+    (is (true? (core/<! a :ctx? 3000)))))
+
+(deftest poison-pill-stops-actor
+  (let [stopped (promise)
+        a (core/new-actor *system* {:function  (fn [_ _] nil)
+                                    :post-stop (fn [_] (deliver stopped true))
+                                    :state     nil})]
+    (core/poison-pill a)
+    (is (true? (deref stopped 3000 false)))))
+
+(deftest graceful-stop-completes
+  (let [a (core/new-actor *system* {:function (fn [_ _] nil) :state nil})]
+    (is (true? @(core/graceful-stop a 3000)))))
+
+(deftest stop-stops-a-child
+  (let [child-stopped (promise)]
+    (core/defactor h5-stop-child
+      (init [_] nil)
+      (on-stop (deliver child-stopped true))
+      (handle :ping (core/reply :pong)))
+    (core/defactor h5-stop-parent
+      (init [_] {})
+      (handle :make (core/reply (core/spawn h5-stop-child nil)))
+      (handle [:kill c]
+        (core/stop c)
+        (core/reply :killed)))
+    (let [p (core/spawn *system* h5-stop-parent nil)
+          c (core/<! p :make 3000)]
+      (is (= :pong (core/<! c :ping 3000)))
+      (is (= :killed (core/<! p [:kill c] 3000)))
+      (is (true? (deref child-stopped 3000 false))))))
+
+(deftest actor-selection-resolves-actor
+  (let [a   (core/spawn *system* h5-echo nil)
+        sel (core/actor-selection *system* (str (.path a)))]
+    (is (= a @(core/identify sel 3000)))))
+
+(deftest actor-system-with-config-and-shutdown
+  (let [cfg (.withFallback (com.typesafe.config.ConfigFactory/parseString "my.key = 7")
+                           (com.typesafe.config.ConfigFactory/load))
+        sys (core/actor-system "cfg-sys" cfg)]
+    (is (= 7 (.getInt (.config (.settings sys)) "my.key")))
+    ;; shutdown-system returns the Terminated event
+    (is (some? (core/shutdown-system sys 10000)))))
+
+;; ---------------------------------------------------------------------------
+;; H15: friendly errors
+;; ---------------------------------------------------------------------------
+
+(deftest out-of-context-calls-name-the-fn
+  ;; Accessor/timer/stash fns called outside an actor handler must throw an
+  ;; IllegalStateException naming the fn and the rule, not a bare NPE on the nil
+  ;; *current-actor*.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/self" (core/self)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/sender" (core/sender)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/parent" (core/parent)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/context" (core/context)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/stash" (core/stash)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/start-timer"
+        (core/start-timer :k 10 :m)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/schedule-once"
+        (core/schedule-once 10 (fn [])))))
+
+(deftest h19-out-of-context-messaging-and-deathwatch-fns-name-the-fn
+  ;; H19: H15 stopped at the accessors — reply/forward/unhandled/watch/unwatch and
+  ;; spawn's child arities still dereferenced a nil *current-actor* and bare-NPE'd.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/reply" (core/reply :x)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/forward"
+        (core/forward nil :x)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/unhandled"
+        (core/unhandled :x)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/watch" (core/watch nil)))
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/watch"
+        (core/watch nil :gone))
+      "the watchWith arity too")
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/unwatch" (core/unwatch nil)))
+  ;; spawn's child arities dispatch on "first arg is not an ActorSystem", so the
+  ;; error also points at the arity the caller almost certainly meant.
+  (is (thrown-with-msg? IllegalStateException #"pekko-clj\.core/spawn"
+        (core/spawn {:make-props (fn [_] {})} nil)))
+  (is (thrown-with-msg? IllegalStateException #"spawn system actor-def"
+        (core/spawn {:make-props (fn [_] {})} nil {:name "n"}))
+      "and names the top-level arity as the likely fix")
+  ;; NPEs are what this replaces — make sure none of them slipped through.
+  (doseq [f [#(core/reply :x) #(core/forward nil :x) #(core/unhandled :x)
+             #(core/watch nil) #(core/unwatch nil)]]
+    (is (not (instance? NullPointerException (try (f) (catch Throwable t t))))
+        "no bare NPE survives")))
+
+(deftest defactor-rejects-non-list-clause
+  ;; A stray non-list clause used to throw a cryptic "Don't know how to create
+  ;; ISeq"; now it is named as an unknown clause.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown clause"
+        (try
+          (macroexpand-1 '(pekko-clj.core/defactor bad-clause
+                            (init [_] {})
+                            :stray-keyword))
+          (catch clojure.lang.Compiler$CompilerException e
+            (throw (.getCause e)))))))

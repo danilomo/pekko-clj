@@ -22,8 +22,13 @@ public class CljSupervisorStrategy {
 
     /**
      * Convert a Clojure keyword directive to a Pekko Directive.
+     *
+     * Public (rather than the internal-use default) so it can be unit-tested
+     * directly from Clojure without an actor-crash integration test.
+     *
+     * @throws IllegalArgumentException if result isn't one of the four known directives
      */
-    private static SupervisorStrategy.Directive toDirective(Object result) {
+    public static SupervisorStrategy.Directive toDirective(Object result) {
         if (RESUME.equals(result)) {
             return SupervisorStrategy.resume();
         } else if (RESTART.equals(result)) {
@@ -33,8 +38,9 @@ public class CljSupervisorStrategy {
         } else if (ESCALATE.equals(result)) {
             return SupervisorStrategy.escalate();
         } else {
-            // Default to escalate for unknown directives
-            return SupervisorStrategy.escalate();
+            throw new IllegalArgumentException(
+                "Supervisor decider must return one of :resume, :restart, :stop, :escalate; got: "
+                    + result);
         }
     }
 

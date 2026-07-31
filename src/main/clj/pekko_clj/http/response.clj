@@ -3,12 +3,12 @@
 
    Provides idiomatic Clojure functions for creating HTTP responses
    with proper content types and status codes."
+  (:require [pekko-clj.http.marshalling :as marshal])
   (:import [org.apache.pekko.http.javadsl.model HttpResponse StatusCodes StatusCode
-                                                  ContentTypes ContentType HttpEntities
-                                                  ResponseEntity]
-           [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
-           [org.apache.pekko.util ByteString]
-           [org.apache.pekko.stream.javadsl Source]))
+            ContentTypes ContentType ContentType$NonBinary HttpEntities
+            ResponseEntity]
+           [org.apache.pekko.stream.javadsl Source]
+           [org.apache.pekko.http.javadsl.model.headers RawHeader Location]))
 
 ;; ---------------------------------------------------------------------------
 ;; Status Codes
@@ -42,14 +42,25 @@
    :gateway-timeout       StatusCodes/GATEWAY_TIMEOUT})
 
 (defn ->status-code
-  "Convert a status keyword or integer to a StatusCode."
-  [status]
+  "Convert a status keyword or integer to a StatusCode.
+
+   Keywords are the documented primary form (see `status-codes`). An integer
+   resolves to the real registered StatusCode when Pekko knows it (so 201
+   behaves exactly like :created — correct reason, isSuccess and allowsEntity
+   flags); a genuinely unregistered code falls back to a custom StatusCode with
+   sensible defaults (never an empty reason / isSuccess=false / allowsEntity=false,
+   which renders a 500 and drops the body)."
+  ^StatusCode [status]
   (cond
     (instance? StatusCode status) status
     (keyword? status) (or (get status-codes status)
                           (throw (ex-info (str "Unknown status code: " status)
                                           {:status status})))
-    (integer? status) (StatusCodes/custom (int status) "" "" false false)
+    (integer? status) (let [n (int status)
+                            registered (StatusCodes/lookup n)]
+                        (if (.isPresent registered)
+                          (.get registered)
+                          (StatusCodes/custom n "Custom" "Custom")))
     :else (throw (ex-info "Invalid status type" {:status status}))))
 
 ;; ---------------------------------------------------------------------------
@@ -59,6 +70,7 @@
 (def content-types
   "Map of content type keywords to Pekko ContentType objects."
   {:json       ContentTypes/APPLICATION_JSON
+   :edn        marshal/edn-content-type
    :html       ContentTypes/TEXT_HTML_UTF8
    :plain      ContentTypes/TEXT_PLAIN_UTF8
    :xml        ContentTypes/TEXT_XML_UTF8
@@ -68,7 +80,7 @@
 
 (defn ->content-type
   "Convert a content type keyword to a ContentType."
-  [ct]
+  ^ContentType [ct]
   (cond
     (instance? ContentType ct) ct
     (keyword? ct) (or (get content-types ct)
@@ -85,20 +97,29 @@
    content: string or byte array
    content-type: keyword or ContentType"
   [content content-type]
+  ;; The (ContentType, String) overload is declared on ContentType$NonBinary — every
+  ;; content type here is NonBinary except :binary, which takes the byte[] overload.
   (let [ct (->content-type content-type)]
     (if (string? content)
-      (HttpEntities/create ct ^String content)
+      (HttpEntities/create ^ContentType$NonBinary ct ^String content)
       (HttpEntities/create ct ^bytes content))))
 
 (defn json
-  "Create a JSON entity from a string or data structure.
-   If given a map/vector, converts to JSON string using pr-str.
-   For production, use a proper JSON library like cheshire."
+  "Create a JSON entity from Clojure data (encoded with Cheshire). A string is a
+   JSON *value*, so it is encoded and comes back quoted — to emit a pre-encoded
+   JSON body verbatim, wrap it with `pekko-clj.http.marshalling/raw-body` (N15).
+
+     (json {:name \"ada\" :ids [1 2]})  ;; => {\"name\":\"ada\",\"ids\":[1,2]}
+     (json \"hi\")                       ;; => \"hi\"  (a quoted JSON string)"
   [data]
-  (let [content (if (string? data)
-                  data
-                  (pr-str data))]
-    (entity content :json)))
+  (entity (marshal/->json data) :json))
+
+(defn edn
+  "Create an application/edn entity from Clojure data (rendered with pr-str). A
+   string is rendered as an EDN string literal, so to emit a pre-rendered EDN body
+   verbatim wrap it with `pekko-clj.http.marshalling/raw-body` (N15)."
+  [data]
+  (entity (marshal/->edn data) :edn))
 
 (defn html
   "Create an HTML entity from a string."
@@ -121,11 +142,17 @@
    content-type: keyword or ContentType"
   [source content-type]
   (let [ct (->content-type content-type)]
-    (HttpEntities/create ct source)))
+    (HttpEntities/create ct ^Source source)))
 
 ;; ---------------------------------------------------------------------------
 ;; Response Builders
 ;; ---------------------------------------------------------------------------
+
+(defn- ->headers
+  "Build a sequence of HttpHeader (RawHeader) from a map of name -> value.
+   Names may be keywords or strings; values are coerced with str."
+  [headers]
+  (map (fn [[k v]] (RawHeader/create (name k) (str v))) headers))
 
 (defn response
   "Create an HTTP response.
@@ -135,22 +162,26 @@
    (response status headers body) - response with status, headers map, and body
 
    status: keyword (:ok, :not-found, etc.) or integer
-   headers: map of header names to values (not yet implemented, reserved)
+   headers: map of header names (keyword or string) to values, added as raw headers
    body: HttpEntity, string, or nil"
   ([status body]
+   ;; Each branch picks its own withEntity overload. A single hinted `ent` would
+   ;; not do: an entity body needs withEntity(ResponseEntity) while a string needs
+   ;; withEntity(String), and hinting one would mis-dispatch the other.
+   ;; scaladsl HttpEntity$Strict implements javadsl ResponseEntity, so the
+   ;; ResponseEntity branch already covers it.
    (let [sc (->status-code status)
-         ent (cond
-               (nil? body) ""
-               (instance? ResponseEntity body) body
-               (instance? HttpEntity$Strict body) body
-               (string? body) body
-               :else (str body))]
-     (-> (HttpResponse/create)
-         (.withStatus sc)
-         (.withEntity ^String ent))))
+         ^HttpResponse resp (.withStatus (HttpResponse/create) ^StatusCode sc)]
+     (cond
+       (nil? body)                     (.withEntity resp "")
+       (instance? ResponseEntity body) (.withEntity resp ^ResponseEntity body)
+       (string? body)                  (.withEntity resp ^String body)
+       :else                           (.withEntity resp ^String (str body)))))
   ([status headers body]
-   ;; For now, ignore headers (would require building HttpHeader list)
-   (response status body)))
+   (let [^HttpResponse resp (response status body)]
+     (if (seq headers)
+       (.addHeaders resp (java.util.ArrayList. ^java.util.Collection (->headers headers)))
+       resp))))
 
 (defn ok
   "Create an OK (200) response with the given body."
@@ -204,6 +235,5 @@
   ([url]
    (redirect url :found))
   ([url status]
-   ;; Redirect responses typically include a Location header
-   ;; For now, return basic redirect response
-   (response status (text (str "Redirecting to " url)))))
+   (let [^HttpResponse resp (response status (text (str "Redirecting to " url)))]
+     (.addHeader resp (Location/create ^String url)))))

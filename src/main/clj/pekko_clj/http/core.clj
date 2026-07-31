@@ -2,22 +2,35 @@
   "Core HTTP server functionality for Pekko HTTP.
 
    Provides server binding, request accessors, and entity handling."
-  (:require [pekko-clj.stream :as stream])
-  (:import [org.apache.pekko.http.javadsl Http ServerBinding]
-           [org.apache.pekko.http.javadsl.model HttpRequest HttpResponse
-                                                  HttpMethod HttpMethods Uri Query]
+  (:require [clojure.string :as str])
+  (:import [org.apache.pekko.http.javadsl Http ServerBinding ServerBuilder HttpsConnectionContext]
+           [org.apache.pekko.http.javadsl.model HttpRequest HttpMethods HttpHeader RequestEntity]
+           [org.apache.pekko.http.scaladsl.model HttpEntity$Strict]
+           [org.apache.pekko.japi Pair]
+           [java.util Optional]
            [org.apache.pekko.http.javadsl.server Route]
            [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.stream Materializer]
-           [org.apache.pekko.util ByteString]
-           [java.util.concurrent CompletionStage CompletableFuture TimeUnit]
-           [java.util.function Function]
-           [scala.concurrent.duration Duration]
-           [scala.jdk.javaapi FutureConverters]))
+           [org.apache.pekko.stream Materializer SystemMaterializer]
+           [java.util.concurrent CompletionStage CompletableFuture]
+           [java.util.function Function]))
 
 ;; ---------------------------------------------------------------------------
 ;; Server Lifecycle
 ;; ---------------------------------------------------------------------------
+
+(defn- bind-route
+  "Bind a Route or a plain request->CompletionStage<HttpResponse> function on an
+   already-configured ServerBuilder."
+  [^ServerBuilder builder route]
+  (if (instance? Route route)
+    (.bind builder ^Route route)
+    ;; route is a function: HttpRequest -> CompletionStage<HttpResponse>.
+    ;; ServerBuilder.bind takes Pekko's japi Function, NOT java.util.function
+    ;; .Function — reifying the latter throws "No matching method bind".
+    (.bind builder
+           (reify org.apache.pekko.japi.function.Function
+             (apply [_ request]
+               (route request))))))
 
 (defn bind-server
   "Bind an HTTP server to a host and port with the given route handler.
@@ -27,27 +40,27 @@
    port: port number
    route: a Route or function (request -> CompletionStage<HttpResponse>)
 
+   The optional last argument is either a Materializer (kept for back-compat) or
+   an options map:
+   - :materializer - a stream Materializer
+   - :https        - an HttpsConnectionContext (see `pekko-clj.http.tls/
+                     https-server-context`); when present the server speaks TLS
+
    Returns a CompletionStage<ServerBinding>."
   ([system host port route]
-   (let [http (Http/get system)
-         builder (.newServerAt http host (int port))]
-     (if (instance? Route route)
-       (.bind builder route)
-       ;; route is a function: HttpRequest -> CompletionStage<HttpResponse>
-       (.bind builder
-              (reify Function
-                (apply [_ request]
-                  (route request)))))))
-  ([system host port route materializer]
-   (let [http (Http/get system)
-         builder (-> (.newServerAt http host (int port))
-                     (.withMaterializer materializer))]
-     (if (instance? Route route)
-       (.bind builder route)
-       (.bind builder
-              (reify Function
-                (apply [_ request]
-                  (route request))))))))
+   (bind-server system host port route {}))
+  ([system host port route mat-or-opts]
+   (let [opts (if (instance? Materializer mat-or-opts)
+                {:materializer mat-or-opts}
+                mat-or-opts)
+         {:keys [materializer https]} opts
+         http (Http/get ^ActorSystem system)
+         ^ServerBuilder builder (.newServerAt http ^String host (int port))
+         ^ServerBuilder builder (if materializer (.withMaterializer builder materializer) builder)
+         ^ServerBuilder builder (if https
+                                  (.enableHttps builder ^HttpsConnectionContext https)
+                                  builder)]
+     (bind-route builder route))))
 
 (defn unbind
   "Unbind a server, stopping it from accepting new connections.
@@ -106,34 +119,36 @@
    Returns nil if no query string."
   [^HttpRequest request]
   (let [uri (.getUri request)
-        raw (.rawQueryString uri)]
-    (when (.isDefined raw)
+        ^Optional raw (.rawQueryString uri)]
+    (when (.isPresent raw)
       (.get raw))))
 
 (defn request-query-params
   "Get query parameters as a map of strings.
-   Multi-valued params return the first value."
+   Multi-valued params return the last value (later entries overwrite
+   earlier ones with the same name)."
   [^HttpRequest request]
   (let [uri (.getUri request)
         query (.query uri)]
     (into {}
-          (for [param (iterator-seq (.iterator (.toList query)))]
+          (for [^Pair param (iterator-seq (.iterator (.toList query)))]
             [(.first param) (.second param)]))))
 
 (defn request-header
   "Get a single header value by name (case-insensitive).
    Returns nil if header not present."
   [^HttpRequest request header-name]
-  (let [optional (.getHeader request header-name)]
+  (let [^Optional optional (.getHeader request ^String header-name)]
     (when (.isPresent optional)
-      (.value (.get optional)))))
+      (.value ^HttpHeader (.get optional)))))
 
 (defn request-headers
   "Get all headers as a map.
-   Multi-valued headers return the first value."
+   Multi-valued headers return the last value (later entries overwrite
+   earlier ones with the same name)."
   [^HttpRequest request]
   (into {}
-        (for [header (iterator-seq (.iterator (.getHeaders request)))]
+        (for [^HttpHeader header (iterator-seq (.iterator (.getHeaders request)))]
           [(.lowercaseName header) (.value header)])))
 
 (defn request-content-type
@@ -147,37 +162,51 @@
 ;; Entity Handling
 ;; ---------------------------------------------------------------------------
 
+(def ^:private entity-strict-timeout-ms
+  "Default time entity->string / entity->bytes wait for the body to be fully
+   collected. Override per call with the trailing timeout-ms argument."
+  10000)
+
+(defn ->materializer
+  "Resolve a Materializer from a Materializer or an ActorSystem.
+
+   When given a system, returns the shared per-system materializer via
+   SystemMaterializer instead of creating a fresh one each call — the latter
+   leaks an unclosed materializer (and its actor) on every invocation."
+  ^Materializer [materializer-or-system]
+  (if (instance? Materializer materializer-or-system)
+    materializer-or-system
+    (.materializer (SystemMaterializer/get ^ActorSystem materializer-or-system))))
+
 (defn entity->string
   "Convert a request entity to a string.
    Returns a CompletionStage<String>.
 
-   materializer-or-system: Materializer or ActorSystem"
-  [^HttpRequest request materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
-    (-> (.entity request)
-        (.toStrict (Duration/create 10 TimeUnit/SECONDS) mat)
-        (FutureConverters/asJava)
-        (.thenApply (reify Function
-                      (apply [_ strict]
-                        (.utf8String (.getData strict))))))))
+   materializer-or-system: Materializer or ActorSystem
+   timeout-ms: how long to wait for the body (default 10000)."
+  ([^HttpRequest request materializer-or-system]
+   (entity->string request materializer-or-system entity-strict-timeout-ms))
+  ([^HttpRequest request materializer-or-system timeout-ms]
+   (let [mat (->materializer materializer-or-system)]
+     (-> (.toStrict ^RequestEntity (.entity request) (long timeout-ms) mat)
+         (.thenApply (reify Function
+                       (apply [_ strict]
+                         (.utf8String (.getData ^HttpEntity$Strict strict)))))))))
 
 (defn entity->bytes
   "Convert a request entity to a byte array.
    Returns a CompletionStage<byte[]>.
 
-   materializer-or-system: Materializer or ActorSystem"
-  [^HttpRequest request materializer-or-system]
-  (let [mat (if (instance? Materializer materializer-or-system)
-              materializer-or-system
-              (Materializer/createMaterializer materializer-or-system))]
-    (-> (.entity request)
-        (.toStrict (Duration/create 10 TimeUnit/SECONDS) mat)
-        (FutureConverters/asJava)
-        (.thenApply (reify Function
-                      (apply [_ strict]
-                        (.toArray (.getData strict))))))))
+   materializer-or-system: Materializer or ActorSystem
+   timeout-ms: how long to wait for the body (default 10000)."
+  ([^HttpRequest request materializer-or-system]
+   (entity->bytes request materializer-or-system entity-strict-timeout-ms))
+  ([^HttpRequest request materializer-or-system timeout-ms]
+   (let [mat (->materializer materializer-or-system)]
+     (-> (.toStrict ^RequestEntity (.entity request) (long timeout-ms) mat)
+         (.thenApply (reify Function
+                       (apply [_ strict]
+                         (.toArray (.getData ^HttpEntity$Strict strict)))))))))
 
 (defn entity->data-bytes
   "Get the entity data as a Source of ByteString.
@@ -194,7 +223,7 @@
    \"/api/v1/users/123\" -> [\"api\" \"v1\" \"users\" \"123\"]"
   [^HttpRequest request]
   (let [path (request-path request)]
-    (vec (remove empty? (clojure.string/split path #"/")))))
+    (vec (remove empty? (str/split path #"/")))))
 
 (defn match-path-pattern
   "Match a path against a pattern with :param placeholders.
@@ -204,8 +233,8 @@
    (match-path-pattern \"/users/123\" \"/users/:id\")
    => {:id \"123\"}"
   [path pattern]
-  (let [path-parts (remove empty? (clojure.string/split path #"/"))
-        pattern-parts (remove empty? (clojure.string/split pattern #"/"))]
+  (let [path-parts (remove empty? (str/split path #"/"))
+        pattern-parts (remove empty? (str/split pattern #"/"))]
     (when (= (count path-parts) (count pattern-parts))
       (loop [remaining-path path-parts
              remaining-pattern pattern-parts
@@ -213,7 +242,7 @@
         (if (empty? remaining-path)
           params
           (let [path-part (first remaining-path)
-                pattern-part (first remaining-pattern)]
+                ^String pattern-part (first remaining-pattern)]
             (cond
               ;; Parameter placeholder
               (.startsWith pattern-part ":")

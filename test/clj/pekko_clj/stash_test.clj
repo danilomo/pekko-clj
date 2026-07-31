@@ -1,8 +1,10 @@
 (ns pekko-clj.stash-test
-  (:require [clojure.test :refer :all]
-            [pekko-clj.core :as core])
-  (:import [org.apache.pekko.actor ActorSystem ActorRef]
-           [scala.concurrent Await]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
+            [pekko-clj.core :as core]
+            [pekko-clj.event-stream :as es]
+            [pekko-clj.supervision :as sup]
+            [pekko-clj.test-support :refer [eventually]])
+  (:import [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
 (def timeout-duration (Duration/create 5 "seconds"))
@@ -23,7 +25,7 @@
 (defn await-ask
   "Send a message and block for the reply via core/<?>"
   [actor msg]
-  (Await/result (core/<?> actor msg 3000) timeout-duration))
+  (core/<! actor msg 3000))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests: Stashing
@@ -62,14 +64,12 @@
     (core/! actor :msg1)
     (core/! actor :msg2)
     (core/! actor :msg3)
-    (Thread/sleep 100)
-    ;; Nothing processed yet
+    ;; All three are stashed (FIFO before this ask), so nothing is processed yet.
     (is (= [] (await-ask actor :get-processed)))
     ;; Become ready - unstashes all
     (core/! actor :ready)
-    (Thread/sleep 100)
-    ;; All messages should be processed in order
-    (is (= [:msg1 :msg2 :msg3] (await-ask actor :get-processed)))))
+    ;; All messages should be processed in order.
+    (is (eventually (= [:msg1 :msg2 :msg3] (await-ask actor :get-processed))))))
 
 (deftest stash-preserves-sender
   (let [received-senders (atom [])
@@ -111,14 +111,11 @@
                        :state nil})]
     ;; Sender sends to stashing actor
     (is (= :sent (await-ask sender-actor :send-to-stashing)))
-    (Thread/sleep 100)
-    ;; Make stashing actor ready
+    ;; Make stashing actor ready (unstashes the payload).
     (core/! stashing-actor :ready)
-    (Thread/sleep 200)
-    ;; Check that sender was preserved
-    (let [senders (await-ask stashing-actor :get-senders)]
-      (is (= 1 (count senders)))
-      (is (= sender-actor (first senders))))))
+    ;; Check that the original sender was preserved on the unstashed message.
+    (is (eventually (= 1 (count (await-ask stashing-actor :get-senders)))))
+    (is (= sender-actor (first (await-ask stashing-actor :get-senders))))))
 
 (deftest stash-size-tracking
   (let [actor (core/new-actor
@@ -146,23 +143,17 @@
                                   ;; Don't stash when not in stashing mode
                                   :else state))))
                 :state {:stashing false}})]
-    ;; Initially empty
+    ;; All sends and asks share one mailbox (FIFO), so the asks observe the
+    ;; expected state without any sleeps.
     (is (= 0 (await-ask actor :get-size)))
-    ;; Enable stashing
     (core/! actor :start-stashing)
-    (Thread/sleep 50)
-    ;; Stash some messages
     (core/! actor :stash-me)
     (core/! actor :stash-me)
     (core/! actor :stash-me)
-    (Thread/sleep 100)
     (is (= 3 (await-ask actor :get-size)))
-    ;; Disable stashing before unstashing
+    ;; Disable stashing, then unstash all (messages won't be re-stashed).
     (core/! actor :stop-stashing)
-    (Thread/sleep 50)
-    ;; Unstash all - messages won't be re-stashed
     (core/! actor :unstash-all)
-    (Thread/sleep 100)
     (is (= 0 (await-ask actor :get-size)))))
 
 (deftest unstash-single-message
@@ -194,16 +185,12 @@
                                     {:ready true})))))
                 :state {:ready false}})]
     ;; First message gets stashed and actor becomes ready
-    (core/! actor :first)
-    (Thread/sleep 50)
-    ;; Second message processed directly
-    (core/! actor :second)
-    (Thread/sleep 50)
+    (core/! actor :first)  ; stashed; actor becomes ready
+    (core/! actor :second) ; processed directly
     (is (= [:second] (await-ask actor :get-processed)))
     ;; Unstash one - should process :first
     (core/! actor :unstash-one)
-    (Thread/sleep 50)
-    (is (= [:second :first] (await-ask actor :get-processed)))))
+    (is (eventually (= [:second :first] (await-ask actor :get-processed))))))
 
 (deftest clear-stash-discards-messages
   (let [processed (atom [])
@@ -241,14 +228,10 @@
     ;; Stash some messages
     (core/! actor :msg1)
     (core/! actor :msg2)
-    (Thread/sleep 50)
-    ;; Clear the stash
+    ;; Clear the stash, then become ready and unstash (nothing left).
     (core/! actor :clear)
-    (Thread/sleep 50)
-    ;; Become ready and unstash
     (core/! actor :ready)
-    (Thread/sleep 50)
-    ;; Nothing should be processed - stash was cleared
+    ;; Nothing should be processed - stash was cleared (all FIFO, no wait needed).
     (is (= [] (await-ask actor :get-processed)))))
 
 (deftest stash-with-defactor
@@ -274,9 +257,79 @@
       (core/! actor :a)
       (core/! actor :b)
       (core/! actor :c)
-      (Thread/sleep 100)
       (is (= [] (await-ask actor :get-processed)))
       ;; Ready - unstash
       (core/! actor :ready)
-      (Thread/sleep 100)
-      (is (= [:a :b :c] (await-ask actor :get-processed))))))
+      (is (eventually (= [:a :b :c] (await-ask actor :get-processed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Tests: Stash lifecycle (B16)
+;; ---------------------------------------------------------------------------
+
+(deftest stash-survives-restart
+  ;; The stash lived on the actor *instance*, so a supervised restart — which
+  ;; builds a fresh instance — dropped every stashed message silently. Pekko's
+  ;; Stash contract is the opposite: preRestart hands them back to the mailbox,
+  ;; which the restart keeps, so the new instance still gets them.
+  (let [processed (atom [])
+        instances (atom 0)]
+    (core/defactor restarting-stasher
+      (init [_]
+        (swap! instances inc)
+        {:ready false})
+      (handle :ready
+        (core/unstash-all)
+        {:ready true})
+      (handle :boom
+        (throw (RuntimeException. "boom")))
+      (handle :get-processed
+        (core/reply @processed))
+      (handle msg
+        (if (:ready state)
+          (do (swap! processed conj msg) state)
+          (do (core/stash) state))))
+
+    (core/defactor restarting-parent
+      (supervision (sup/one-for-one {:max-retries 5} (fn [_] :restart)))
+      (init [_] nil)
+      (handle :spawn
+        (core/reply (core/spawn restarting-stasher nil))))
+
+    (let [parent (core/spawn *system* restarting-parent nil)
+          child (await-ask parent :spawn)]
+      (core/! child :a)
+      (core/! child :b)
+      ;; FIFO: both are stashed by the time this ask is answered.
+      (is (= [] (await-ask child :get-processed)))
+      (core/! child :boom)
+      (is (eventually (= 2 @instances)) "the child restarted")
+      ;; :a and :b are back in the mailbox; the fresh instance is not ready yet,
+      ;; so it stashes them again until :ready releases them — in order.
+      (core/! child :ready)
+      (is (eventually (= [:a :b] (await-ask child :get-processed)))
+          "the restart carried the stashed messages over"))))
+
+(deftest stash-becomes-dead-letters-on-stop
+  ;; Messages still stashed when the actor stops for good have nowhere to go.
+  ;; They used to disappear with the instance; now they are dead letters, so the
+  ;; loss shows up on the event stream.
+  (let [dead (atom [])]
+    (es/subscribe-dead-letters *system*
+                               (fn [{:keys [message]}]
+                                 (when (#{:x :y} message)
+                                   (swap! dead conj message))))
+    (core/defactor stopping-stasher
+      (init [_] nil)
+      (handle :ping
+        (core/reply :pong))
+      (handle _msg
+        (core/stash)
+        state))
+
+    (let [actor (core/spawn *system* stopping-stasher nil)]
+      (core/! actor :x)
+      (core/! actor :y)
+      (is (= :pong (await-ask actor :ping)) "both messages are stashed by now")
+      (core/poison-pill actor)
+      (is (eventually (= [:x :y] @dead))
+          "the stash was dead-lettered, in stash order"))))

@@ -36,9 +36,42 @@ To launch a server, we define a route and then bind a server port using `pekko-c
 ;; 2. Bind the server async
 (def binding-future (http/bind-server sys "localhost" 8080 my-routes))
 
-;; Note: You can retrieve port/address info
-;; (let [binding (Await/result binding-future ...)]
+;; Note: bind-server returns a java.util.concurrent.CompletionStage<ServerBinding>;
+;; `stream/await-completion` blocks for it with a millisecond timeout.
+;; (let [binding (stream/await-completion binding-future 5000)]
 ;;   (println "Server online at:" (http/local-address binding)))
+```
+
+### Path patterns
+
+The pattern is split on `/` — the leading slash is optional, so `"/users"` and
+`"users"` are the same route. Each segment is matched against the *unmatched*
+part of the request path and the route only matches if the path ends where the
+pattern does (`/users/42/extra` does not match `"/users/:id"`). Because the
+macros consume only their own segments, they nest inside `path-prefix`:
+
+```clojure
+(r/path-prefix "api"
+  (r/path-prefix "v1"
+    (routes
+      (GET "users" []          (complete :ok "all users"))
+      (GET "users/:id" [id]    (complete :ok (str "user " id)))
+      ;; several params bind by name, in any order in the vector
+      (GET "users/:id/posts/:post-id" [post-id id]
+        (complete :ok (str "user " id ", post " post-id))))))
+```
+
+A request with a matching path but the wrong method gets a `405`, not a `404`.
+
+For hand-built routes, the same capture is available as a directive —
+`path-var` (last segment) and `path-prefix-var` (keep matching afterwards):
+
+```clojure
+(r/path-prefix "users"
+  (r/path-prefix-var
+    (fn [id]
+      (r/path "posts"
+        (r/method-get (complete :ok (str "posts of " id)))))))
 ```
 
 ## Extracting Request Information
@@ -66,6 +99,173 @@ Since the HTTP requests use Pekko Streams underneath to stream bytes smoothly wi
       (println "Received string:" body-str)
       (complete :ok "Length processed!"))))
 ```
+
+## Static Content
+
+Serve files from the classpath or the filesystem. Content types come from the
+file extension, so nothing has to be declared per file. The directory forms
+resolve the *still-unmatched* path, so they nest under `path-prefix`:
+
+```clojure
+(r/routes
+  ;; One file
+  (r/path "favicon.ico" (r/from-resource "public/favicon.ico"))
+  ;; A whole tree: GET /assets/css/app.css -> classpath public/css/app.css
+  (r/path-prefix "assets" (r/from-resource-directory "public"))
+  ;; …or from disk (Pekko refuses to serve outside the directory)
+  (r/path-prefix "files" (r/from-directory "/var/www")))
+```
+
+## Authentication
+
+`basic-auth` handles the 401 and the `WWW-Authenticate` challenge for you. The
+supplied password is deliberately not reachable — Pekko exposes only `verify`,
+which compares your known secret against it in constant time:
+
+```clojure
+(r/path "admin"
+  (r/basic-auth "admin area"
+    (fn [user verify]
+      (when-let [secret (get users user)]
+        (when (verify secret) {:user user})))         ; any falsey value rejects
+    (fn [principal]
+      (complete (str "hi " (:user principal))))))
+```
+
+The authenticator's return value is read with Clojure truthiness: return anything
+truthy to accept — it becomes the `principal` handed to the inner function — and
+`nil` or `false` to reject. A predicate-shaped authenticator that returns
+`true`/`false` therefore works as written.
+
+`bearer-token` is extraction only — it hands the inner function the token from
+an `Authorization: Bearer …` header, or nil when the header is absent or uses
+another scheme, and the route decides what that means.
+
+## HTTPS / TLS
+
+Build an `SSLContext` from a keystore/truststore with `pekko-clj.http.tls`, wrap
+it as a connection context, and hand it to the server or the client. `ssl-context`
+accepts a KeyStore or anything `clojure.java.io/input-stream` reads (a path, File,
+URL, or `io/resource`):
+
+```clojure
+(require '[pekko-clj.http.tls :as tls]
+         '[pekko-clj.http.client :as client])
+
+;; Server: a keystore holding the server key/cert
+(def server-ctx
+  (tls/https-server-context {:keystore "certs/server.p12"
+                             :keystore-password "changeit"}))
+(http/bind-server sys "0.0.0.0" 8443 app {:https server-ctx})
+
+;; Client: a truststore holding the CAs it trusts (needed for self-signed servers)
+(def client-ctx
+  (tls/https-client-context {:truststore "certs/truststore.p12"
+                             :truststore-password "changeit"}))
+
+;; per request …
+(client/GET sys "https://example.com/" {:https-context client-ctx})
+;; … or as the system default
+(client/set-default-client-https-context! sys client-ctx)
+```
+
+## Compression
+
+`encode-response` gzips/deflates the response according to the client's
+`Accept-Encoding` (and leaves it untouched when the client asks for none);
+`decode-request` inflates a compressed request body before inner routes read it:
+
+```clojure
+(r/encode-response
+  (r/decode-request
+    app))                          ; both negotiate gzip/deflate automatically
+```
+
+Restrict the offered/accepted codings with `encode-response-with [coders]` and
+`decode-request-with coder`, where a coder is `:gzip`, `:deflate`, or `:none`.
+Note the built-in client does **not** auto-decode responses — read the body bytes
+and inflate them (e.g. a `java.util.zip.GZIPInputStream`) when a response carries
+`Content-Encoding: gzip`.
+
+## Request timeouts
+
+`with-request-timeout` overrides the server's per-request deadline for a subtree;
+a route that overruns completes `503 Service Unavailable` (or a response you
+supply). `without-request-timeout` lifts the deadline for long-lived responses:
+
+```clojure
+(r/with-request-timeout 2000 app)                     ; 503 after 2s
+(r/with-request-timeout 2000
+  (resp/response :service-unavailable "too slow") app) ; custom timeout response
+(r/without-request-timeout streaming-download)
+```
+
+The strict-entity buffering timeouts in `http/entity->string` / `entity->bytes`
+and `client/response-body` / `response-body-bytes` also take an explicit
+millisecond argument as their last parameter.
+
+## Server-sent events
+
+`sse` completes a route with a `text/event-stream`, driven by a stream `Source`
+of events — each a string (data only) or a `{:data … :event … :id … :retry …}`
+map. Wrap it in `without-request-timeout` for an unbounded stream:
+
+```clojure
+(r/path "events"
+  (r/without-request-timeout
+    (r/sse (stream/source-tick 0 1000 {:data "tick" :event "clock"}))))
+```
+
+Read the framed stream back on the client with `stream/lines` (or
+`stream/frame-delimiter`) over the response's `getDataBytes` — chunk boundaries
+do not line up with events, so framing is what re-joins them.
+
+## Async routes: drive an actor without blocking
+
+`on-success` and `on-complete` build the Route from a `CompletionStage` (an actor
+`core/<?>`, say) once it resolves, so a handler never blocks a dispatcher thread:
+
+```clojure
+(r/GET "/users/:id" [id]
+  (r/on-success (core/<?> user-actor [:get id] 3000)
+    (fn [user] (r/complete-json user))))
+```
+
+`on-complete` also sees failures — its fn receives `{:success true :value v}` or
+`{:success false :error throwable}`, so a failed ask becomes a chosen response
+instead of a bare 500:
+
+```clojure
+(r/on-complete (core/<?> actor :risky 3000)
+  (fn [{:keys [success value error]}]
+    (if success (r/complete-json value)
+        (r/complete :internal-server-error (.getMessage error)))))
+```
+
+## Client IP
+
+`extract-client-ip` yields the peer IP as a string — but only when the server
+config sets `pekko.http.server.remote-address-attribute = on`; without it Pekko
+never captures the address and the value is `nil`.
+
+```clojure
+(r/extract-client-ip (fn [ip] (r/complete (str "hello from " ip))))
+```
+
+## Marshalling: strings are values, not pre-encoded bodies
+
+`->json` / `->edn` (and therefore `resp/json`, `complete-json`, …) encode every
+value, strings included:
+
+```clojure
+(complete-json "hello")                        ;; => "hello"  (a JSON string)
+(complete-json (marshal/raw-body "{\"a\":1}")) ;; => {"a":1}  (verbatim)
+```
+
+Strings used to be passed through unchanged, on the theory that a string must
+already be encoded. That made `(resp/json "hello")` emit the bare characters
+`hello` — not valid JSON, with nothing to say so. Pre-encoded bodies are now
+explicit via `marshal/raw-body`.
 
 ## Contrast with Scala (Pekko HTTP)
 

@@ -47,6 +47,56 @@ If you prefer operating with custom Flow graph blocks natively, you can integrat
 ;; Awaits the stream and returns ["Processed: Data 1" "Processed: Data 2"]
 ```
 
+### Materializers
+
+Every `run-*` above is handed the `ActorSystem` directly. That resolves to
+`(s/system-materializer sys)` — the single materializer the system owns, created
+on first use and shut down with the system. `(s/materializer sys)` builds a
+**new** materializer each call, and each one owns actors that live until it is
+explicitly shut down, so reach for it only when a stream needs its own settings
+or lifetime.
+
+### Files and blocking I/O
+
+These streams carry Pekko `ByteString` elements. Coerce with `->byte-string`
+(a String is encoded UTF-8; a byte-array or existing ByteString pass through) and
+read back with `byte-string->string` / `byte-string->bytes`.
+
+- **Files** — `(source-from-file f)` reads a file as ByteString chunks;
+  `(sink-to-file f)` writes them. `f` is a String path, a `java.io.File` or a
+  `java.nio.file.Path`. Their materialized value is a `CompletionStage<IOResult>`;
+  pass it through `io-result->map` for `{:count :success? :error}`. `sink-to-file`
+  takes an optional open-option collection — keywords like `:append`, `:create`,
+  `:truncate-existing` (or `java.nio.file.OpenOption` values).
+
+- **InputStream / OutputStream** — `source-from-input-stream` /
+  `sink-to-output-stream` bridge a stream to a blocking `java.io.*Stream` you
+  create (each takes a no-arg factory fn and materializes to an `IOResult`).
+  `sink-as-input-stream` and `source-as-output-stream` go the other way: their
+  materialized value *is* a blocking stream you read from / write to.
+
+- **Framing** — `(frame-delimiter delim max-len)` is a Flow that splits a byte
+  stream on a delimiter (stripping it); `(lines)` is the newline-framing +
+  UTF-8-decoding shorthand, emitting `String`s.
+
+```clojure
+;; Count the non-blank lines in a file.
+(-> (s/source-from-file "names.txt")
+    (s/via (s/lines))
+    (s/sfilter (complement clojure.string/blank?))
+    (s/run-fold 0 (fn [n _] (inc n)) sys)
+    (s/await-completion))
+
+;; Write a stream to disk, then inspect the IOResult.
+(let [result (-> (s/source [(s/->byte-string "line 1\n") (s/->byte-string "line 2\n")])
+                 (s/run-with (s/sink-to-file "out.txt") sys)
+                 (s/await-completion))]
+  (s/io-result->map result)) ;; => {:count 14 :success? true :error nil}
+```
+
+A `source-from-file` composes directly with `pekko-clj.http.response/stream` for
+serving a file as a streaming HTTP entity (see the HTTP guide's static content).
+
 ### Contrast with Scala (Pekko Typed)
 
 In native Scala, constructing a stream demands instantiating specific objects explicitly and attaching them.

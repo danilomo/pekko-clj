@@ -1,13 +1,14 @@
 (ns pekko-clj.http.routing-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.string :as str]
             [pekko-clj.core :as core]
-            [pekko-clj.stream :as stream]
             [pekko-clj.http.core :as http]
             [pekko-clj.http.routing :as routing]
             [pekko-clj.http.response :as resp])
-  (:import [org.apache.pekko.actor ActorSystem]
-           [org.apache.pekko.http.javadsl Http]
-           [org.apache.pekko.http.javadsl.model HttpRequest StatusCodes]
+  (:import [org.apache.pekko.http.javadsl Http]
+           [org.apache.pekko.http.javadsl.model.ws BinaryMessage]
+           [org.apache.pekko.http.javadsl.server ExceptionHandler RejectionHandler]
+           [org.apache.pekko.util ByteString]
            [scala.concurrent Await]
            [scala.concurrent.duration Duration]))
 
@@ -138,13 +139,86 @@
 (deftest extract-request-test
   (testing "Extract request directive"
     (let [route (routing/extract-request
-                  (fn [req]
-                    (routing/complete (http/request-method req))))]
+                 (fn [req]
+                   (routing/complete (http/request-method req))))]
       (is route))))
 
 (deftest handle-request-test
   (testing "Handle request function"
     (let [route (routing/handle-request
-                  (fn [req]
-                    (resp/ok "handled")))]
+                 (fn [_req]
+                   (resp/ok "handled")))]
       (is route))))
+
+;; ---------------------------------------------------------------------------
+;; Handler builders & WebSocket helpers (N7)
+;; ---------------------------------------------------------------------------
+
+(deftest handler-builders-test
+  (testing "rejection-handler / exception-handler build real Pekko handlers"
+    (is (instance? RejectionHandler
+                   (routing/rejection-handler {:not-found (routing/complete :not-found "x")})))
+    (is (instance? RejectionHandler
+                   (routing/rejection-handler {:all (fn [_] (routing/complete "all"))})))
+    (is (instance? ExceptionHandler
+                   (routing/exception-handler {Throwable (fn [_] (routing/complete "e"))})))
+    (is (instance? ExceptionHandler
+                   (routing/exception-handler (fn [_] (routing/complete "any"))))
+        "a bare function handles any Throwable")))
+
+(deftest websocket-message-helpers-test
+  (testing "text messages round trip; other messages read as nil"
+    (is (= "hi" (routing/message->text (routing/text-message "hi"))))
+    (is (nil? (routing/message->text
+               (BinaryMessage/create (ByteString/fromString "bytes"))))
+        "binary messages have no text")))
+
+(deftest websocket-route-test
+  (testing "websocket route builds from a Flow of Messages"
+    (is (routing/websocket (routing/text-flow str/upper-case)))
+    (is (routing/websocket (routing/text-flow identity) "chat-v1"))))
+
+;; ---------------------------------------------------------------------------
+;; Regressions: interop signatures that only ever failed at runtime
+;; ---------------------------------------------------------------------------
+
+(deftest complete-with-content-type-test
+  ;; AllDirectives has no (StatusCode, ContentType, String) overload, so the
+  ;; three-arity complete threw "No matching method complete found taking 3 args".
+  ;; Reflection hid the mismatch at compile time and nothing exercised this arity.
+  (testing "complete with an explicit content type builds a route"
+    (is (routing/complete :ok :json "{\"a\":1}"))
+    (is (routing/complete :created :plain "hello"))))
+
+(deftest extract-strict-entity-test
+  ;; toStrictEntity takes a java.time.Duration, not a bare long — passing millis
+  ;; directly threw "No matching method toStrictEntity found taking 2 args".
+  (testing "extract-strict-entity builds a route from a millisecond timeout"
+    (is (routing/extract-strict-entity 1000 (fn [_] (routing/complete "ok"))))))
+
+;; ---------------------------------------------------------------------------
+;; Compression & timeout directives (N16) — construction / validation
+;; (behaviour is proven end-to-end in integration_test)
+;; ---------------------------------------------------------------------------
+
+(deftest compression-directives-build-routes-test
+  (testing "encode/decode directives build routes for the known coders"
+    (let [inner (routing/complete "ok")]
+      (is (routing/encode-response inner))
+      (is (routing/encode-response-with [:gzip :deflate] inner))
+      (is (routing/decode-request inner))
+      (is (routing/decode-request-with :gzip inner)))))
+
+(deftest coder-directives-reject-unknown-coder-test
+  (testing "an unknown coder keyword throws instead of silently falling back"
+    (is (thrown-with-msg? IllegalArgumentException #"Unknown coder"
+          (routing/encode-response-with [:brotli] (routing/complete "ok"))))
+    (is (thrown-with-msg? IllegalArgumentException #"Unknown coder"
+          (routing/decode-request-with :brotli (routing/complete "ok"))))))
+
+(deftest request-timeout-directives-build-routes-test
+  (testing "with-request-timeout / without-request-timeout build routes"
+    (let [inner (routing/complete "ok")]
+      (is (routing/with-request-timeout 1000 inner))
+      (is (routing/with-request-timeout 1000 (resp/response :service-unavailable "slow") inner))
+      (is (routing/without-request-timeout inner)))))

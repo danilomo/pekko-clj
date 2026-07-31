@@ -9,11 +9,15 @@ pekko-clj provides a declarative `defactor` macro with implicit state binding, `
 - **Declarative Actor Definition** - `defactor` macro with pattern matching
 - **Erlang-style Messaging** - `!` (tell), `<?>` (ask), `<!` (blocking ask)
 - **Event Sourcing** - `defactor-persistent` with commands, events, and snapshots
+- **At-least-once delivery** - `defactor-delivery` for reliable, redelivered messaging
 - **Reactive Streams** - Functional stream API with backpressure
 - **Clustering** - Cluster membership, events, and state management
 - **Cluster Sharding** - Distribute actors across cluster nodes
 - **Cluster Singletons** - Exactly-one actor instances with supervision
 - **Routers** - Pool and group routers with multiple strategies
+- **Distributed Data** - Replicated CRDTs (set, map, counter) with consistency levels
+- **Clojure-Data Serialization** - Transit serializer for messages, events and remoting
+- **HTTP** - Routing DSL with JSON/EDN marshalling, rejection/exception handling, websockets
 
 ## Quick Start
 
@@ -72,13 +76,18 @@ pekko-clj includes these Apache Pekko modules:
 
 | Module | Version | Purpose |
 |--------|---------|---------|
-| `pekko-actor_3` | 1.1.3 | Core actor system |
-| `pekko-stream_3` | 1.1.3 | Reactive streams |
-| `pekko-persistence_3` | 1.1.3 | Event sourcing |
-| `pekko-cluster_3` | 1.1.3 | Clustering |
-| `pekko-cluster-sharding_3` | 1.1.3 | Cluster sharding |
-| `pekko-cluster-tools_3` | 1.1.3 | Singletons, pub-sub |
-| `pekko-http_3` | 1.1.0 | HTTP server/client |
+| `pekko-actor_3` | 1.6.0 | Core actor system |
+| `pekko-stream_3` | 1.6.0 | Reactive streams |
+| `pekko-persistence_3` | 1.6.0 | Event sourcing |
+| `pekko-persistence-query_3` | 1.6.0 | Read-side event queries (`pekko-clj.persistence.query`) |
+| `pekko-cluster_3` | 1.6.0 | Clustering |
+| `pekko-cluster-sharding_3` | 1.6.0 | Cluster sharding |
+| `pekko-cluster-tools_3` | 1.6.0 | Singletons, pub-sub |
+| `pekko-distributed-data_3` | 1.6.0 | CRDTs (`pekko-clj.cluster.ddata`) |
+| `pekko-cluster-sharding-typed_3` | 1.6.0 | ShardedDaemonProcess (`pekko-clj.cluster.daemon`) |
+| `pekko-http_3` | 1.4.0 | HTTP server/client, websockets |
+| `pekko-testkit_3` | 1.6.0 | `pekko-clj.test` companion |
+| `pekko-stream-testkit_3` | 1.6.0 | Stream test probes |
 
 ## The `defactor` Macro
 
@@ -100,8 +109,14 @@ pekko-clj includes these Apache Pekko modules:
     new-state)
 
   (on-stop
-    ;; Cleanup when actor stops.
-    cleanup-expr))
+    ;; Cleanup when actor stops (also runs on the old instance on restart).
+    cleanup-expr)
+
+  (on-restart [reason]
+    ;; Runs on the fresh instance after a supervised restart, once init has
+    ;; re-run. `reason` (optional) is the causing Throwable; return value
+    ;; becomes the new state.
+    new-state))
 ```
 
 ### Clauses
@@ -110,7 +125,10 @@ pekko-clj includes these Apache Pekko modules:
 |--------|----------|-------------|
 | `init` | No | Called once before actor starts. Returns initial state. |
 | `handle` | Yes (1+) | Message handlers with pattern matching. Returns new state. |
-| `on-stop` | No | Lifecycle hook for cleanup when actor stops. |
+| `on-stop` | No | Lifecycle hook for cleanup when the actor stops (also fires on the old instance during a supervised restart). |
+| `on-restart` | No | Lifecycle hook that fires on the fresh instance after a supervised restart. `(on-restart [reason] ...)`; return value becomes new state. |
+| `on-error` | No | Recover from a thrown Exception in place. `(on-error [ex msg] ...)`; return value becomes new state. |
+| `supervision` | No | Supervisor strategy for this actor's children. |
 
 ### Pattern Matching
 
@@ -126,7 +144,7 @@ Patterns in `handle` clauses use `core.match`:
 
 ### Implicit Bindings
 
-Inside any `handle`, `init`, or `on-stop` body:
+Inside any `handle`, `init`, `on-stop`, `on-restart`, or `on-error` body:
 
 | Binding | Description |
 |---------|-------------|
@@ -152,10 +170,12 @@ Inside any `handle`, `init`, or `on-stop` body:
 ;; Top-level (requires ActorSystem)
 (spawn system actor-def)
 (spawn system actor-def args)
+(spawn system actor-def args {:name "worker-1"})  ;; named, resolves at "/user/worker-1"
 
 ;; Inside an actor (creates child actor)
 (spawn actor-def)
 (spawn actor-def args)
+(spawn actor-def args {:name "child-1"})
 ```
 
 ### Message Passing
@@ -164,7 +184,7 @@ Inside any `handle`, `init`, or `on-stop` body:
 ;; Fire-and-forget (tell)
 (! actor-ref msg)
 
-;; Non-blocking ask - returns Scala Future
+;; Non-blocking ask - returns a java.util.concurrent.CompletableFuture
 (<?> actor-ref msg)
 (<?> actor-ref msg timeout-ms)
 
@@ -219,6 +239,84 @@ Define persistent actors that store events and rebuild state:
   (snapshot-every 100))
 ```
 
+A command persists one event with `(persist event)` — the event may be any shape
+(keyword, vector, map). To emit several events from one command, use
+`(persist-all [event1 event2 …])`; a plain collection returned from `persist` is
+always a single event, so there is no ambiguity between "one compound event" and
+"several events". A `persist-all` batch is written atomically — one journal
+write, all events or none — so a crash mid-command cannot leave a half-applied
+command behind.
+
+Two more write modes, for when the default is not what you want:
+
+```clojure
+;; Keep processing commands while the write is in flight. Faster, but the next
+;; command may read state that does not include the event yet.
+(command [:observe v] (persist-async [:observed v]))   ; persist-all-async for a batch
+
+;; Reply only once the events are durable: `defer` hands its value back to the
+;; command handler after the writes of the same command have completed, with the
+;; original sender still in scope. `then` runs several operations in order.
+(command [:withdraw n]
+  (then (persist [:withdrawn n])
+        (defer [:withdrawn-ok n])))
+
+(command [:withdrawn-ok n]
+  (reply {:ok true :balance (:balance state)})
+  nil)
+```
+
+Beyond commands and events, a persistent actor takes `(on-stop …)`,
+`(supervision strat)` and timers (`start-timer`/`cancel-timer` from
+`pekko-clj.persistence`), plus `(journal-plugin-id id)` / `(snapshot-plugin-id id)`
+to pick storage per actor and `(recovery …)` to bound or skip replay —
+`(recovery :none)` for a write-only actor, `(recovery {:replay-max 100})` to cap
+it. Note that `self`/`context`/timer helpers for a persistent actor live in
+`pekko-clj.persistence`, not `pekko-clj.core`, whose versions are typed to
+`defactor` actors.
+
+pekko-clj ships no journal or snapshot-store plugin of its own — LevelDB (via
+`org.iq80.leveldb`) is a test-only dependency, wired up in
+`test/resources/persistence-test.conf`, and is not on the classpath of
+consumers of this library. For production, configure a real Pekko Persistence
+plugin (e.g. `pekko-persistence-jdbc`, `pekko-persistence-r2dbc`, or
+`pekko-persistence-cassandra`) in your own `application.conf`.
+
+### At-least-once delivery
+
+For reliable actor-to-actor messaging — a message that must arrive even across
+crashes and restarts — `pekko-clj.persistence.delivery/defactor-delivery` wraps
+Pekko's `AtLeastOnceDelivery`. Call `deliver`/`confirm-delivery!` from the *event*
+handler so a journal replay rebuilds the outstanding set; the message is
+redelivered on `redeliver-interval` until confirmed:
+
+```clojure
+(require '[pekko-clj.persistence.delivery :as d])
+
+(d/defactor-delivery notifier
+  :persistence-id (fn [args] (str "notifier-" (:id args)))
+  (init [args] {:target (:target args)})
+
+  (command [:notify payload]      (d/persist [:queued payload]))
+  (command [:ack delivery-id]     (d/persist [:confirmed delivery-id]))
+
+  (event [:queued payload]
+    (d/deliver (:target state) (fn [delivery-id] [:deliver delivery-id payload]))
+    state)
+  (event [:confirmed delivery-id]
+    (d/confirm-delivery! delivery-id)
+    state)
+
+  (redeliver-interval (java.time.Duration/ofSeconds 5)))
+```
+
+It is a deliberate sibling of `defactor-persistent`, not a mode of it: Pekko's
+timers (which `defactor-persistent` exposes) and at-least-once delivery come from
+two Scala traits that a single Java class cannot combine without a Scala compiler,
+so a delivery actor trades the timer clauses for the delivery ones
+(`redeliver-interval`, `redelivery-burst-limit`, `warn-after-unconfirmed`,
+`max-unconfirmed`). The `persist`/`then`/`defer` helpers are re-exported unchanged.
+
 ## Reactive Streams
 
 Build reactive stream pipelines with backpressure:
@@ -245,6 +343,25 @@ Build reactive stream pipelines with backpressure:
     (s/run-to-seq sys))  ;; => ["HELLO!" "WORLD!"]
 ```
 
+Every `run-*` takes either a `Materializer` or, as above, the `ActorSystem`
+itself — which resolves to `(s/system-materializer sys)`, the one materializer
+the system owns. Prefer that to `(s/materializer sys)`, which builds a *new*
+materializer on every call; each one owns actors that live until it is shut
+down, so calling it per stream leaks them.
+
+Beyond the usual `smap`/`sfilter`/`mapcat`, the operator set includes `skeep`
+(map-and-drop-nils), `zip` / `zip-all` / `interleave` / `prepend` / `or-else`
+for combining, `divert-to` for routing elements out of the main flow, `limit`
+(like `take`, but going over the bound is an error), `dedupe` / `dedupe-by`,
+and empty-safe `sink-head-option` / `sink-last-option` / `sink-take-last`.
+
+For files and blocking I/O, `source-from-file` / `sink-to-file` read and write
+`ByteString` streams (materializing to an `IOResult`, `io-result->map` for
+`{:count :success? :error}`), `source-from-input-stream` / `sink-to-output-stream`
+and `sink-as-input-stream` / `source-as-output-stream` bridge `java.io.*Stream`s,
+and `(lines)` / `frame-delimiter` split a byte stream into lines/frames. Coerce
+with `->byte-string` and `byte-string->string`.
+
 ## Clustering
 
 Create cluster-enabled actor systems:
@@ -270,6 +387,79 @@ Create cluster-enabled actor systems:
 (cluster/state-snapshot sys)  ;; Full state as map
 ```
 
+### Distributed Data (CRDTs)
+
+Replicated, conflict-free state — a set, a map and a counter — that every node can
+write without coordination:
+
+```clojure
+(require '[pekko-clj.cluster.ddata :as ddata])
+
+(def online (ddata/or-set-key "online-users"))
+
+(ddata/add! sys online "ada")            ;; => CompletableFuture of {:status :success …}
+(ddata/value sys online)                 ;; => #{"ada"}
+
+(ddata/increment! sys (ddata/pn-counter-key "hits") 1)
+(ddata/put! sys (ddata/lww-map-key "config") "level" "debug")
+
+;; React to changes made anywhere in the cluster
+(ddata/subscribe sys online (fn [{:keys [value]}] (println "online:" value)))
+```
+
+Reads and writes default to `:local`; pass `{:consistency :majority}` (or `:all`)
+where a command must reach other nodes first.
+
+## Serialization
+
+Pekko cannot serialize Clojure data on its own, so remoting, sharding and persistence
+would fall back to Java serialization. `pekko-clj.serialization` provides a Transit
+serializer instead:
+
+```clojure
+(ns my-app.serialization
+  (:require [pekko-clj.cluster :as cluster]
+            [pekko-clj.serialization :as ser]))
+
+;; Turn it on for a cluster system (also turns Java serialization off)
+(def sys (cluster/create-system "my-app"
+           {:port 7355
+            :transit-serialization true}))          ;; or {:format :msgpack ...}
+
+;; Or build the Config yourself and merge it into any system
+(ser/transit-config {:format :msgpack
+                     :extra-bindings ["my.app.SomeIface"]})
+
+;; Direct use, e.g. writing Clojure data to an external store
+(ser/read-bytes (ser/write-bytes {:a [1 2 #{:x}]}))  ;; => {:a [1 2 #{:x}]}
+```
+
+Maps, vectors, lists, sets, keywords, symbols, ratios and big integers are bound to the
+serializer by default, and `ActorRef`s embedded in a message survive the round trip.
+
+### Records
+
+Transit needs a handler per record type, so records are **opt-in**: list them under
+`:records` and they round trip as themselves.
+
+```clojure
+(defrecord Point [x y])
+
+(cluster/create-system "my-app"
+  {:port 7355
+   :transit-serialization {:records [Point]}})   ;; classes or class names
+
+;; Standalone, per call
+(ser/read-bytes (ser/write-bytes (->Point 1 2) nil :json [Point]) nil :json [Point])
+;; => #my-app.serialization.Point{:x 1, :y 2}
+```
+
+Every node exchanging a record needs it in its own `:records` list. Without
+registration Transit writes a record as a plain map and it comes back as a plain map —
+the type is silently erased — so prefer plain maps unless you register the type.
+Reading a payload whose record type is *not* registered locally throws with the
+unknown tag named, rather than yielding an opaque `TaggedValue`.
+
 ## Cluster Sharding
 
 Distribute actors across the cluster:
@@ -278,17 +468,21 @@ Distribute actors across the cluster:
 (ns my-app.sharding
   (:require [pekko-clj.cluster.sharding :as sharding]))
 
+;; Entities match the raw message they are sent and read their own id with
+;; (sharding/entity-id).
 (defactor order-entity
-  (init [args] {:order-id (:entity-id args) :items []})
+  (init [_] {:items []})
 
-  (handle [:entity-message id msg]
-    (case (first msg)
-      :add-item (update state :items conj (second msg))
-      :get-items (do (reply (:items state)) state))))
+  (handle [:add-item item] (update state :items conj item))
+  (handle [:get-items] (reply {:order-id (sharding/entity-id) :items (:items state)})))
 
 ;; Start sharding region
 (def region (sharding/start sys order-entity
-              {:type-name "Order" :num-shards 100}))
+              {:type-name "Order"
+               :num-shards 100
+               ;; Passivate idle entities, or cap how many stay active per region:
+               ;; {:strategy :least-recently-used :active-entity-limit 10000}
+               :passivation {:strategy :idle :idle-timeout 300000}}))
 
 ;; Send messages to entities
 (sharding/tell region "order-123" [:add-item {:sku "ABC"}])
@@ -296,6 +490,20 @@ Distribute actors across the cluster:
 ;; Or use EntityRef for cleaner API
 (def order (sharding/entity-ref sys "Order" "order-123"))
 (sharding/tell-entity order [:add-item {:sku "XYZ"}])
+```
+
+For always-on workers that are not addressed by entity id (queue consumers,
+projections, periodic jobs), use the Sharded Daemon Process — Pekko keeps exactly
+`n` instances running and moves them when the cluster changes:
+
+```clojure
+(require '[pekko-clj.cluster.daemon :as daemon])
+
+(defactor partition-worker
+  (init [i] {:partition i})            ;; init receives the index 0 … n-1
+  (handle [:poll] (consume! (:partition state)) state))
+
+(daemon/start sys "partition-workers" 4 partition-worker)
 ```
 
 ## Cluster Singletons
@@ -364,6 +572,60 @@ Distribute messages across actor pools:
                     {:strategy :round-robin
                      :max-instances-per-node 2
                      :allow-local-routees true}))
+```
+
+## HTTP
+
+A routing DSL over Pekko HTTP, with JSON/EDN marshalling, failure handling and
+websockets:
+
+```clojure
+(ns my-app.http
+  (:require [pekko-clj.http.core :as http]
+            [pekko-clj.http.routing :as r]
+            [pekko-clj.http.response :as resp]))
+
+(def app
+  (r/handle-exceptions
+    (r/exception-handler {Throwable (fn [e] (r/complete :internal-server-error (.getMessage e)))})
+    (r/handle-rejections
+      (r/rejection-handler {:not-found (r/complete-json :not-found {:error "not found"})})
+      (r/routes
+        (r/path "users"
+          (r/routes
+            ;; Query params as a Clojure map
+            (r/method-get (r/path-end (r/params (fn [{:keys [page]}] (r/complete-json (list-users page))))))
+            ;; JSON in, JSON out (a malformed body completes 400)
+            (r/method-post (r/path-end (r/with-json-body #(r/complete-json :created (create-user! %)))))))
+        ;; Websockets over a stream Flow
+        (r/path "echo" (r/websocket (r/text-flow clojure.string/upper-case)))))))
+
+;; Bind it
+(def binding (http/bind-server sys "0.0.0.0" 8080 app))
+```
+
+Body helpers: `with-request-body` (string), `with-json-body`, `with-edn-body`,
+`with-body` (parsed by Content-Type). Response helpers: `complete-json`,
+`complete-edn`, and the `pekko-clj.http.response` builders (`ok`, `created`,
+`not-found`, `redirect`, …). Encoding/decoding lives in
+`pekko-clj.http.marshalling` (Cheshire for JSON, `clojure.edn` for EDN).
+
+Static content (`from-resource`/`from-directory`), auth (`basic-auth`,
+`bearer-token`), compression (`encode-response`/`decode-request`, gzip/deflate),
+and per-subtree `with-request-timeout` are all directives too. For TLS, build a
+context from a keystore with `pekko-clj.http.tls` and pass it to the server or
+client:
+
+```clojure
+(require '[pekko-clj.http.tls :as tls] '[pekko-clj.http.client :as client])
+
+(http/bind-server sys "0.0.0.0" 8443 app
+  {:https (tls/https-server-context {:keystore "certs/server.p12"
+                                     :keystore-password "changeit"})})
+
+(client/GET sys "https://example.com/"
+  {:https-context (tls/https-client-context {:truststore "certs/truststore.p12"
+                                             :truststore-password "changeit"})})
 ```
 
 ## Design Principles

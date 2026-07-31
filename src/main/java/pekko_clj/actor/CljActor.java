@@ -4,8 +4,6 @@ import org.apache.pekko.actor.*;
 import clojure.lang.RT;
 import clojure.lang.IDeref;
 import clojure.lang.IFn;
-import clojure.lang.ISeq;
-import clojure.lang.Seqable;
 import clojure.lang.Keyword;
 import clojure.lang.PersistentVector;
 import clojure.lang.ILookup;
@@ -44,6 +42,11 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   private final LinkedList<StashedMessage> stash = new LinkedList<>();
   private Object currentMessage;
   private ActorRef currentSender;
+  // The raw, untranslated message currently being handled. Kept alongside
+  // currentMessage so unhandled() can restore the real Terminated instance
+  // (currentMessage holds its [:terminated ref] translation) and re-arm the
+  // death pact. See unhandled().
+  private Object currentRawMessage;
 
   public static Props create(ILookup props) {
     return Props.create(CljActor.class, () -> {
@@ -87,24 +90,41 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       translatedMessage = PersistentVector.create(TERMINATED, t.getActor());
     }
 
-    // Track current message and sender for stashing
+    // Track current message and sender for stashing (translated) and for the
+    // death-pact restore in unhandled() (raw).
     currentMessage = translatedMessage;
+    currentRawMessage = message;
     currentSender = getSender();
 
     try {
       Object result = function.invoke(this, translatedMessage);
       handleState(result);
     } catch (Throwable t) {
+      // on-error vs supervision contract:
+      //  - Error and InterruptedException always propagate: they are never
+      //    routed to on-error. Swallowing them would hide fatal failures
+      //    (OutOfMemoryError, StackOverflowError) and break thread interruption.
+      //  - Any other Throwable (i.e. a recoverable Exception): if an on-error
+      //    handler is set it recovers the actor IN PLACE, so the parent's
+      //    supervisor strategy never sees the failure; otherwise it is rethrown
+      //    so supervision can decide (restart/resume/stop/escalate).
+      //  - DeathPactException is never routed to on-error: like upstream Pekko,
+      //    an unhandled Terminated is not a recoverable handler error — it must
+      //    propagate to supervision (which stops this watcher by default).
+      if (t instanceof Error || t instanceof InterruptedException
+          || t instanceof DeathPactException) {
+        throw t;
+      }
       if (errorHandler != null) {
-        // Call error handler: (fn [this exception message] ...) -> new-state
+        // on-error handler: (fn [this exception message] ...) -> new-state
         Object result = errorHandler.invoke(this, t, translatedMessage);
         handleState(result);
       } else {
-        // No error handler - rethrow to trigger supervision
         throw t;
       }
     } finally {
       currentMessage = null;
+      currentRawMessage = null;
       currentSender = null;
     }
   }
@@ -114,6 +134,9 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       return;
     }
 
+    // Behavior switching goes through BecomeResult only (see core/become). Any
+    // other return value — including a PersistentVector — is the new state, so a
+    // handler whose state legitimately is a vector is handled correctly.
     if (result instanceof BecomeResult) {
       BecomeResult b = (BecomeResult) result;
       this.function = b.function;
@@ -121,18 +144,7 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
       return;
     }
 
-    if (PersistentVector.class.isAssignableFrom(result.getClass())) {
-      var seq = ((Seqable) result).seq();
-      handleSeq(seq);
-      return;
-    }
-
     state = result;
-  }
-
-  private void handleSeq(ISeq seq) {
-    function = (IFn) seq.first();
-    state = seq.more().first();
   }
 
   @Override
@@ -148,6 +160,69 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
 
     Object initial = preStart.invoke(this);
     handleState(initial);
+  }
+
+  @Override
+  public void postStop() {
+    // Runs on stop, and (via the default preRestart) on restart. Powers the
+    // defactor `on-stop` clause and the :post-stop prop.
+    if (postStop != null) {
+      postStop.invoke(this);
+    }
+    // Anything still stashed when the actor stops for good has nowhere to go.
+    // Re-sending it to a stopped self routes it to dead letters, so the loss is
+    // observable on the event stream instead of silent. On a *restart* this
+    // finds an empty stash: preRestart drained it back into the mailbox first.
+    drainStashToSelf();
+  }
+
+  @Override
+  public void preRestart(Throwable reason, java.util.Optional<Object> message) throws Exception {
+    // Runs on the OLD instance just before it is discarded by a supervised
+    // restart. Powers the low-level :pre-restart prop. The default behaviour
+    // (super) stops this actor's children and then calls postStop(), which
+    // fires the on-stop hook — so on a restart both on-restart (new instance,
+    // below) and on-stop (old instance) run. (We override the javadsl
+    // Optional-based overload; the scala.Option one is deprecated.)
+    if (preRestart != null) {
+      preRestart.invoke(this, reason);
+    }
+    // Hand the stash to the new instance. Pekko's Stash contract is that a
+    // restart does not swallow stashed messages: they go back to the mailbox,
+    // which a restart keeps. Without this the fresh instance started with an
+    // empty stash and the messages vanished silently. Draining after the
+    // :pre-restart hook lets that hook drop them deliberately (clear-stash).
+    drainStashToSelf();
+    super.preRestart(reason, message);
+  }
+
+  /**
+   * Re-send every stashed message to {@code self} with its original sender, in
+   * stash order, emptying the stash.
+   *
+   * <p>From {@link #preRestart} the messages land in the mailbox the restart
+   * keeps, so the fresh instance receives them (at the tail — see
+   * {@link #unstashAll()} for the ordering note). From {@link #postStop} self is
+   * already stopped, so they become dead letters.
+   */
+  private void drainStashToSelf() {
+    while (!stash.isEmpty()) {
+      StashedMessage msg = stash.removeFirst();
+      getSelf().tell(msg.message, msg.sender);
+    }
+  }
+
+  @Override
+  public void postRestart(Throwable reason) throws Exception {
+    // Runs on the FRESH instance after a supervised restart. The default (super)
+    // calls preStart(), re-running init so state is rebuilt before the hook
+    // runs. Powers the defactor `on-restart` clause and the :post-restart prop;
+    // like a message handler, the hook's return value becomes the new state
+    // (a nil return leaves it unchanged).
+    super.postRestart(reason);
+    if (postRestart != null) {
+      handleState(postRestart.invoke(this, reason));
+    }
   }
 
   @Override
@@ -191,6 +266,33 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
     getSender().tell(msg, getSelf());
   }
 
+  /**
+   * Mark a message as unhandled. Delegates to Pekko's default handling, which
+   * publishes an {@link org.apache.pekko.actor.UnhandledMessage} to the actor
+   * system's event stream (and throws {@code DeathPactException} for a watched
+   * actor's {@code Terminated} that no handler consumed). Used by the
+   * {@code defactor} catch-all so an unmatched message does not crash the actor
+   * with a {@code MatchError}.
+   *
+   * <p>Because {@link #onReceive} translates a {@code Terminated} to a
+   * {@code [:terminated ref]} vector before matching (so a handler can
+   * pattern-match it), the catch-all hands us that vector — and
+   * {@code super.unhandled} only re-arms the death pact for a real
+   * {@code Terminated} instance. So when the message being marked unhandled is
+   * the translation of the {@code Terminated} we are currently handling, we
+   * delegate the raw {@code Terminated} instead, restoring the death pact
+   * exactly as upstream (default supervision then stops this watcher).
+   */
+  @Override
+  public void unhandled(Object message) {
+    if (currentRawMessage instanceof Terminated
+        && currentMessage != null && currentMessage.equals(message)) {
+      super.unhandled(currentRawMessage);
+      return;
+    }
+    super.unhandled(message);
+  }
+
   public Scheduler scheduler() {
     return getContext().getSystem().scheduler();
   }
@@ -206,6 +308,18 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
 
   public void startTimerWithInitialDelay(Object key, java.time.Duration initialDelay, java.time.Duration interval, Object message) {
     getTimers().startTimerAtFixedRate(key, message, initialDelay, interval);
+  }
+
+  // Fixed-DELAY variants: the next tick is scheduled `interval` after the previous
+  // one *completes*, so ticks never bunch up to catch up after a pause/GC (unlike
+  // the fixed-RATE startTimer/startTimerWithInitialDelay above). Pekko recommends
+  // fixed-delay for most periodic work.
+  public void startTimerWithFixedDelay(Object key, java.time.Duration interval, Object message) {
+    getTimers().startTimerWithFixedDelay(key, message, interval);
+  }
+
+  public void startTimerWithFixedDelayAndInitial(Object key, java.time.Duration initialDelay, java.time.Duration interval, Object message) {
+    getTimers().startTimerWithFixedDelay(key, message, initialDelay, interval);
   }
 
   public void startSingleTimer(Object key, java.time.Duration delay, Object message) {
@@ -229,6 +343,13 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
     getContext().watch(actorRef);
   }
 
+  // Like watch, but delivers `message` (as-is) instead of a Terminated when the
+  // watched actor stops — Pekko's watchWith. The custom message flows through the
+  // normal receive path, so it is NOT translated to [:terminated actor-ref].
+  public void watchWith(ActorRef actorRef, Object message) {
+    getContext().watchWith(actorRef, message);
+  }
+
   public void unwatch(ActorRef actorRef) {
     getContext().unwatch(actorRef);
   }
@@ -237,6 +358,10 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   /**
    * Stash the current message for later processing.
    * Call this during message handling to defer processing.
+   *
+   * <p>Stashed messages outlive a supervised restart: {@link #preRestart} puts
+   * them back in the mailbox for the fresh instance. When the actor stops for
+   * good they become dead letters (see {@link #postStop}).
    */
   public void stash() {
     if (currentMessage == null) {
@@ -246,19 +371,22 @@ public class CljActor extends UntypedAbstractActorWithTimers implements IDeref {
   }
 
   /**
-   * Unstash all messages, prepending them to the mailbox.
-   * Messages will be processed in the order they were stashed (FIFO).
+   * Re-enqueue all stashed messages, in the order they were stashed (FIFO), each
+   * with its original sender.
+   *
+   * <p>Note: unlike Pekko's {@code Stash} (which prepends to the mailbox front),
+   * this re-sends the messages to {@code self}, so they land at the TAIL of the
+   * mailbox — after any messages already queued. Equivalent for the common
+   * stash-until-ready pattern; differs only when other messages queued up in
+   * between and their relative ordering matters.
    */
   public void unstashAll() {
-    // Send messages in FIFO order
-    while (!stash.isEmpty()) {
-      StashedMessage msg = stash.removeFirst();
-      getSelf().tell(msg.message, msg.sender);
-    }
+    drainStashToSelf();
   }
 
   /**
-   * Unstash the first stashed message only.
+   * Re-enqueue the first stashed message only (with its original sender), placing
+   * it at the tail of the mailbox (see {@link #unstashAll()} for the ordering note).
    */
   public void unstash() {
     if (!stash.isEmpty()) {

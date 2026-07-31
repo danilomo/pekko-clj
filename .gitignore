@@ -1,8 +1,11 @@
-.clj-kondo/
+# clj-kondo: keep config.edn tracked, ignore the analysis cache
+.clj-kondo/.cache/
 .idea/
 .lein-repl-history
 .lsp/
 pekko-clj.iml
 target/
+# Distributed-data durable (LMDB) stores, if a run enables durable keys
+ddata-*/
 .nrepl-port
 .lein-failures
